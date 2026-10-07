@@ -2,7 +2,8 @@
 
 **Discord, native and fast.** A lightweight Discord client written in Rust with
 [egui](https://github.com/emilk/egui), built on
-[fastframe](https://github.com/crmne/fastframe). No browser engine.
+[fastframe](https://github.com/crmne/fastframe). No browser engine: when
+Discord asks for a captcha, a small separate helper shows it, and only then.
 
 Early work in progress. The first version covers text only: servers, channels,
 direct messages, history, sending, reactions and notifications.

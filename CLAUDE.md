@@ -5,8 +5,10 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
 ## Loop
 
 - `cargo run -- --demo` shows the interface on offline sample data (`src/demo.rs`).
-  Sign-in does not exist yet, so the demo is the only way to see the app.
-- Done means the CI steps in `.github/workflows/ci.yml` pass locally, `--locked` included.
+- `cargo build --workspace && cargo run -- -v` signs in for real (QR code). Use a
+  secondary Discord account. `cargo run` alone does not build `fastcord-captcha`.
+- Done means the CI steps in `.github/workflows/ci.yml` pass locally, `--locked` and
+  `--workspace` included.
 
 ## Layout
 
@@ -18,6 +20,17 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
 - `ui.rs`: drawing only. Turn any decision it makes into a function in `model.rs`
   or a method on `Selection`, with a test.
 - `theme.rs`: the palette, which follows Omarchy's through `fastframe-theme`.
+- `backend.rs`: the thread that talks to Discord and the keyring. The interface
+  sends `Command`s and reads what it reports; it never waits on the network.
+- `remote_auth.rs`: QR sign-in. `Handshake` is the protocol without I/O (test it
+  there); `run` drives it over the socket.
+- `api.rs`: Discord's HTTP API. `credentials.rs`: the token in the keyring.
+- `captcha.rs`: runs `crates/captcha` (`fastcord-captcha`), a separate WebKitGTK
+  program that shows Discord's hCaptcha. It is its own package so WebKit never
+  links into `fastcord`: check with `ldd target/debug/fastcord | grep -i webkit`.
+- `websocket.rs`: WebSocket upgrade written by hand, because Discord's remote auth
+  gateway refuses a lowercase `origin` header (403) and the `http` crate
+  lowercases every header name.
 
 ## Conventions
 
@@ -35,6 +48,8 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
 
 The guarantees in README.md § Privacy are product promises: message content
 stays in memory and stays out of logs, and the token goes only to the keyring.
+`Token` has no `Debug`/`Display` and wipes itself on drop: keep it that way, and
+never log a ticket, a QR URL (it holds the session fingerprint) or a payload.
 
 ## Known gaps
 
