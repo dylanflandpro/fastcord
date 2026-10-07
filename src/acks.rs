@@ -270,6 +270,7 @@ mod tests {
             content: String::new(),
             attachments: vec![],
             embeds: vec![],
+            reactions: vec![],
         };
         let marked = |channel| Update::Acked {
             channel,

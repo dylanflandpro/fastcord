@@ -8,6 +8,7 @@ use crate::markdown::{self, Action, Block, Content, Directory, Span, Style};
 use crate::media::{self, Media, Picture, Shown};
 use crate::model::{
     self, Attachment, Badge, ChannelKind, Embed, EmbedField, Entry, Id, Message, Model,
+    ReactionKind,
 };
 use crate::theme::{self, Icon, Palette};
 use egui::cache::{ComputerMut, FrameCache};
@@ -42,6 +43,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         conversation(selection, model, &palette, status, &mut app.media, ui)
     };
     app.report_bottom(bottom);
+    let clicked =
+        ui.data_mut(|d| d.remove_temp::<(Id, model::Emoji)>(egui::Id::new(REACTION_CLICK)));
+    if let (Some((message, emoji)), Some(channel)) = (clicked, app.selection.channel) {
+        app.toggle_reaction(channel, message, emoji);
+    }
     viewer(&mut app.media, &palette, ui);
     match request {
         Some(HistoryRequest::Older(channel)) => app.request_history(channel, true),
@@ -643,6 +649,128 @@ fn message_line(
     body.blocks(ui, &parsed(ui, &message.content));
     attachments(ui, &body, media, &message.attachments);
     embeds(ui, &body, media, &message.embeds);
+    reactions(ui, palette, message);
+}
+
+/// Where a click on a reaction waits for `show`, which can change the app.
+const REACTION_CLICK: &str = "reaction-click";
+
+/// A message's reactions, in pills under it: the emoji and how many, in the
+/// accent colour when one is mine. Clicking a plain one adds mine or takes
+/// it back. Super reactions (Nitro) get a pill of their own, outlined in
+/// the warning colour, and only show.
+fn reactions(ui: &mut egui::Ui, palette: &Palette, message: &Message) {
+    if message.reactions.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    for (response, reaction, kind) in reaction_row(ui, palette, message) {
+        if kind == ReactionKind::Normal && response.clicked() {
+            let click = (message.id, reaction.emoji.clone());
+            ui.data_mut(|d| d.insert_temp(egui::Id::new(REACTION_CLICK), click));
+        }
+    }
+}
+
+/// Each pill's own id, from what it shows rather than where it is drawn:
+/// egui credits a click to the id pressed, so a pill that moves while the
+/// pointer is down (a reaction added before it, a message above) must not
+/// hand the click to whichever pill takes its place. Snowflakes make the
+/// message id unique across channels.
+fn pill_id(message: Id, emoji: &model::Emoji, kind: ReactionKind) -> egui::Id {
+    let name = emoji.id.is_none().then_some(emoji.name.as_str());
+    egui::Id::new((
+        "reaction",
+        message,
+        emoji.id,
+        name,
+        kind == ReactionKind::Burst,
+    ))
+}
+
+fn reaction_row<'m>(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    message: &'m Message,
+) -> Vec<(Response, &'m model::Reaction, ReactionKind)> {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+        let mut pills = Vec::new();
+        for reaction in &message.reactions {
+            let shown = [
+                (ReactionKind::Normal, reaction.count, reaction.me),
+                (ReactionKind::Burst, reaction.burst_count, reaction.me_burst),
+            ];
+            for (kind, count, mine) in shown.into_iter().filter(|(_, n, _)| *n > 0) {
+                let id = pill_id(message.id, &reaction.emoji, kind);
+                let response = reaction_pill(ui, palette, id, reaction, kind, count, mine);
+                pills.push((response, reaction, kind));
+            }
+        }
+        pills
+    })
+    .inner
+}
+
+/// One pill, laid out in the row (so it wraps with it) but answering to
+/// its own stable id.
+fn reaction_pill(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    id: egui::Id,
+    reaction: &model::Reaction,
+    kind: ReactionKind,
+    count: u32,
+    mine: bool,
+) -> Response {
+    const PADDING: Vec2 = Vec2::new(8.0, 3.0);
+    let burst = kind == ReactionKind::Burst;
+    // Reaction counts are written in full, not shortened like badges.
+    let label = format!("{} {count}", reaction.emoji.label());
+    let color = if mine {
+        palette.text
+    } else {
+        palette.secondary
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.clone(), theme::regular(13.0), color);
+    let (rect, _) = ui.allocate_exact_size(galley.size() + PADDING * 2.0, Sense::hover());
+    let sense = if burst {
+        Sense::hover()
+    } else {
+        Sense::click()
+    };
+    let mut response = ui.interact(rect, id, sense);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), mine, &label)
+    });
+    if !burst {
+        response = response.on_hover_cursor(CursorIcon::PointingHand);
+    }
+    let fill = match (mine, !burst && response.hovered()) {
+        (true, _) => palette.accent.gamma_multiply(0.15),
+        (false, true) => palette.surface_hover,
+        (false, false) => palette.surface,
+    };
+    let stroke = match (burst, mine) {
+        (true, _) => palette.warning,
+        (false, true) => palette.accent,
+        (false, false) => palette.outline,
+    };
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let radius = CornerRadius::same(8);
+        painter.rect(
+            rect,
+            radius,
+            fill,
+            Stroke::new(1.0, stroke),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(rect.min + PADDING, galley, color);
+    }
+    response
 }
 
 /// A message's embeds: pictures and GIF links on their own, the rest as
@@ -1405,6 +1533,104 @@ impl Clock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each pill's label, id and place, drawn `before` widgets down in a
+    /// panel `width` wide.
+    fn pills(message: &Message, before: usize, width: f32) -> Vec<(String, egui::Id, Rect)> {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 600.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let mut pills = Vec::new();
+        let mut output = ctx.run_ui(input, |ui| {
+            // Whatever is drawn before moves the pills but must not
+            // change their ids.
+            for _ in 0..before {
+                let _ = ui.button("above");
+            }
+            for (response, reaction, kind) in reaction_row(ui, &Palette::dark(), message) {
+                let label = format!("{} {kind:?}", reaction.emoji.label());
+                pills.push((label, response.id, response.rect));
+            }
+        });
+        output.textures_delta.clear();
+        pills.sort_by(|a, b| a.0.cmp(&b.0));
+        pills
+    }
+
+    fn pill_ids(message: &Message, before: usize) -> Vec<(String, egui::Id)> {
+        let drawn = pills(message, before, 800.0);
+        drawn
+            .into_iter()
+            .map(|(label, id, _)| (label, id))
+            .collect()
+    }
+
+    #[test]
+    fn reaction_pills_wrap_within_a_narrow_panel() {
+        let reaction = |name: &str| model::Reaction {
+            emoji: model::Emoji {
+                id: Some(1),
+                name: name.into(),
+                animated: false,
+            },
+            count: 12,
+            ..model::Reaction::default()
+        };
+        let names = ["party", "laugh", "heart", "rocket", "eyes", "ferris"];
+        let message = Message {
+            id: 50,
+            author: model::User::default(),
+            content: String::new(),
+            attachments: vec![],
+            embeds: vec![],
+            reactions: names.map(reaction).to_vec(),
+        };
+        let drawn = pills(&message, 0, 200.0);
+        assert_eq!(drawn.len(), 6);
+        for (label, _, rect) in &drawn {
+            assert!(rect.right() <= 200.0, "{label} at {rect:?}");
+            assert!(rect.width() > rect.height(), "{label} squashed: {rect:?}");
+        }
+        let rows = drawn.iter().map(|(_, _, r)| r.top() as i32);
+        assert!(rows.collect::<HashSet<_>>().len() > 1, "wrapped onto rows");
+    }
+
+    #[test]
+    fn reaction_pills_keep_their_ids_wherever_they_are_drawn() {
+        let reaction = |name: &str, count, burst_count| model::Reaction {
+            emoji: model::Emoji {
+                id: None,
+                name: name.into(),
+                animated: false,
+            },
+            count,
+            burst_count,
+            ..model::Reaction::default()
+        };
+        let mut message = Message {
+            id: 50,
+            author: model::User::default(),
+            content: String::new(),
+            attachments: vec![],
+            embeds: vec![],
+            reactions: vec![reaction("🎉", 1, 1), reaction("😂", 2, 0)],
+        };
+        let first = pill_ids(&message, 0);
+        message.reactions.reverse();
+        assert_eq!(pill_ids(&message, 3), first);
+        assert_eq!(first.len(), 3, "a plain and a super 🎉, a plain 😂");
+        message.id = 51;
+        assert!(
+            pill_ids(&message, 0)
+                .iter()
+                .all(|(_, id)| !first.iter().any(|(_, f)| f == id))
+        );
+    }
 
     #[test]
     fn initials_take_the_first_letter_of_up_to_three_words() {

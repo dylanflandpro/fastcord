@@ -3,7 +3,7 @@
 use crate::backend::{Backend, Command, Event, Link, Session};
 use crate::events::Update;
 use crate::media::{self, Media};
-use crate::model::{Ack, ChannelKind, Id, Model};
+use crate::model::{Ack, ChannelKind, Emoji, Id, Model, ReactionRequest};
 use crate::notify::{self, Attention};
 use crate::theme::{self, Catalog, Palette};
 use std::collections::{HashMap, HashSet};
@@ -346,6 +346,29 @@ impl App {
         }
     }
 
+    /// Adds my reaction to a message, or removes it if it is there: at once
+    /// on screen, then on Discord. Demo runs only change what is shown.
+    /// Nothing checks permissions first: joining an existing reaction needs
+    /// only Read Message History (Add Reactions is for a new emoji, which
+    /// fastcord does not offer), and Discord's refusal undoes it.
+    pub fn toggle_reaction(&mut self, channel: Id, message: Id, emoji: Emoji) {
+        let Some(model) = &mut self.model else {
+            return;
+        };
+        let Some(add) = model.toggle_reaction(channel, message, &emoji) else {
+            return;
+        };
+        if let Some(backend) = &self.backend {
+            backend.send(Command::React(ReactionRequest {
+                channel,
+                guild: model.guild_of(channel),
+                message,
+                emoji,
+                add,
+            }));
+        }
+    }
+
     /// Whether notifications show what messages say.
     pub fn notification_content(&self) -> bool {
         self.notifications.show_content()
@@ -486,81 +509,92 @@ impl App {
         };
         let events: Vec<Event> = backend.events().collect();
         for event in events {
-            match event {
-                Event::Session(session) => {
-                    self.qr = match &session {
-                        Session::Qr(url) => qrcode::QrCode::new(url.as_bytes()).ok(),
-                        _ => None,
-                    };
-                    // Signed out, or signing in again: nothing of the last
-                    // account stays on screen.
-                    if !matches!(session, Session::SignedIn(_)) {
-                        self.forget_account();
-                    }
-                    self.session = session;
+            self.take(event);
+        }
+    }
+
+    /// Takes one thing the backend reported.
+    fn take(&mut self, event: Event) {
+        match event {
+            Event::Session(session) => {
+                self.qr = match &session {
+                    Session::Qr(url) => qrcode::QrCode::new(url.as_bytes()).ok(),
+                    _ => None,
+                };
+                // Signed out, or signing in again: nothing of the last
+                // account stays on screen.
+                if !matches!(session, Session::SignedIn(_)) {
+                    self.forget_account();
                 }
-                Event::Link(link) => self.link = link,
-                Event::Ready(model) => {
-                    // A new session after a reconnect missed what happened
-                    // meanwhile: histories load again rather than stay
-                    // silently incomplete. What was open stays open.
-                    match self.model.is_some() {
-                        true => self.selection.repair(&model),
-                        false => self.selection = Selection::initial(Some(&model)),
-                    }
-                    self.model = Some(*model);
+                self.session = session;
+            }
+            Event::Link(link) => self.link = link,
+            Event::Ready(model) => {
+                // A new session after a reconnect missed what happened
+                // meanwhile: histories load again rather than stay
+                // silently incomplete. What was open stays open.
+                match self.model.is_some() {
+                    true => self.selection.repair(&model),
+                    false => self.selection = Selection::initial(Some(&model)),
                 }
-                Event::AckDone { channel, flags } => {
-                    self.reading.outstanding.remove(&channel);
-                    if let (Some(model), Some(flags)) = (&mut self.model, flags) {
-                        model.save_flags(channel, flags);
-                    }
+                self.model = Some(*model);
+            }
+            Event::AckDone { channel, flags } => {
+                self.reading.outstanding.remove(&channel);
+                if let (Some(model), Some(flags)) = (&mut self.model, flags) {
+                    model.save_flags(channel, flags);
                 }
-                Event::Open(channel) => {
-                    if let Some(model) = &self.model {
-                        self.raise = self.selection.reveal(model, channel);
-                    }
+            }
+            Event::ReactionFailed(reaction) => {
+                if let Some(model) = &mut self.model {
+                    let undo = !reaction.add;
+                    model.react(reaction.channel, reaction.message, &reaction.emoji, undo);
                 }
-                Event::HistoryFailed { channel } => {
+            }
+            Event::Open(channel) => {
+                if let Some(model) = &self.model {
+                    self.raise = self.selection.reveal(model, channel);
+                }
+            }
+            Event::HistoryFailed { channel } => {
+                self.loading_history.remove(&channel);
+                self.failed_history.insert(channel);
+            }
+            Event::Update(update) => {
+                // A message arriving while its channel's first page loads
+                // may be newer than the page: keep it for after.
+                if let Update::MessageCreate { channel, .. } = &update
+                    && self.loading_history.contains(channel)
+                    && self
+                        .model
+                        .as_ref()
+                        .is_some_and(|m| !m.messages.contains_key(channel))
+                {
+                    let channel = *channel;
+                    self.early_messages.entry(channel).or_default().push(update);
+                    return;
+                }
+                let landed = match &update {
+                    Update::History { channel, .. } => Some(*channel),
+                    _ => None,
+                };
+                if let Some(channel) = landed {
                     self.loading_history.remove(&channel);
-                    self.failed_history.insert(channel);
                 }
-                Event::Update(update) => {
-                    // A message arriving while its channel's first page loads
-                    // may be newer than the page: keep it for after.
-                    if let Update::MessageCreate { channel, .. } = &update
-                        && self.loading_history.contains(channel)
-                        && self
-                            .model
-                            .as_ref()
-                            .is_some_and(|m| !m.messages.contains_key(channel))
-                    {
-                        let channel = *channel;
-                        self.early_messages.entry(channel).or_default().push(update);
-                        continue;
+                if let Update::Acked {
+                    channel,
+                    manual: true,
+                    ..
+                } = update
+                {
+                    self.reading.marked_unread(channel, self.selection.channel);
+                }
+                if let Some(model) = &mut self.model {
+                    model.apply(update);
+                    if let Some(early) = landed.and_then(|c| self.early_messages.remove(&c)) {
+                        early.into_iter().for_each(|update| model.apply(update));
                     }
-                    let landed = match &update {
-                        Update::History { channel, .. } => Some(*channel),
-                        _ => None,
-                    };
-                    if let Some(channel) = landed {
-                        self.loading_history.remove(&channel);
-                    }
-                    if let Update::Acked {
-                        channel,
-                        manual: true,
-                        ..
-                    } = update
-                    {
-                        self.reading.marked_unread(channel, self.selection.channel);
-                    }
-                    if let Some(model) = &mut self.model {
-                        model.apply(update);
-                        if let Some(early) = landed.and_then(|c| self.early_messages.remove(&c)) {
-                            early.into_iter().for_each(|update| model.apply(update));
-                        }
-                        self.selection.repair(model);
-                    }
+                    self.selection.repair(model);
                 }
             }
         }
@@ -755,6 +789,38 @@ mod tests {
         assert_eq!(selection.channel, Some(900), "a channel gone since");
         selection.open_guild(&model, 200);
         assert_eq!(selection.channel, Some(201), "remembered in its guild");
+    }
+
+    #[test]
+    fn a_reaction_discord_refused_is_undone_on_screen() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, Some(crate::demo::model()), None);
+        let (channel, message) = (101, app.model.as_ref().unwrap().messages[&101][2].id);
+        let shown = |app: &App| {
+            let reactions = &app.model.as_ref().unwrap().messages[&channel][2].reactions;
+            reactions
+                .iter()
+                .map(|r| (r.emoji.label(), r.count, r.me))
+                .collect::<Vec<_>>()
+        };
+        let before = shown(&app);
+        let party = before[0].0.clone();
+        let emoji = crate::model::Emoji {
+            id: None,
+            name: party.clone(),
+            animated: false,
+        };
+        // Demo runs change only what is shown.
+        app.toggle_reaction(channel, message, emoji.clone());
+        assert_eq!(shown(&app)[0], (party.clone(), before[0].1 - 1, false));
+        app.take(Event::ReactionFailed(ReactionRequest {
+            channel,
+            guild: Some(100),
+            message,
+            emoji,
+            add: false,
+        }));
+        assert_eq!(shown(&app), before);
     }
 
     #[test]

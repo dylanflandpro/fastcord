@@ -3,8 +3,8 @@
 
 use crate::model::{
     Attachment, Channel, ChannelKind, ChannelSettings, DmChannel, Embed, EmbedField, EmbedImage,
-    Guild, GuildSettings, Id, Message, Model, Mute, Notify, Overwrite, OverwriteKind, Permissions,
-    ReadState, Role, User, id_at,
+    Emoji, Guild, GuildSettings, Id, Message, Model, Mute, Notify, Overwrite, OverwriteKind,
+    Permissions, Reaction, ReadState, Role, User, id_at,
 };
 use std::collections::HashMap;
 
@@ -95,6 +95,7 @@ impl Timeline {
                     content: (*content).into(),
                     attachments: vec![],
                     embeds: vec![],
+                    reactions: vec![],
                 }
             })
             .collect()
@@ -124,6 +125,20 @@ fn attachment(id: Id, filename: &str, content_type: &str, size: u64) -> Attachme
         width: None,
         height: None,
         flags: 0,
+    }
+}
+
+/// `count` plain reactions with an emoji, one of them mine if `me`.
+fn reaction(name: &str, id: Option<Id>, count: u32, me: bool) -> Reaction {
+    Reaction {
+        emoji: Emoji {
+            id,
+            name: name.into(),
+            animated: false,
+        },
+        count,
+        me,
+        ..Reaction::default()
     }
 }
 
@@ -269,6 +284,14 @@ pub fn model() -> Model {
         253_952,
     )];
     annonces[4].embeds = vec![meetup_embed()];
+    annonces[2].reactions = vec![
+        reaction("🎉", None, 12, true),
+        reaction("ferris", Some(9100), 3, false),
+        Reaction {
+            burst_count: 2,
+            ..reaction("🦀", None, 5, false)
+        },
+    ];
     annonces[5].attachments = vec![Attachment {
         width: Some(960),
         height: Some(540),
@@ -336,11 +359,13 @@ pub fn model() -> Model {
 
     let dm_lea = DmChannel {
         id: 900,
+        group: false,
         recipients: vec![lea.clone()],
         last_message_id: None,
     };
     let dm_group = DmChannel {
         id: 901,
+        group: true,
         recipients: vec![marc.clone(), sam.clone()],
         last_message_id: None,
     };
