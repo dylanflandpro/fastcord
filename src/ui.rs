@@ -71,6 +71,7 @@ fn status_bar(app: &mut App, ui: &mut egui::Ui) {
         Link::Reconnecting => Some("Connection lost. Reconnecting…"),
     };
     let mut log_out = false;
+    let mut previews = app.notification_content();
     egui::Panel::bottom("status")
         .exact_size(28.0)
         .show_separator_line(false)
@@ -90,6 +91,8 @@ fn status_bar(app: &mut App, ui: &mut egui::Ui) {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     log_out = ui.small_button("Log out").clicked();
+                    ui.checkbox(&mut previews, "Notification previews")
+                        .on_hover_text("Show what messages say in desktop notifications");
                     ui.label(
                         egui::RichText::new(name)
                             .font(theme::regular(12.0))
@@ -98,6 +101,7 @@ fn status_bar(app: &mut App, ui: &mut egui::Ui) {
                 });
             });
         });
+    app.set_notification_content(previews);
     if log_out {
         app.send(Command::LogOut);
     }

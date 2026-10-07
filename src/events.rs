@@ -16,7 +16,7 @@ use serde_json::value::RawValue;
 use std::collections::HashMap;
 
 /// A change to the model, in the order the gateway reported it.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Update {
     /// A guild joined or became available.
     GuildUpsert(Guild),
@@ -102,6 +102,8 @@ pub enum Update {
         guild: Id,
         channels: Vec<(Id, Option<Id>)>,
     },
+    /// My status changed: Do Not Disturb (until when), or anything else.
+    DoNotDisturb(Option<Mute>),
 }
 
 /// How many messages a history page asks for, as the official client does.
@@ -131,7 +133,12 @@ struct WireMessage {
     mention_everyone: bool,
     #[serde(default)]
     mention_roles: Vec<String>,
+    #[serde(default)]
+    flags: u64,
 }
+
+/// The message flag of @silent messages.
+const SUPPRESS_NOTIFICATIONS: u64 = 1 << 12;
 
 #[derive(serde::Deserialize)]
 struct WireAttachment {
@@ -263,6 +270,7 @@ impl WireMessage {
                 .iter()
                 .filter_map(|r| r.parse().ok())
                 .collect(),
+            silent: self.flags & SUPPRESS_NOTIFICATIONS != 0,
         }
     }
 }
@@ -364,6 +372,8 @@ struct Ready {
     read_state: Option<Box<RawValue>>,
     user_guild_settings: Option<Box<RawValue>>,
     notification_settings: Option<Box<RawValue>>,
+    /// The account's settings, as base64 protobuf: only my status is read.
+    user_settings_proto: Option<String>,
 }
 
 /// The account's notification settings: only the flag that separates
@@ -1049,6 +1059,10 @@ impl Decoder {
                 .notification_settings
                 .and_then(|raw| serde_json::from_str::<NotificationSettings>(raw.get()).ok())
                 .is_some_and(|s| s.flags & USE_NEW_NOTIFICATIONS != 0),
+            do_not_disturb: ready
+                .user_settings_proto
+                .and_then(|proto| do_not_disturb(&proto, false))
+                .flatten(),
             ..Model::default()
         };
         model.read_states = read_states(ready.read_state.as_deref(), &model);
@@ -1210,9 +1224,137 @@ impl Decoder {
                         .collect(),
                 }]
             }
+            "USER_SETTINGS_PROTO_UPDATE" => {
+                let update: SettingsUpdate = serde_json::from_str(data)?;
+                if update.settings.kind != PRELOADED_USER_SETTINGS {
+                    return Ok(Vec::new());
+                }
+                do_not_disturb(&update.settings.proto, update.partial)
+                    .map(Update::DoNotDisturb)
+                    .into_iter()
+                    .collect()
+            }
             _ => Vec::new(),
         })
     }
+}
+
+// My status, from the account settings Discord keeps as protobuf
+// (`discord_protos.discord_users.v1.PreloadedUserSettings`). Only the path
+// to the status is read: field 11 (`status`), then field 1 (`status`, a
+// `StringValue` holding "online", "idle", "dnd"…) and field 4
+// (`status_expires_at_ms`, a fixed64, 0 for none).
+
+#[derive(serde::Deserialize)]
+struct SettingsUpdate {
+    settings: SettingsProto,
+    /// Only the fields that changed.
+    #[serde(default)]
+    partial: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct SettingsProto {
+    #[serde(rename = "type")]
+    kind: u8,
+    proto: String,
+}
+
+/// The settings type that holds the status.
+const PRELOADED_USER_SETTINGS: u8 = 1;
+
+/// Whether the settings set Do Not Disturb, and until when. `None` when they
+/// say nothing of the status (a partial update leaves it alone) or cannot
+/// be read; a full set without one means online.
+fn do_not_disturb(base64: &str, partial: bool) -> Option<Option<Mute>> {
+    use base64::Engine as _;
+    let decoded = base64::engine::general_purpose::STANDARD.decode(base64);
+    let Some(status) = decoded.as_deref().ok().and_then(proto_status) else {
+        log::warn!("unreadable settings protobuf");
+        return None;
+    };
+    match status {
+        Some((status, expires)) => Some((status == "dnd").then(|| {
+            Mute {
+                until: (expires > 0)
+                    .then(|| i64::try_from(expires).ok())
+                    .flatten()
+                    .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok()),
+            }
+        })),
+        None if partial => None,
+        None => Some(None),
+    }
+}
+
+/// The status and when it expires (0: never), or `Some(None)` without one.
+fn proto_status(settings: &[u8]) -> Option<Option<(&str, u64)>> {
+    let Some(ProtoValue::Bytes(status)) = proto_field(settings, 11)? else {
+        return Some(None);
+    };
+    let Some(ProtoValue::Bytes(value)) = proto_field(status, 1)? else {
+        return Some(None);
+    };
+    let text = match proto_field(value, 1)? {
+        Some(ProtoValue::Bytes(text)) => std::str::from_utf8(text).ok()?,
+        _ => "",
+    };
+    let expires = match proto_field(status, 4)? {
+        Some(ProtoValue::Number(ms)) => ms,
+        _ => 0,
+    };
+    Some(Some((text, expires)))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ProtoValue<'a> {
+    Number(u64),
+    Bytes(&'a [u8]),
+}
+
+/// The last value of field `number` in a protobuf message (the last one
+/// wins, as protobuf merges them): `Some(None)` when it is absent, `None`
+/// when the message cannot be read.
+fn proto_field(mut bytes: &[u8], number: u64) -> Option<Option<ProtoValue<'_>>> {
+    let mut found = None;
+    while !bytes.is_empty() {
+        let key = varint(&mut bytes)?;
+        let value = match key & 7 {
+            0 => ProtoValue::Number(varint(&mut bytes)?),
+            1 => ProtoValue::Number(u64::from_le_bytes(take(&mut bytes, 8)?.try_into().ok()?)),
+            2 => {
+                let len = usize::try_from(varint(&mut bytes)?).ok()?;
+                ProtoValue::Bytes(take(&mut bytes, len)?)
+            }
+            5 => {
+                ProtoValue::Number(u32::from_le_bytes(take(&mut bytes, 4)?.try_into().ok()?).into())
+            }
+            _ => return None,
+        };
+        if key >> 3 == number {
+            found = Some(value);
+        }
+    }
+    Some(found)
+}
+
+fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+    let (head, rest) = bytes.split_at_checked(len)?;
+    *bytes = rest;
+    Some(head)
+}
+
+fn varint(bytes: &mut &[u8]) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..64).step_by(7) {
+        let (&byte, rest) = bytes.split_first()?;
+        *bytes = rest;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1867,8 +2009,101 @@ mod tests {
                 me: true,
                 everyone: true,
                 roles: vec![1050],
+                silent: false,
             }
         );
+    }
+
+    #[test]
+    fn silent_messages_say_so() {
+        let (mut decoder, _, _) = ready();
+        let created = decoder
+            .event(
+                "MESSAGE_CREATE",
+                r#"{"id":"50","channel_id":"3001","content":"psst","flags":4096,"author":{"id":"9002","username":"lea.dev"}}"#,
+            )
+            .unwrap();
+        let [Update::MessageCreate { ping, .. }] = &created[..] else {
+            panic!("expected a message");
+        };
+        assert!(ping.silent);
+    }
+
+    /// Account settings as protobuf, base64: an unrelated field, then the
+    /// status (and when it expires) the way Discord nests it.
+    fn settings_proto(status: Option<&str>, expires_ms: u64) -> String {
+        use base64::Engine as _;
+        let mut inner = Vec::new();
+        if let Some(status) = status {
+            let value = [&[0x0a, status.len() as u8][..], status.as_bytes()].concat();
+            inner.extend([0x0a, value.len() as u8]);
+            inner.extend(value);
+        }
+        if expires_ms > 0 {
+            inner.push(0x21);
+            inner.extend(expires_ms.to_le_bytes());
+        }
+        // Field 2 holding a two-byte varint, then field 11 (status).
+        let mut proto = vec![0x10, 0x96, 0x01];
+        proto.extend([0x5a, inner.len() as u8]);
+        proto.extend(inner);
+        base64::engine::general_purpose::STANDARD.encode(proto)
+    }
+
+    #[test]
+    fn reads_do_not_disturb_from_the_settings_protobuf() {
+        let dnd = settings_proto(Some("dnd"), 0);
+        assert_eq!(
+            do_not_disturb(&dnd, false),
+            Some(Some(Mute { until: None }))
+        );
+        let until = settings_proto(Some("dnd"), 1_800_000_000_000);
+        assert_eq!(
+            do_not_disturb(&until, true),
+            Some(Some(Mute {
+                until: Some(jiff::Timestamp::from_millisecond(1_800_000_000_000).unwrap())
+            }))
+        );
+        assert_eq!(
+            do_not_disturb(&settings_proto(Some("idle"), 0), true),
+            Some(None)
+        );
+        // Without a status: online in full settings, unchanged in a partial update.
+        assert_eq!(do_not_disturb(&settings_proto(None, 0), false), Some(None));
+        assert_eq!(do_not_disturb(&settings_proto(None, 0), true), None);
+        assert_eq!(do_not_disturb("", false), Some(None));
+        // Unreadable: base64 that is not, a truncated message.
+        assert_eq!(do_not_disturb("ignored!", false), None);
+        assert_eq!(do_not_disturb("Wg8K", false), None);
+    }
+
+    #[test]
+    fn my_status_comes_from_ready_and_settings_updates() {
+        let (mut decoder, model, _) = ready();
+        assert_eq!(
+            model.do_not_disturb, None,
+            "the fixture's proto is unreadable"
+        );
+        let dnd = settings_proto(Some("dnd"), 0);
+        let ready = READY.replace(
+            r#""user_settings_proto": "ignored""#,
+            &format!(r#""user_settings_proto": "{dnd}""#),
+        );
+        let (model, _) = Decoder::default().ready(&ready).unwrap();
+        assert_eq!(model.do_not_disturb, Some(Mute { until: None }));
+        let event = |proto: &str, partial: bool, kind: u8| {
+            format!(r#"{{"settings":{{"type":{kind},"proto":"{proto}"}},"partial":{partial}}}"#)
+        };
+        let update = |decoder: &mut Decoder, data: String| {
+            decoder.event("USER_SETTINGS_PROTO_UPDATE", &data).unwrap()
+        };
+        assert_eq!(
+            update(&mut decoder, event(&dnd, true, 1)),
+            [Update::DoNotDisturb(Some(Mute { until: None }))]
+        );
+        assert_eq!(update(&mut decoder, event(&dnd, true, 2)), [], "frecency");
+        let other = settings_proto(None, 0);
+        assert_eq!(update(&mut decoder, event(&other, true, 1)), []);
     }
 
     #[test]

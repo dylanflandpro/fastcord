@@ -14,6 +14,8 @@ direct messages, history, sending, reactions and notifications.
 - Messages live in memory only; nothing is written to disk.
 - The session token is kept in the system keyring, never in a plain file.
 - Logs never contain message content.
+- Desktop notifications show a message's text unless "Notification previews"
+  is off; your desktop's notification server may keep its own history.
 
 ## Developing
 
