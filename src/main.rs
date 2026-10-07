@@ -9,6 +9,7 @@ mod demo;
 mod events;
 mod gateway;
 mod markdown;
+mod media;
 mod model;
 mod remote_auth;
 mod theme;

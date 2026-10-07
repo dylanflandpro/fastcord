@@ -280,6 +280,67 @@ pub struct Message {
     pub id: Id,
     pub author: User,
     pub content: String,
+    pub attachments: Vec<Attachment>,
+    pub embeds: Vec<Embed>,
+}
+
+/// A file sent with a message.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Attachment {
+    pub id: Id,
+    pub filename: String,
+    /// The file on Discord's CDN.
+    pub url: String,
+    /// The same file through Discord's media proxy, which resizes images.
+    pub proxy_url: String,
+    pub content_type: Option<String>,
+    /// In bytes.
+    pub size: u64,
+    /// Set for the images and videos Discord could measure.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// Discord's attachment flags, such as [`Attachment::SPOILER`].
+    pub flags: u64,
+}
+
+impl Attachment {
+    /// Sent behind a spoiler.
+    pub const SPOILER: u64 = 1 << 3;
+}
+
+/// A picture in an embed. `url` is wherever the link pointed; only
+/// `proxy_url`, Discord's copy, is ever loaded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmbedImage {
+    pub url: String,
+    pub proxy_url: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmbedField {
+    pub name: String,
+    pub value: String,
+    pub inline: bool,
+}
+
+/// A link preview, or a bot's rich message.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Embed {
+    /// Discord's `type`: "rich", "image", "gifv", "video", "article"…
+    pub kind: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub url: Option<String>,
+    /// 0xRRGGBB, for the bar down the left.
+    pub color: Option<u32>,
+    pub author: Option<String>,
+    pub footer: Option<String>,
+    pub provider: Option<String>,
+    pub fields: Vec<EmbedField>,
+    pub thumbnail: Option<EmbedImage>,
+    pub image: Option<EmbedImage>,
 }
 
 /// Messages from one author close enough in time to share a header.
@@ -457,14 +518,23 @@ impl Model {
                 channel,
                 id,
                 content,
+                attachments,
+                embeds,
             } => {
-                if let Some(content) = content
-                    && let Some(message) = self
-                        .messages
-                        .get_mut(&channel)
-                        .and_then(|loaded| loaded.iter_mut().find(|m| m.id == id))
+                if let Some(message) = self
+                    .messages
+                    .get_mut(&channel)
+                    .and_then(|loaded| loaded.iter_mut().find(|m| m.id == id))
                 {
-                    message.content = content;
+                    if let Some(content) = content {
+                        message.content = content;
+                    }
+                    if let Some(attachments) = attachments {
+                        message.attachments = attachments;
+                    }
+                    if let Some(embeds) = embeds {
+                        message.embeds = embeds;
+                    }
                 }
             }
             Update::MessageDelete { channel, ids } => {
@@ -744,6 +814,8 @@ mod tests {
                 ..User::default()
             },
             content: String::new(),
+            attachments: vec![],
+            embeds: vec![],
         }
     }
 
@@ -926,13 +998,32 @@ mod tests {
             channel: 8,
             id: 60,
             content: Some("edited".into()),
+            attachments: None,
+            embeds: None,
         });
+        // A link preview resolving later: the text stays.
+        let preview = Embed {
+            kind: Some("article".into()),
+            title: Some("Rust".into()),
+            description: None,
+            url: None,
+            color: None,
+            author: None,
+            footer: None,
+            provider: None,
+            fields: vec![],
+            thumbnail: None,
+            image: None,
+        };
         model.apply(Update::MessageEdit {
             channel: 8,
             id: 60,
             content: None,
+            attachments: None,
+            embeds: Some(vec![preview.clone()]),
         });
         assert_eq!(model.messages(8)[1].content, "edited");
+        assert_eq!(model.messages(8)[1].embeds, [preview]);
         model.apply(Update::MessageDelete {
             channel: 8,
             ids: vec![5],

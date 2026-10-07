@@ -2,8 +2,8 @@
 //! so the interface can be built without touching a Discord account.
 
 use crate::model::{
-    Channel, ChannelKind, DmChannel, Guild, Id, Message, Model, Overwrite, OverwriteKind,
-    Permissions, Role, User, id_at,
+    Attachment, Channel, ChannelKind, DmChannel, Embed, EmbedField, EmbedImage, Guild, Id, Message,
+    Model, Overwrite, OverwriteKind, Permissions, Role, User, id_at,
 };
 
 fn user(id: Id, username: &str, global_name: Option<&str>) -> User {
@@ -88,9 +88,78 @@ impl Timeline {
                     ),
                     author: (*author).clone(),
                     content: (*content).into(),
+                    attachments: vec![],
+                    embeds: vec![],
                 }
             })
             .collect()
+    }
+}
+
+/// The demo's pictures, built into the binary: the demo never goes online
+/// for them. Any Discord URL ending in one of these names serves it.
+pub fn image(url: &str) -> Option<&'static [u8]> {
+    let url = reqwest::Url::parse(url).ok()?;
+    let name = url.path_segments()?.next_back()?;
+    match name.strip_prefix("SPOILER_").unwrap_or(name) {
+        "paysage.png" => Some(include_bytes!("../assets/demo/paysage.png")),
+        "logo.png" => Some(include_bytes!("../assets/demo/logo.png")),
+        _ => None,
+    }
+}
+
+fn attachment(id: Id, filename: &str, content_type: &str, size: u64) -> Attachment {
+    Attachment {
+        id,
+        filename: filename.into(),
+        url: format!("https://cdn.discordapp.com/attachments/101/{id}/{filename}"),
+        proxy_url: format!("https://media.discordapp.net/attachments/101/{id}/{filename}"),
+        content_type: Some(content_type.into()),
+        size,
+        width: None,
+        height: None,
+        flags: 0,
+    }
+}
+
+/// A picture from another site, as Discord's media proxy serves it.
+fn external(name: &str, width: u32, height: u32) -> EmbedImage {
+    EmbedImage {
+        url: format!("https://www.rust-lang.org/static/images/{name}"),
+        proxy_url: Some(format!(
+            "https://images-ext-1.discordapp.net/external/demo/https/www.rust-lang.org/static/images/{name}"
+        )),
+        width: Some(width),
+        height: Some(height),
+    }
+}
+
+/// A bot's announcement, with every part of a rich embed.
+fn meetup_embed() -> Embed {
+    let field = |name: &str, value: &str, inline| EmbedField {
+        name: name.into(),
+        value: value.into(),
+        inline,
+    };
+    Embed {
+        kind: Some("rich".into()),
+        title: Some("Meetup de rentrée".into()),
+        description: Some(
+            "Deux talks, puis **pizzas** 🍕\nRéservez votre place sur [la page du meetup](https://www.rust-lang.org/community).".into(),
+        ),
+        url: Some("https://www.rust-lang.org/community".into()),
+        color: Some(0xce422b),
+        author: Some("Rust Francophone".into()),
+        footer: Some("Événements · Rust Francophone".into()),
+        provider: None,
+        fields: vec![
+            field("Date", "Jeudi, 19 h", true),
+            field("Lieu", "Salle B", true),
+            field("Places", "42", true),
+            field("Accès", "Métro ligne 4, sortie *Saint-Michel*", false),
+        ],
+        thumbnail: Some(external("logo.png", 160, 160)),
+        image: Some(external("paysage.png", 960, 540)),
     }
 }
 
@@ -99,6 +168,7 @@ pub fn model() -> Model {
     let lea = user(2, "lea.dev", Some("Léa"));
     let marc = user(3, "marc", None);
     let sam = user(4, "samuel_k", Some("Sam"));
+    let ferris = user(5, "ferris", Some("Ferris"));
 
     // Dylan is a contributor (150) but not a moderator (151): he sees
     // #contributeurs, but neither #bureau nor the Modération category.
@@ -170,17 +240,36 @@ pub fn model() -> Model {
          - un client Discord *natif*, par <@1>\n\
          -# Inscriptions dans <#111> ou sur [la page du meetup](https://www.rust-lang.org/community). @everyone"
     );
-    model.messages.insert(
-        101,
-        timeline.history(&[
-            (
-                1440,
-                &marc,
-                "Le meetup de jeudi est confirmé : 19 h, salle B. Pensez à vous inscrire dans #général.",
-            ),
-            (30, &marc, &programme),
-        ]),
-    );
+    let mut annonces = timeline.history(&[
+        (
+            1440,
+            &marc,
+            "Le meetup de jeudi est confirmé : 19 h, salle B. Pensez à vous inscrire dans #général.",
+        ),
+        (1439, &marc, "La vue depuis la terrasse :"),
+        (30, &marc, &programme),
+        (29, &marc, "Le programme détaillé, à imprimer :"),
+        (10, &ferris, ""),
+        (8, &sam, "La salle l'an dernier, sans gâcher la surprise :"),
+    ]);
+    annonces[1].attachments = vec![Attachment {
+        width: Some(960),
+        height: Some(540),
+        ..attachment(1, "paysage.png", "image/png", 6384)
+    }];
+    annonces[3].attachments = vec![attachment(
+        2,
+        "programme-meetup.pdf",
+        "application/pdf",
+        253_952,
+    )];
+    annonces[4].embeds = vec![meetup_embed()];
+    annonces[5].attachments = vec![Attachment {
+        width: Some(960),
+        height: Some(540),
+        ..attachment(3, "SPOILER_paysage.png", "image/png", 6384)
+    }];
+    model.messages.insert(101, annonces);
     model.messages.insert(
         111,
         timeline.history(&[
@@ -307,6 +396,20 @@ mod tests {
         assert!(rust.contains(&"contributeurs"));
         assert!(!rust.contains(&"bureau") && !rust.contains(&"Modération"));
         assert!(names(300).contains(&"direction"));
+    }
+
+    #[test]
+    fn pictures_come_from_the_binary() {
+        let model = model();
+        let message = &model.messages(101)[1];
+        let picture = crate::media::Picture::attachment(&message.attachments[0]);
+        let request = picture.request(crate::media::ATTACHMENT_BOX, 2.0).unwrap();
+        assert!(image(&request.url).is_some());
+        let embed = &model.messages(101)[4].embeds[0];
+        for picture in [&embed.thumbnail, &embed.image] {
+            let source = picture.as_ref().unwrap().proxy_url.as_deref().unwrap();
+            assert!(image(source).is_some());
+        }
     }
 
     #[test]

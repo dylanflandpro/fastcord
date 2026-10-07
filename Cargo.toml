@@ -52,6 +52,9 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 http = "1.5.0"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
 thiserror = "2.0.21"
+# Pictures in messages. eframe already brings it in for PNG; the media
+# proxy serves WebP, and senders post JPEG and GIF.
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 [profile.release]
 lto = "thin"

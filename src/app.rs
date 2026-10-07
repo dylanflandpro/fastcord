@@ -2,6 +2,7 @@
 
 use crate::backend::{Backend, Command, Event, Link, Session};
 use crate::events::Update;
+use crate::media::{self, Media};
 use crate::model::{Id, Model};
 use crate::theme::{self, Catalog, Palette};
 use std::collections::{HashMap, HashSet};
@@ -115,6 +116,8 @@ pub struct App {
     /// The live connection, while signed in.
     pub link: Link,
     pub selection: Selection,
+    /// The pictures in messages, in memory only.
+    pub media: Media,
     pub palette: Palette,
     themes: Catalog,
     themes_dir: Option<PathBuf>,
@@ -193,7 +196,12 @@ impl App {
         }
 
         let backend = model.is_none().then(|| Backend::start(ctx.clone()));
+        let source = match backend {
+            Some(_) => media::Source::Discord,
+            None => media::Source::Demo,
+        };
         Self {
+            media: Media::new(source),
             selection: Selection::initial(model.as_ref()),
             model,
             session: Session::Checking,
@@ -276,6 +284,7 @@ impl App {
         self.loading_history.clear();
         self.failed_history.clear();
         self.early_messages.clear();
+        self.media.clear();
     }
 
     /// Where the open channel's history stands.
@@ -397,6 +406,7 @@ impl eframe::App for App {
         if let Some(channel) = self.selection.channel {
             self.request_history(channel, false);
         }
+        self.media.poll(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

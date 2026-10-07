@@ -123,6 +123,9 @@ fastframe_icons::icons! {
     pub enum Icon {
         prefix: "fastcord-icon-",
         directory: "../assets/icons/",
+        Alert => lucide "circle-alert",
+        Download => "download",
+        File => "file",
         Hash => "hash",
         Megaphone => "megaphone",
         MessageCircle => "message-circle",

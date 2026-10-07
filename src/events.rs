@@ -8,8 +8,8 @@
 
 use crate::api::{ApiUser, optional_snowflake, snowflake};
 use crate::model::{
-    Channel, ChannelKind, DmChannel, Guild, Id, Message, Model, Overwrite, OverwriteKind,
-    Permissions, Role, User,
+    Attachment, Channel, ChannelKind, DmChannel, Embed, EmbedField, EmbedImage, Guild, Id, Message,
+    Model, Overwrite, OverwriteKind, Permissions, Role, User,
 };
 use serde_json::value::RawValue;
 use std::collections::HashMap;
@@ -65,12 +65,14 @@ pub enum Update {
         channel: Id,
         message: Message,
     },
-    /// An edit; `content` is `None` when the edit left the text alone (an
-    /// embed resolving, a pin).
+    /// An edit. Each part is `None` when the edit left it alone: a link
+    /// preview resolving after the message sends `embeds` only.
     MessageEdit {
         channel: Id,
         id: Id,
         content: Option<String>,
+        attachments: Option<Vec<Attachment>>,
+        embeds: Option<Vec<Embed>>,
     },
     MessageDelete {
         channel: Id,
@@ -92,6 +94,130 @@ struct WireMessage {
     content: String,
     #[serde(rename = "type", default)]
     kind: u8,
+    #[serde(default, deserialize_with = "lenient")]
+    attachments: Vec<WireAttachment>,
+    #[serde(default, deserialize_with = "lenient")]
+    embeds: Vec<WireEmbed>,
+}
+
+#[derive(serde::Deserialize)]
+struct WireAttachment {
+    #[serde(deserialize_with = "snowflake")]
+    id: Id,
+    filename: String,
+    #[serde(default)]
+    size: u64,
+    url: String,
+    #[serde(default)]
+    proxy_url: String,
+    content_type: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    #[serde(default)]
+    flags: u64,
+}
+
+impl From<WireAttachment> for Attachment {
+    fn from(wire: WireAttachment) -> Self {
+        Attachment {
+            id: wire.id,
+            filename: wire.filename,
+            url: wire.url,
+            proxy_url: wire.proxy_url,
+            content_type: wire.content_type,
+            size: wire.size,
+            width: wire.width,
+            height: wire.height,
+            flags: wire.flags,
+        }
+    }
+}
+
+/// An embed. Each part is read on its own, so one Discord sends in a shape
+/// this version does not know is left out rather than the whole embed.
+#[derive(serde::Deserialize)]
+struct WireEmbed {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
+    url: Option<String>,
+    color: Option<u32>,
+    #[serde(default, deserialize_with = "lenient_one")]
+    author: Option<Named>,
+    #[serde(default, deserialize_with = "lenient_one")]
+    footer: Option<Footer>,
+    #[serde(default, deserialize_with = "lenient_one")]
+    provider: Option<Named>,
+    #[serde(default, deserialize_with = "lenient")]
+    fields: Vec<WireField>,
+    #[serde(default, deserialize_with = "lenient_one")]
+    thumbnail: Option<WireImage>,
+    #[serde(default, deserialize_with = "lenient_one")]
+    image: Option<WireImage>,
+}
+
+#[derive(serde::Deserialize)]
+struct Named {
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct Footer {
+    text: String,
+}
+
+#[derive(serde::Deserialize)]
+struct WireField {
+    name: String,
+    value: String,
+    #[serde(default)]
+    inline: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct WireImage {
+    url: String,
+    proxy_url: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+impl From<WireImage> for EmbedImage {
+    fn from(wire: WireImage) -> Self {
+        EmbedImage {
+            url: wire.url,
+            proxy_url: wire.proxy_url,
+            width: wire.width,
+            height: wire.height,
+        }
+    }
+}
+
+impl From<WireEmbed> for Embed {
+    fn from(wire: WireEmbed) -> Self {
+        Embed {
+            kind: wire.kind,
+            title: wire.title,
+            description: wire.description,
+            url: wire.url,
+            color: wire.color,
+            author: wire.author.map(|a| a.name),
+            footer: wire.footer.map(|f| f.text),
+            provider: wire.provider.map(|p| p.name),
+            fields: wire
+                .fields
+                .into_iter()
+                .map(|f| EmbedField {
+                    name: f.name,
+                    value: f.value,
+                    inline: f.inline,
+                })
+                .collect(),
+            thumbnail: wire.thumbnail.map(Into::into),
+            image: wire.image.map(Into::into),
+        }
+    }
 }
 
 /// The message types shown as conversation: regular messages, replies and
@@ -107,6 +233,8 @@ impl From<WireMessage> for Message {
             id: wire.id,
             author: wire.author.into(),
             content: wire.content,
+            attachments: wire.attachments.into_iter().map(Into::into).collect(),
+            embeds: wire.embeds.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -152,6 +280,10 @@ struct MessageChange {
     #[serde(deserialize_with = "snowflake")]
     channel_id: Id,
     content: Option<String>,
+    #[serde(default, deserialize_with = "lenient_some")]
+    attachments: Option<Vec<WireAttachment>>,
+    #[serde(default, deserialize_with = "lenient_some")]
+    embeds: Option<Vec<WireEmbed>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -255,6 +387,26 @@ where
         );
     }
     Ok(items)
+}
+
+/// [`lenient`] for a list that may be missing, as in a partial update.
+fn lenient_some<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    lenient(deserializer).map(Some)
+}
+
+/// One object read leniently: in a shape this version does not know, or
+/// null, it is left out.
+fn lenient_one<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raw: Option<Box<RawValue>> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| serde_json::from_str(raw.get()).ok()))
 }
 
 #[derive(serde::Deserialize)]
@@ -651,6 +803,12 @@ impl Decoder {
                     channel: change.channel_id,
                     id: change.id,
                     content: change.content,
+                    attachments: change
+                        .attachments
+                        .map(|list| list.into_iter().map(Into::into).collect()),
+                    embeds: change
+                        .embeds
+                        .map(|list| list.into_iter().map(Into::into).collect()),
                 }]
             }
             "MESSAGE_DELETE" | "MESSAGE_DELETE_BULK" => {
@@ -999,6 +1157,104 @@ mod tests {
         assert_eq!(oldest, Some(99));
     }
 
+    /// A made-up message in the shape the web client receives.
+    const WITH_MEDIA: &str = r#"{"id":"50","channel_id":"7","type":0,"content":"regarde","author":{"id":"5","username":"sam","global_name":null},
+        "attachments":[
+            {"id":"60","filename":"SPOILER_photo.png","size":48213,"url":"https://cdn.discordapp.com/attachments/7/60/SPOILER_photo.png?ex=1&is=2&hm=3&","proxy_url":"https://media.discordapp.net/attachments/7/60/SPOILER_photo.png?ex=1&is=2&hm=3&","content_type":"image/png","width":800,"height":600,"flags":8,"placeholder":"abc","placeholder_version":1},
+            {"id":"61","filename":"notes.pdf","size":1024,"url":"https://cdn.discordapp.com/attachments/7/61/notes.pdf","proxy_url":"https://media.discordapp.net/attachments/7/61/notes.pdf","content_type":"application/pdf"},
+            {"id":"62"}
+        ],
+        "embeds":[
+            {"type":"rich","title":"Titre","description":"Du **texte**","url":"https://example.com/","color":13517355,
+             "author":{"name":"Auteur","url":"https://example.com/a"},"footer":{"text":"Pied"},"provider":{"name":"Site"},
+             "fields":[{"name":"A","value":"1","inline":true},{"name":"B"},{"name":"C","value":"3"}],
+             "thumbnail":{"url":"https://example.com/t.png","proxy_url":"https://images-ext-1.discordapp.net/external/x/https/example.com/t.png","width":80,"height":80,"flags":0},
+             "image":{"proxy_url":"https://images-ext-1.discordapp.net/external/y"}},
+            {"type":"gifv","url":"https://tenor.com/view/x","provider":{"name":"Tenor","url":"https://tenor.co"},
+             "thumbnail":{"url":"https://media.tenor.com/x.png","proxy_url":"https://images-ext-2.discordapp.net/external/z/https/media.tenor.com/x.png","width":498,"height":280},
+             "video":{"url":"https://media.tenor.com/x.mp4","proxy_url":"https://images-ext-2.discordapp.net/external/v","width":498,"height":280}},
+            {"type":"rich","color":"red"}
+        ]}"#;
+
+    #[test]
+    fn messages_carry_attachments_and_embeds() {
+        let mut decoder = Decoder::default();
+        let created = decoder.event("MESSAGE_CREATE", WITH_MEDIA).unwrap();
+        let [Update::MessageCreate { message, .. }] = &created[..] else {
+            panic!("expected a message");
+        };
+        // The attachment without a filename or URL is left out, the message kept.
+        assert_eq!(message.content, "regarde");
+        let [photo, notes] = &message.attachments[..] else {
+            panic!("expected two attachments");
+        };
+        assert_eq!(
+            (photo.id, photo.size, photo.width, photo.height, photo.flags),
+            (60, 48213, Some(800), Some(600), Attachment::SPOILER)
+        );
+        assert!(photo.proxy_url.starts_with("https://media.discordapp.net/"));
+        assert_eq!(notes.content_type.as_deref(), Some("application/pdf"));
+        assert_eq!((notes.width, notes.flags), (None, 0));
+
+        // The embed with a colour in an unknown shape is left out.
+        let [rich, gif] = &message.embeds[..] else {
+            panic!("expected two embeds");
+        };
+        assert_eq!(rich.kind.as_deref(), Some("rich"));
+        assert_eq!(rich.color, Some(0xce422b));
+        assert_eq!(
+            (
+                rich.author.as_deref(),
+                rich.footer.as_deref(),
+                rich.provider.as_deref()
+            ),
+            (Some("Auteur"), Some("Pied"), Some("Site"))
+        );
+        // The field without a value is left out; `inline` defaults to false.
+        let fields: Vec<(&str, bool)> = rich
+            .fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.inline))
+            .collect();
+        assert_eq!(fields, [("A", true), ("C", false)]);
+        let thumbnail = rich.thumbnail.as_ref().unwrap();
+        assert_eq!((thumbnail.width, thumbnail.height), (Some(80), Some(80)));
+        // An image without its URL is left out, not the embed.
+        assert_eq!(rich.image, None);
+        assert_eq!(gif.kind.as_deref(), Some("gifv"));
+        assert!(gif.thumbnail.as_ref().unwrap().proxy_url.is_some());
+
+        // History pages read the same way.
+        let Update::History { messages, .. } = history(7, &format!("[{WITH_MEDIA}]")).unwrap()
+        else {
+            panic!("expected history");
+        };
+        assert_eq!(messages[0].embeds.len(), 2);
+    }
+
+    #[test]
+    fn a_link_preview_arrives_as_an_edit() {
+        let mut decoder = Decoder::default();
+        let edited = decoder
+            .event(
+                "MESSAGE_UPDATE",
+                r#"{"id":"50","channel_id":"7","guild_id":"1","embeds":[{"type":"article","title":"Rust","url":"https://www.rust-lang.org/","provider":{"name":"rust-lang.org"}}]}"#,
+            )
+            .unwrap();
+        let [
+            Update::MessageEdit {
+                content: None,
+                attachments: None,
+                embeds: Some(embeds),
+                ..
+            },
+        ] = &edited[..]
+        else {
+            panic!("expected an edit of the embeds only");
+        };
+        assert_eq!(embeds[0].title.as_deref(), Some("Rust"));
+    }
+
     #[test]
     fn message_events() {
         let mut decoder = Decoder::default();
@@ -1023,7 +1279,9 @@ mod tests {
             [Update::MessageEdit {
                 channel: 7,
                 id: 40,
-                content: None
+                content: None,
+                attachments: None,
+                embeds: Some(vec![]),
             }]
         );
         assert_eq!(

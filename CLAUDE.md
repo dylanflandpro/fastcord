@@ -19,6 +19,10 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
   `&app.model` while it changes `app.selection`. Keep the model borrowed in place.
 - `ui.rs`: drawing only. Turn any decision it makes into a function in `model.rs`
   or a method on `Selection`, with a test.
+- `media.rs`: pictures in messages. The rules (which attachments are images, sizes,
+  which hosts may be loaded: Discord's only) are tested functions; `Media` keeps the
+  textures in memory under a cap and fetches off the interface's thread. Draw a
+  picture only when it is on screen, so only what is seen loads.
 - `theme.rs`: the palette, which follows Omarchy's through `fastframe-theme`.
 - `backend.rs`: the thread that talks to Discord and the keyring. The interface
   sends `Command`s and reads what it reports; it never waits on the network.
