@@ -6,14 +6,18 @@
 //! it. The window reports what it shows through [`Shared`].
 //!
 //! Rules follow the web client's notification store (`shouldNotify`): not
-//! my own messages, not @silent ones, not while my status is Do Not
-//! Disturb, not the conversation open in a focused window, and otherwise
+//! my own messages, not @silent ones, not from people I blocked or ignored
+//! or from flagged spammers, not while my status is Do Not Disturb or quiet
+//! mode is on, not the conversation open in a focused window, and otherwise
 //! what my notification settings let through ([`Model::notifies`]).
+//!
+//! A first DM from someone new notifies only once its CHANNEL_CREATE has
+//! arrived, which Discord sends before the message.
 
 use crate::events::Update;
 use crate::markdown::{self, Directory};
 use crate::model::{ChannelKind, Id, Message, Model, Ping, created_at};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -67,8 +71,10 @@ impl Shared {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notification {
     pub channel: Id,
+    /// The message it is about.
+    pub message: Id,
     pub title: String,
-    /// Plain text, escaped for servers that read markup.
+    /// Plain text: the notifier escapes it for servers that read markup.
     pub body: String,
 }
 
@@ -76,9 +82,15 @@ pub struct Notification {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Notice {
     Show(Notification),
-    /// The channel was read: its notification goes, as in the official
-    /// client.
-    Clear(Id),
+    /// The channel was read up to `message`: its notification goes unless
+    /// it is about a later message, as in the official client.
+    Read {
+        channel: Id,
+        message: Id,
+    },
+    /// Every notification goes and clicking one no longer does anything:
+    /// signed out, or previews turned off.
+    ClearAll,
 }
 
 /// Whether a new message notifies.
@@ -93,21 +105,44 @@ pub fn wanted(
     let now = created_at(message.id);
     message.author.id != model.me
         && !ping.silent
+        && !ping.from_spammer
+        && !model.blocked_or_ignored.contains(&message.author.id)
+        && !model.quiet_mode
         && !model.do_not_disturb.is_some_and(|dnd| dnd.active(now))
         && !(attention.focused && attention.open == Some(channel))
         && model.unseen(channel, guild, message.id)
         && model.notifies(channel, ping, now)
 }
 
-/// The official client's title: the author, then in a guild the channel and
-/// its category ("Léa (#général, Discussions)"), in a group DM its members.
-/// The guild's name is not in it: Discord shows the guild's icon instead.
+/// Whether a message notifies even through a burst: a DM, or a mention of
+/// me by name.
+fn urgent(model: &Model, channel: Id, ping: &Ping) -> bool {
+    ping.me || model.dm(channel).is_some()
+}
+
+/// A name in a title, as the official client sets it: control characters
+/// out, and isolated (U+2068…U+2069) so a right-to-left name cannot turn
+/// the rest of the title around.
+fn isolate(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .filter(|&c| !c.is_control() && !matches!(c, '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+        .collect();
+    format!("\u{2068}{clean}\u{2069}")
+}
+
+/// The official client's title: the author (by their nickname in a
+/// guild), then in a guild the channel and its category ("Léa (#général,
+/// Discussions)"), in a group DM its members. Without a category the guild
+/// goes there instead: the official client shows the guild's icon, which
+/// fastcord has not.
 pub fn title(model: &Model, channel: Id, message: &Message) -> String {
-    let author = message.author.display_name();
+    let guild = model.guild_of(channel);
+    let author = isolate(&model.name_in(guild, &message.author));
     if let Some(dm) = model.dm(channel) {
         return match dm.recipients.len() {
-            0 | 1 => author.to_owned(),
-            _ => format!("{author} ({})", dm.title()),
+            0 | 1 => author,
+            _ => format!("{author} ({})", isolate(&dm.title())),
         };
     }
     let Some((guild, channel)) = model
@@ -115,17 +150,19 @@ pub fn title(model: &Model, channel: Id, message: &Message) -> String {
         .iter()
         .find_map(|g| g.channel(channel).map(|c| (g, c)))
     else {
-        return author.to_owned();
+        return author;
     };
     let hash = if channel.kind == ChannelKind::Voice {
         ""
     } else {
         "#"
     };
-    match channel.parent.and_then(|p| guild.channel(p)) {
-        Some(category) => format!("{author} ({hash}{}, {})", channel.name, category.name),
-        None => format!("{author} ({hash}{})", channel.name),
-    }
+    let place = match channel.parent.and_then(|p| guild.channel(p)) {
+        Some(category) => &category.name,
+        None => &guild.name,
+    };
+    let name = isolate(&format!("{hash}{}", channel.name));
+    format!("{author} ({name}, {})", isolate(place))
 }
 
 /// The longest body shown, in characters.
@@ -143,7 +180,7 @@ pub fn body(
     tz: &jiff::tz::TimeZone,
 ) -> String {
     if !show_content {
-        return "New message".to_owned();
+        return HIDDEN_BODY.to_owned();
     }
     let names = Directory::new(model, channel);
     let mut text = markdown::plain(&markdown::parse(&message.content), &names, now, tz);
@@ -165,8 +202,10 @@ pub fn body(
     {
         text = format!("Uploaded {}", file.filename);
     }
-    escape(&truncate(&text, BODY_CHARS))
+    truncate(&text, BODY_CHARS)
 }
+
+const HIDDEN_BODY: &str = "New message";
 
 fn truncate(text: &str, max: usize) -> String {
     match text.char_indices().nth(max) {
@@ -175,42 +214,53 @@ fn truncate(text: &str, max: usize) -> String {
     }
 }
 
-/// Notification servers may read the body as markup: a message's `<` and
-/// `&` must stay text.
+/// Servers with the `body-markup` capability read the body as markup: a
+/// message's `<` and `&` must stay text there.
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
 
-/// At most this many notifications in [`BURST_WINDOW`]; past it, messages
-/// notify nothing until the window moves on (their badges still count).
-/// Each channel already shows one notification at a time, so a busy
-/// conversation updates its own instead of piling up.
+/// At most this many new notifications in [`BURST_WINDOW`]; past it, guild
+/// messages notify nothing until the window moves on (their badges still
+/// count). A DM or a mention of me always gets through, and so does a
+/// message in a channel notified within the window: it replaces that
+/// channel's notification rather than adding one.
 const BURST: usize = 4;
 const BURST_WINDOW: Duration = Duration::from_secs(10);
 
 /// Keeps a burst of messages from flooding the desktop.
 #[derive(Debug, Default)]
 pub struct Throttle {
-    shown: VecDeque<Instant>,
+    /// When each new notification counted against the burst was shown.
+    counted: VecDeque<Instant>,
+    /// The channels notified within the window, and when last.
+    recent: HashMap<Id, Instant>,
 }
 
 impl Throttle {
     /// Whether a notification may show now, counting it if so.
-    pub fn admit(&mut self, now: Instant) -> bool {
-        while self
-            .shown
-            .front()
-            .is_some_and(|&at| now.duration_since(at) >= BURST_WINDOW)
-        {
-            self.shown.pop_front();
+    pub fn admit(&mut self, channel: Id, urgent: bool, now: Instant) -> bool {
+        let fresh = |at: &Instant| now.duration_since(*at) < BURST_WINDOW;
+        while self.counted.front().is_some_and(|at| !fresh(at)) {
+            self.counted.pop_front();
         }
-        let admitted = self.shown.len() < BURST;
+        self.recent.retain(|_, at| fresh(at));
+        let replaces = self.recent.contains_key(&channel);
+        let admitted = urgent || replaces || self.counted.len() < BURST;
         if admitted {
-            self.shown.push_back(now);
+            if !urgent && !replaces {
+                self.counted.push_back(now);
+            }
+            self.recent.insert(channel, now);
         }
         admitted
+    }
+
+    /// The channel was read: its notification is gone.
+    pub fn forget(&mut self, channel: Id) {
+        self.recent.remove(&channel);
     }
 }
 
@@ -248,14 +298,16 @@ impl Notifications {
                 ping,
             } => {
                 let attention = self.shared.attention();
+                let urgent = urgent(model, *channel, ping);
                 (wanted(model, *channel, *guild, message, ping, attention)
-                    && self.throttle.admit(now))
+                    && self.throttle.admit(*channel, urgent, now))
                 .then(|| {
                     let wall = jiff::Timestamp::now();
                     let tz = jiff::tz::TimeZone::system();
                     let show = self.shared.show_content();
                     Notice::Show(Notification {
                         channel: *channel,
+                        message: message.id,
                         title: title(model, *channel, message),
                         body: body(model, *channel, message, show, wall, &tz),
                     })
@@ -263,9 +315,16 @@ impl Notifications {
             }
             Update::Acked {
                 channel,
+                message,
                 manual: false,
                 ..
-            } => Some(Notice::Clear(*channel)),
+            } => {
+                self.throttle.forget(*channel);
+                Some(Notice::Read {
+                    channel: *channel,
+                    message: *message,
+                })
+            }
             _ => None,
         };
         model.apply(update.clone());
@@ -273,87 +332,169 @@ impl Notifications {
     }
 }
 
-/// The desktop's notifier, on its own thread: a D-Bus round trip never
-/// holds up the gateway. `opened` runs when a notification is clicked,
-/// with its channel. Never used in tests.
-pub fn desktop(opened: impl Fn(Id) + Send + 'static) -> impl Fn(Notice) {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    let started = std::thread::Builder::new()
-        .name("notifications".into())
-        .spawn(move || serve_desktop(receiver, opened));
-    if let Err(error) = started {
-        log::warn!("notifications are off: {error}");
+/// The notifications on screen, by channel, as the notifier tracks them.
+#[derive(Debug, Default)]
+pub struct Shown {
+    popups: HashMap<Id, Popup>,
+}
+
+#[derive(Debug)]
+struct Popup {
+    /// The notification server's id for it.
+    id: u32,
+    message: Id,
+}
+
+impl Shown {
+    /// The notification a new one for `channel` replaces (0: none).
+    pub fn replaces(&self, channel: Id) -> u32 {
+        self.popups.get(&channel).map_or(0, |p| p.id)
     }
-    move |notice| {
-        let _ = sender.send(notice);
+
+    pub fn shown(&mut self, notification: &Notification, id: u32) {
+        let popup = Popup {
+            id,
+            message: notification.message,
+        };
+        self.popups.insert(notification.channel, popup);
+    }
+
+    /// The server closed it (expired, dismissed or clicked).
+    pub fn closed(&mut self, id: u32) {
+        self.popups.retain(|_, p| p.id != id);
+    }
+
+    /// The channel a clicked notification opens.
+    pub fn clicked(&self, id: u32) -> Option<Id> {
+        self.popups
+            .iter()
+            .find_map(|(&channel, p)| (p.id == id).then_some(channel))
+    }
+
+    /// The notification to close once `channel` is read up to `message`.
+    pub fn read(&mut self, channel: Id, message: Id) -> Option<u32> {
+        let popup = self.popups.get(&channel)?;
+        (popup.message <= message).then_some(popup.id)?;
+        self.popups.remove(&channel).map(|p| p.id)
+    }
+
+    /// Every notification, to close; none is tracked after.
+    pub fn clear(&mut self) -> Vec<u32> {
+        self.popups.drain().map(|(_, p)| p.id).collect()
     }
 }
 
-fn serve_desktop(
-    mut notices: tokio::sync::mpsc::UnboundedReceiver<Notice>,
-    opened: impl Fn(Id) + 'static,
-) {
-    use notify_rust::{Hint, NotificationHandle, NotificationResponse};
-    use std::rc::Rc;
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        log::warn!("notifications are off: no runtime");
-        return;
-    };
-    let opened = Rc::new(opened);
-    let local = tokio::task::LocalSet::new();
-    local.block_on(&runtime, async move {
-        // Per channel, its notification and the task waiting for a click.
-        let mut shown: std::collections::HashMap<
-            Id,
-            (Rc<NotificationHandle>, tokio::task::JoinHandle<()>),
-        > = Default::default();
-        while let Some(notice) = notices.recv().await {
-            match notice {
-                Notice::Show(notification) => {
-                    let channel = notification.channel;
-                    let mut desktop = notify_rust::Notification::new();
-                    desktop
-                        .appname("fastcord")
-                        .summary(&notification.title)
-                        .body(&notification.body)
-                        .action("default", "Open")
-                        .hint(Hint::Category("im.received".into()))
-                        .hint(Hint::DesktopEntry("fastcord".into()));
-                    if let Some((previous, waiting)) = shown.remove(&channel) {
-                        waiting.abort();
-                        desktop.id(previous.id());
-                    }
-                    let handle = match desktop.show_async().await {
-                        Ok(handle) => Rc::new(handle),
-                        Err(error) => {
-                            log::warn!("a notification could not be shown: {error}");
-                            continue;
+/// Sends notices to the desktop's notifier.
+#[derive(Clone, Debug)]
+pub struct Notifier {
+    sender: tokio::sync::mpsc::UnboundedSender<Notice>,
+}
+
+impl Notifier {
+    pub fn send(&self, notice: Notice) {
+        let _ = self.sender.send(notice);
+    }
+}
+
+/// The desktop's notifier: one D-Bus connection on its own thread, so a
+/// round trip never holds up the gateway. `opened` runs when a notification
+/// is clicked, with its channel. Never used in tests.
+pub fn desktop(opened: impl Fn(Id) + Send + 'static) -> Notifier {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let started = std::thread::Builder::new()
+        .name("notifications".into())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                log::warn!("notifications are off: no runtime");
+                return;
+            };
+            if let Err(error) = runtime.block_on(serve_desktop(&mut receiver, &opened)) {
+                log::warn!("notifications are off: {error}");
+            }
+        });
+    if let Err(error) = started {
+        log::warn!("notifications are off: {error}");
+    }
+    Notifier { sender }
+}
+
+const NOTIFICATIONS: &str = "org.freedesktop.Notifications";
+
+/// The freedesktop notification protocol over one session-bus connection.
+async fn serve_desktop(
+    notices: &mut tokio::sync::mpsc::UnboundedReceiver<Notice>,
+    opened: &dyn Fn(Id),
+) -> zbus::Result<()> {
+    use futures_util::StreamExt as _;
+    let connection = zbus::Connection::session().await?;
+    let path = "/org/freedesktop/Notifications";
+    let proxy = zbus::Proxy::new(&connection, NOTIFICATIONS, path, NOTIFICATIONS).await?;
+    let capabilities: Vec<String> = proxy.call("GetCapabilities", &()).await.unwrap_or_default();
+    let markup = capabilities.iter().any(|c| c == "body-markup");
+    let mut invoked = proxy.receive_signal("ActionInvoked").await?;
+    let mut closed = proxy.receive_signal("NotificationClosed").await?;
+    let mut shown = Shown::default();
+    loop {
+        tokio::select! {
+            notice = notices.recv() => {
+                let Some(notice) = notice else {
+                    return Ok(());
+                };
+                let close = match notice {
+                    Notice::Show(notification) => {
+                        let body = match markup {
+                            true => escape(&notification.body),
+                            false => notification.body.clone(),
+                        };
+                        let replaces = shown.replaces(notification.channel);
+                        match notify(&proxy, replaces, &notification.title, &body).await {
+                            Ok(id) => shown.shown(&notification, id),
+                            Err(error) => log::warn!("a notification could not be shown: {error}"),
                         }
-                    };
-                    let (clicked, waited) = (opened.clone(), handle.clone());
-                    let waiting = tokio::task::spawn_local(async move {
-                        waited
-                            .wait_for_action_async(|response| {
-                                if matches!(response, NotificationResponse::Default) {
-                                    clicked(channel);
-                                }
-                            })
-                            .await;
-                    });
-                    shown.insert(channel, (handle, waiting));
-                }
-                Notice::Clear(channel) => {
-                    if let Some((handle, waiting)) = shown.remove(&channel) {
-                        waiting.abort();
-                        handle.close_async().await;
+                        Vec::new()
                     }
+                    Notice::Read { channel, message } => shown.read(channel, message).into_iter().collect(),
+                    Notice::ClearAll => shown.clear(),
+                };
+                for id in close {
+                    let _ = proxy.call::<_, _, ()>("CloseNotification", &id).await;
+                }
+            }
+            Some(signal) = invoked.next() => {
+                if let Ok((id, action)) = signal.body().deserialize::<(u32, String)>()
+                    && action == "default"
+                    && let Some(channel) = shown.clicked(id)
+                {
+                    opened(channel);
+                }
+            }
+            Some(signal) = closed.next() => {
+                if let Ok((id, _reason)) = signal.body().deserialize::<(u32, u32)>() {
+                    shown.closed(id);
                 }
             }
         }
-    });
+    }
+}
+
+/// `Notify`, as the specification lays it out: the app, the notification
+/// it replaces, no icon, the texts, a default action (a click), hints for
+/// the server, and the server's own timeout.
+async fn notify(
+    proxy: &zbus::Proxy<'_>,
+    replaces: u32,
+    title: &str,
+    body: &str,
+) -> zbus::Result<u32> {
+    let mut hints: HashMap<&str, zbus::zvariant::Value<'_>> = HashMap::new();
+    hints.insert("category", "im.received".into());
+    hints.insert("desktop-entry", "fastcord".into());
+    let actions = vec!["default", "Open"];
+    let call = ("fastcord", replaces, "", title, body, actions, hints, -1i32);
+    proxy.call("Notify", &call).await
 }
 
 #[cfg(test)]
@@ -452,7 +593,7 @@ mod tests {
             me,
             everyone,
             roles: roles.to_vec(),
-            silent: false,
+            ..Ping::default()
         }
     }
 
@@ -572,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn never_mine_silent_seen_or_while_do_not_disturb() {
+    fn never_mine_silent_blocked_spam_seen_or_while_quiet_or_do_not_disturb() {
         let mut model = model();
         let hi = |id, author| message(id, author, "hi");
         let quiet = Ping::default();
@@ -608,6 +749,19 @@ mod tests {
             &quiet,
             away()
         ));
+
+        let fresh = hi(START + 1, FRIEND);
+        let spam = Ping {
+            from_spammer: true,
+            ..Ping::default()
+        };
+        assert!(!wanted(&model, DM, None, &fresh, &spam, away()));
+        model.blocked_or_ignored.insert(FRIEND);
+        assert!(!wanted(&model, DM, None, &fresh, &quiet, away()));
+        model.blocked_or_ignored.clear();
+        model.quiet_mode = true;
+        assert!(!wanted(&model, DM, None, &fresh, &quiet, away()));
+        model.quiet_mode = false;
 
         // A temporary status ends on its own.
         let fresh = hi(START + 1, FRIEND);
@@ -650,24 +804,72 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn titles_follow_the_official_client() {
-        let model = model();
-        let from = message(START + 1, FRIEND, "");
-        assert_eq!(title(&model, DM, &from), "lea");
-        assert_eq!(title(&model, GROUP, &from), "lea (lea, marc)");
-        assert_eq!(title(&model, TEXT, &from), "lea (#general, Talk)");
-        assert_eq!(title(&model, VOICE, &from), "lea (Lounge, Talk)");
+    /// A title with its isolation marks shown as brackets.
+    fn shown_title(model: &Model, channel: Id, message: &Message) -> String {
+        title(model, channel, message)
+            .replace('\u{2068}', "[")
+            .replace('\u{2069}', "]")
     }
 
     #[test]
-    fn bodies_are_plain_escaped_short_and_hideable() {
+    fn titles_follow_the_official_client() {
+        let mut model = model();
+        let from = message(START + 1, FRIEND, "");
+        assert_eq!(shown_title(&model, DM, &from), "[lea]");
+        assert_eq!(shown_title(&model, GROUP, &from), "[lea] ([lea, marc])");
+        assert_eq!(
+            shown_title(&model, TEXT, &from),
+            "[lea] ([#general], [Talk])"
+        );
+        assert_eq!(
+            shown_title(&model, VOICE, &from),
+            "[lea] ([Lounge], [Talk])"
+        );
+        model.guilds[0].channels[1].parent = None;
+        assert_eq!(
+            shown_title(&model, TEXT, &from),
+            "[lea] ([#general], [Rust])",
+            "the guild, without a category"
+        );
+        model
+            .nicknames
+            .insert(GUILD, [(FRIEND, "Léa ✨".to_owned())].into());
+        assert_eq!(
+            shown_title(&model, TEXT, &from),
+            "[Léa ✨] ([#general], [Rust])"
+        );
+        assert_eq!(
+            shown_title(&model, DM, &from),
+            "[lea]",
+            "no nickname in a DM"
+        );
+    }
+
+    #[test]
+    fn titles_keep_names_from_turning_the_line_around() {
+        let mut model = model();
+        let mut from = message(START + 1, FRIEND, "");
+        from.author.username = "\u{202e}evil\u{2069}\n\u{7}name".into();
+        model.guilds[0].channels[1].name = "\u{200f}rtl\u{2066}".into();
+        assert_eq!(
+            shown_title(&model, TEXT, &from),
+            "[evilname] ([#rtl], [Talk])"
+        );
+    }
+
+    #[test]
+    fn bodies_are_plain_short_and_hideable() {
         let model = model();
         let now = jiff::Timestamp::UNIX_EPOCH;
         let tz = jiff::tz::TimeZone::UTC;
         let say = |message: &Message, show| body(&model, DM, message, show, now, &tz);
         let mut text = message(START + 1, FRIEND, "**look** <@2> a<b && ||x||");
-        assert_eq!(say(&text, true), "look @lea a&lt;b &amp;&amp; (spoiler)");
+        assert_eq!(say(&text, true), "look @lea a<b && (spoiler)");
+        assert_eq!(
+            escape("a<b> && c"),
+            "a&lt;b&gt; &amp;&amp; c",
+            "for markup servers"
+        );
         assert_eq!(say(&text, false), "New message");
         text.content = "é".repeat(300);
         assert_eq!(say(&text, true), format!("{}…", "é".repeat(250)));
@@ -702,15 +904,54 @@ mod tests {
     }
 
     #[test]
-    fn a_burst_notifies_four_times_in_ten_seconds() {
+    fn a_burst_notifies_four_new_channels_in_ten_seconds() {
         let mut throttle = Throttle::default();
         let start = Instant::now();
         let at = |secs| start + Duration::from_secs(secs);
-        let admitted: Vec<bool> = [0, 1, 2, 3, 4, 9, 10, 11]
+        let admitted: Vec<bool> = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (9, 6), (10, 7)]
             .into_iter()
-            .map(|s| throttle.admit(at(s)))
+            .map(|(s, channel)| throttle.admit(channel, false, at(s)))
             .collect();
-        assert_eq!(admitted, [true, true, true, true, false, false, true, true]);
+        assert_eq!(admitted, [true, true, true, true, false, false, true]);
+    }
+
+    #[test]
+    fn a_burst_never_starves_dms_mentions_or_replacements() {
+        let mut throttle = Throttle::default();
+        let now = Instant::now();
+        for channel in 1..=4 {
+            assert!(throttle.admit(channel, false, now));
+        }
+        assert!(!throttle.admit(5, false, now), "the burst is full");
+        assert!(throttle.admit(1, false, now), "replaces channel 1's own");
+        assert!(throttle.admit(DM, true, now), "a DM or a mention");
+        assert!(throttle.admit(6, true, now));
+        assert!(!throttle.admit(5, false, now), "neither took a slot");
+        throttle.forget(1);
+        assert!(!throttle.admit(1, false, now), "read: a new one again");
+    }
+
+    #[test]
+    fn shown_notifications_go_when_read_up_to_them() {
+        let mut shown = Shown::default();
+        let note = |channel, message| Notification {
+            channel,
+            message,
+            title: String::new(),
+            body: String::new(),
+        };
+        shown.shown(&note(DM, 50), 7);
+        shown.shown(&note(TEXT, 60), 8);
+        assert_eq!(shown.replaces(DM), 7);
+        assert_eq!(shown.clicked(8), Some(TEXT));
+        assert_eq!(shown.read(DM, 49), None, "an older message read");
+        assert_eq!(shown.read(DM, 50), Some(7));
+        assert_eq!(shown.replaces(DM), 0);
+        shown.closed(8);
+        assert_eq!(shown.clicked(8), None, "expired: forgotten");
+        shown.shown(&note(DM, 51), 9);
+        assert_eq!(shown.clear(), [9]);
+        assert_eq!(shown.clicked(9), None, "a click after logging out");
     }
 
     fn create(id: Id, channel: Id, author: Id) -> Update {
@@ -737,7 +978,7 @@ mod tests {
         let Some(Notice::Show(shown)) = shown else {
             panic!("expected a notification, got {shown:?}");
         };
-        assert_eq!((shown.channel, shown.title.as_str()), (DM, "lea"));
+        assert_eq!((shown.channel, shown.message), (DM, START + 1));
         assert_eq!(shown.body, "hi");
         assert_eq!(
             notifications.follow(&create(START + 1, DM, FRIEND), now),
@@ -765,7 +1006,11 @@ mod tests {
             mentions: None,
             flags: None,
         };
-        assert_eq!(notifications.follow(&read, now), Some(Notice::Clear(DM)));
+        let read_up_to = Notice::Read {
+            channel: DM,
+            message: START + 3,
+        };
+        assert_eq!(notifications.follow(&read, now), Some(read_up_to));
         let status = Update::DoNotDisturb(Some(Mute { until: None }));
         assert_eq!(notifications.follow(&status, now), None);
         shared.set_attention(away());
@@ -774,21 +1019,5 @@ mod tests {
             None
         );
         assert!(notifications.model.as_ref().unwrap().messages.is_empty());
-    }
-
-    #[test]
-    fn a_burst_across_channels_is_cut_short() {
-        let mut notifications = Notifications::new(Arc::new(Shared::default()));
-        notifications.ready(&model());
-        let now = Instant::now();
-        let shown = (1..=6)
-            .filter(|&n| {
-                let channel = if n % 2 == 0 { DM } else { GROUP };
-                notifications
-                    .follow(&create(START + n, channel, FRIEND), now)
-                    .is_some()
-            })
-            .count();
-        assert_eq!(shown, BURST);
     }
 }

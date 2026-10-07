@@ -104,6 +104,20 @@ pub enum Update {
     },
     /// My status changed: Do Not Disturb (until when), or anything else.
     DoNotDisturb(Option<Mute>),
+    /// Quiet mode (the account setting that silences notifications)
+    /// turned on or off.
+    QuietMode(bool),
+    /// I blocked or ignored someone, or stopped to.
+    BlockedOrIgnored {
+        user: Id,
+        blocked_or_ignored: bool,
+    },
+    /// People a message named (its author and those it mentions), with
+    /// their nickname in `guild` when the event gave one.
+    People {
+        guild: Option<Id>,
+        people: Vec<(User, Option<Option<String>>)>,
+    },
 }
 
 /// How many messages a history page asks for, as the official client does.
@@ -127,15 +141,38 @@ struct WireMessage {
     #[serde(default, deserialize_with = "optional_snowflake")]
     guild_id: Option<Id>,
     #[serde(default, deserialize_with = "lenient")]
-    mentions: Vec<WireMemberUser>,
+    mentions: Vec<WireMention>,
+    /// The author's membership, in a guild.
+    #[serde(default, deserialize_with = "lenient_one")]
+    member: Option<WireNick>,
     /// Set only when the author was allowed to ping everyone.
     #[serde(default)]
     mention_everyone: bool,
     #[serde(default)]
     mention_roles: Vec<String>,
-    #[serde(default)]
-    flags: u64,
+    /// Read leniently: an odd value must not cost the message.
+    #[serde(default, deserialize_with = "lenient_one")]
+    flags: Option<u64>,
 }
+
+/// A user a message mentions, with their membership in a guild.
+#[derive(serde::Deserialize)]
+struct WireMention {
+    #[serde(deserialize_with = "snowflake")]
+    id: Id,
+    username: Option<String>,
+    global_name: Option<String>,
+    #[serde(default, deserialize_with = "lenient_one")]
+    member: Option<WireNick>,
+}
+
+#[derive(serde::Deserialize)]
+struct WireNick {
+    nick: Option<String>,
+}
+
+/// The user flag Discord sets on accounts it takes for spammers.
+const SPAMMER: u64 = 1 << 20;
 
 /// The message flag of @silent messages.
 const SUPPRESS_NOTIFICATIONS: u64 = 1 << 12;
@@ -270,8 +307,25 @@ impl WireMessage {
                 .iter()
                 .filter_map(|r| r.parse().ok())
                 .collect(),
-            silent: self.flags & SUPPRESS_NOTIFICATIONS != 0,
+            silent: self.flags.unwrap_or(0) & SUPPRESS_NOTIFICATIONS != 0,
+            from_spammer: self.author.public_flags.unwrap_or(0) & SPAMMER != 0,
         }
+    }
+
+    /// The author and the people mentioned, for names and nicknames.
+    fn people(&self) -> Vec<(User, Option<Option<String>>)> {
+        let author = User::from(self.author.clone());
+        let nick = |member: &Option<WireNick>| member.as_ref().map(|m| m.nick.clone());
+        std::iter::once((author, nick(&self.member)))
+            .chain(self.mentions.iter().filter_map(|m| {
+                let user = User {
+                    id: m.id,
+                    username: m.username.clone()?,
+                    global_name: m.global_name.clone(),
+                };
+                Some((user, nick(&m.member)))
+            }))
+            .collect()
     }
 }
 
@@ -372,8 +426,33 @@ struct Ready {
     read_state: Option<Box<RawValue>>,
     user_guild_settings: Option<Box<RawValue>>,
     notification_settings: Option<Box<RawValue>>,
-    /// The account's settings, as base64 protobuf: only my status is read.
+    /// The account's settings, as base64 protobuf: only my status and
+    /// quiet mode are read.
     user_settings_proto: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    relationships: Vec<WireRelationship>,
+}
+
+#[derive(serde::Deserialize)]
+struct WireRelationship {
+    /// The other user.
+    #[serde(deserialize_with = "snowflake")]
+    id: Id,
+    #[serde(rename = "type", default)]
+    kind: u8,
+    #[serde(default)]
+    user_ignored: bool,
+}
+
+/// The relationship type of someone I blocked.
+const BLOCKED: u8 = 2;
+
+impl WireRelationship {
+    /// The web client's `isBlockedOrIgnored`: blocked, or ignored (a flag
+    /// on any other relationship).
+    fn blocked_or_ignored(&self) -> bool {
+        self.kind == BLOCKED || self.user_ignored
+    }
 }
 
 /// The account's notification settings: only the flag that separates
@@ -501,9 +580,19 @@ impl WireGuildSettings {
                 (o.channel_id, settings)
             })
             .collect();
+        // A guild's own record set to 3 (NULL) is not the guild's default:
+        // the official store keeps the record over the default, and NULL is
+        // neither "all" nor "nothing", so only mentions get through. The DM
+        // record keeps notifying on every message.
+        let level = self.message_notifications;
+        let unset = self.guild_id.is_some() && level.is_some_and(|l| notify(Some(l)).is_none());
         let settings = GuildSettings {
             muted: mute(self.muted, self.mute_config),
-            notify: notify(self.message_notifications),
+            notify: if unset {
+                Some(Notify::Mentions)
+            } else {
+                notify(level)
+            },
             unreads: unreads(self.flags, 1 << 11, 1 << 12),
             suppress_everyone: self.suppress_everyone,
             suppress_roles: self.suppress_roles,
@@ -1061,8 +1150,20 @@ impl Decoder {
                 .is_some_and(|s| s.flags & USE_NEW_NOTIFICATIONS != 0),
             do_not_disturb: ready
                 .user_settings_proto
-                .and_then(|proto| do_not_disturb(&proto, false))
+                .as_deref()
+                .and_then(|proto| do_not_disturb(proto, false))
                 .flatten(),
+            quiet_mode: ready
+                .user_settings_proto
+                .as_deref()
+                .and_then(|proto| quiet_mode(proto, false))
+                .unwrap_or(false),
+            blocked_or_ignored: ready
+                .relationships
+                .iter()
+                .filter(|r| r.blocked_or_ignored())
+                .map(|r| r.id)
+                .collect(),
             ..Model::default()
         };
         model.read_states = read_states(ready.read_state.as_deref(), &model);
@@ -1150,14 +1251,20 @@ impl Decoder {
                 }
                 let (channel, guild) = (wire.channel_id, wire.guild_id);
                 let ping = wire.ping(self.me);
+                let people = wire.people();
                 let message = Message::from(wire);
-                self.users.insert(message.author.id, message.author.clone());
-                vec![Update::MessageCreate {
-                    channel,
-                    guild,
-                    message,
-                    ping,
-                }]
+                for (user, _) in &people {
+                    self.users.insert(user.id, user.clone());
+                }
+                vec![
+                    Update::People { guild, people },
+                    Update::MessageCreate {
+                        channel,
+                        guild,
+                        message,
+                        ping,
+                    },
+                ]
             }
             "MESSAGE_UPDATE" => {
                 let change: MessageChange = serde_json::from_str(data)?;
@@ -1229,10 +1336,18 @@ impl Decoder {
                 if update.settings.kind != PRELOADED_USER_SETTINGS {
                     return Ok(Vec::new());
                 }
-                do_not_disturb(&update.settings.proto, update.partial)
-                    .map(Update::DoNotDisturb)
-                    .into_iter()
-                    .collect()
+                let (proto, partial) = (&update.settings.proto, update.partial);
+                let status = do_not_disturb(proto, partial).map(Update::DoNotDisturb);
+                let quiet = quiet_mode(proto, partial).map(Update::QuietMode);
+                status.into_iter().chain(quiet).collect()
+            }
+            "RELATIONSHIP_ADD" | "RELATIONSHIP_UPDATE" | "RELATIONSHIP_REMOVE" => {
+                let relationship: WireRelationship = serde_json::from_str(data)?;
+                vec![Update::BlockedOrIgnored {
+                    user: relationship.id,
+                    blocked_or_ignored: name != "RELATIONSHIP_REMOVE"
+                        && relationship.blocked_or_ignored(),
+                }]
             }
             _ => Vec::new(),
         })
@@ -1267,9 +1382,8 @@ const PRELOADED_USER_SETTINGS: u8 = 1;
 /// say nothing of the status (a partial update leaves it alone) or cannot
 /// be read; a full set without one means online.
 fn do_not_disturb(base64: &str, partial: bool) -> Option<Option<Mute>> {
-    use base64::Engine as _;
-    let decoded = base64::engine::general_purpose::STANDARD.decode(base64);
-    let Some(status) = decoded.as_deref().ok().and_then(proto_status) else {
+    let decoded = settings_bytes(base64);
+    let Some(status) = decoded.as_deref().and_then(proto_status) else {
         log::warn!("unreadable settings protobuf");
         return None;
     };
@@ -1284,6 +1398,36 @@ fn do_not_disturb(base64: &str, partial: bool) -> Option<Option<Mute>> {
         })),
         None if partial => None,
         None => Some(None),
+    }
+}
+
+fn settings_bytes(base64: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(base64)
+        .ok()
+}
+
+/// Whether the settings turn quiet mode on (`notifications.quiet_mode`,
+/// field 7 then field 5, a `BoolValue`); `None` as for the status.
+fn quiet_mode(base64: &str, partial: bool) -> Option<bool> {
+    let decoded = settings_bytes(base64)?;
+    let quiet = (|| {
+        let Some(ProtoValue::Bytes(notifications)) = proto_field(&decoded, 7)? else {
+            return Some(None);
+        };
+        let Some(ProtoValue::Bytes(value)) = proto_field(notifications, 5)? else {
+            return Some(None);
+        };
+        match proto_field(value, 1)? {
+            Some(ProtoValue::Number(on)) => Some(Some(on != 0)),
+            _ => Some(Some(false)),
+        }
+    })()?;
+    match quiet {
+        Some(on) => Some(on),
+        None if partial => None,
+        None => Some(false),
     }
 }
 
@@ -1699,7 +1843,7 @@ mod tests {
     fn messages_carry_attachments_and_embeds() {
         let mut decoder = Decoder::default();
         let created = decoder.event("MESSAGE_CREATE", WITH_MEDIA).unwrap();
-        let [Update::MessageCreate { message, .. }] = &created[..] else {
+        let [_, Update::MessageCreate { message, .. }] = &created[..] else {
             panic!("expected a message");
         };
         // The attachment without a filename or URL is left out, the message kept.
@@ -1785,7 +1929,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             &created[..],
-            [Update::MessageCreate { channel: 7, guild: Some(1), message, .. }] if message.content == "salut"
+            [_, Update::MessageCreate { channel: 7, guild: Some(1), message, .. }] if message.content == "salut"
         ));
         assert_eq!(decoder.user(5).display_name(), "Sam");
         assert_eq!(
@@ -1991,16 +2135,20 @@ mod tests {
     }
 
     #[test]
-    fn messages_say_whom_they_ping() {
+    fn messages_say_whom_they_ping_and_name_people() {
         let (mut decoder, _, _) = ready();
         let created = decoder
             .event(
                 "MESSAGE_CREATE",
-                r#"{"id":"50","channel_id":"2002","guild_id":"1001","type":19,"content":"<@9000> @everyone <@&1050>","author":{"id":"9001","username":"marc"},"mentions":[{"id":"9000","username":"imbu"}],"mention_everyone":true,"mention_roles":["1050"]}"#,
+                r#"{"id":"50","channel_id":"2002","guild_id":"1001","type":19,"content":"<@9000> @everyone <@&1050>","flags":null,"author":{"id":"9001","username":"marc","public_flags":1048576},"member":{"nick":"Marco","roles":[]},"mentions":[{"id":"9000","username":"imbu","member":{"nick":null}},{"id":"9005","username":"new","global_name":"Newcomer"}],"mention_everyone":true,"mention_roles":["1050"]}"#,
             )
             .unwrap();
-        let [Update::MessageCreate { guild, ping, .. }] = &created[..] else {
-            panic!("expected a message");
+        let [
+            Update::People { guild, people },
+            Update::MessageCreate { ping, .. },
+        ] = &created[..]
+        else {
+            panic!("expected people, then a message");
         };
         assert_eq!(*guild, Some(1001));
         assert_eq!(
@@ -2010,8 +2158,64 @@ mod tests {
                 everyone: true,
                 roles: vec![1050],
                 silent: false,
+                from_spammer: true,
             }
         );
+        let named: Vec<(Id, &str, Option<Option<&str>>)> = people
+            .iter()
+            .map(|(u, nick)| (u.id, u.display_name(), nick.as_ref().map(|n| n.as_deref())))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (9001, "marc", Some(Some("Marco"))),
+                (9000, "imbu", Some(None)),
+                (9005, "Newcomer", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn people_and_nicknames_reach_the_model() {
+        let (_, mut model, _) = ready();
+        let lea = User {
+            id: 9002,
+            username: "lea.dev".into(),
+            global_name: None,
+        };
+        let people = |nick: Option<Option<&str>>| Update::People {
+            guild: Some(1001),
+            people: vec![(lea.clone(), nick.map(|n| n.map(Into::into)))],
+        };
+        model.apply(people(Some(Some("Léa"))));
+        assert_eq!(model.name_in(Some(1001), &lea), "Léa");
+        assert_eq!(model.name_in(None, &lea), "lea.dev", "renamed meanwhile");
+        model.apply(people(None));
+        assert_eq!(model.name_in(Some(1001), &lea), "Léa", "not said: kept");
+        model.apply(people(Some(None)));
+        assert_eq!(model.name_in(Some(1001), &lea), "lea.dev");
+    }
+
+    #[test]
+    fn blocked_and_ignored_people_come_from_relationships() {
+        let mut decoder = Decoder::default();
+        let (mut model, _) = decoder.ready(READY).unwrap();
+        assert_eq!(model.blocked_or_ignored, [9001, 9002].into());
+        let mut event = |name: &str, data: &str| {
+            for update in decoder.event(name, data).unwrap() {
+                model.apply(update);
+            }
+        };
+        event(
+            "RELATIONSHIP_ADD",
+            r#"{"id":"9003","type":2,"user":{"id":"9003","username":"x"}}"#,
+        );
+        event(
+            "RELATIONSHIP_UPDATE",
+            r#"{"id":"9002","type":1,"user_ignored":false}"#,
+        );
+        event("RELATIONSHIP_REMOVE", r#"{"id":"9001","type":2}"#);
+        assert_eq!(model.blocked_or_ignored, [9003].into());
     }
 
     #[test]
@@ -2023,7 +2227,7 @@ mod tests {
                 r#"{"id":"50","channel_id":"3001","content":"psst","flags":4096,"author":{"id":"9002","username":"lea.dev"}}"#,
             )
             .unwrap();
-        let [Update::MessageCreate { ping, .. }] = &created[..] else {
+        let [_, Update::MessageCreate { ping, .. }] = &created[..] else {
             panic!("expected a message");
         };
         assert!(ping.silent);
@@ -2075,6 +2279,51 @@ mod tests {
         // Unreadable: base64 that is not, a truncated message.
         assert_eq!(do_not_disturb("ignored!", false), None);
         assert_eq!(do_not_disturb("Wg8K", false), None);
+    }
+
+    #[test]
+    fn reads_quiet_mode_from_the_settings_protobuf() {
+        use base64::Engine as _;
+        let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        // notifications (7) { quiet_mode (5) { value (1): on } }
+        let quiet = |on: u8| encode(&[0x3a, 0x04, 0x2a, 0x02, 0x08, on]);
+        assert_eq!(quiet_mode(&quiet(1), true), Some(true));
+        assert_eq!(quiet_mode(&quiet(0), true), Some(false));
+        // An empty BoolValue is false.
+        assert_eq!(
+            quiet_mode(&encode(&[0x3a, 0x02, 0x2a, 0x00]), true),
+            Some(false)
+        );
+        let other = settings_proto(Some("dnd"), 0);
+        assert_eq!(quiet_mode(&other, true), None, "partial: unchanged");
+        assert_eq!(quiet_mode(&other, false), Some(false));
+        assert_eq!(quiet_mode("ignored!", false), None);
+
+        let mut decoder = Decoder::default();
+        let data = format!(
+            r#"{{"settings":{{"type":1,"proto":"{}"}},"partial":true}}"#,
+            quiet(1)
+        );
+        assert_eq!(
+            decoder.event("USER_SETTINGS_PROTO_UPDATE", &data).unwrap(),
+            [Update::QuietMode(true)]
+        );
+    }
+
+    #[test]
+    fn a_guild_record_left_unset_notifies_on_mentions() {
+        let mut decoder = Decoder::default();
+        let mut settings = |guild: &str| {
+            let data = format!(
+                r#"{{"guild_id":{guild},"message_notifications":3,"channel_overrides":[]}}"#
+            );
+            match &decoder.event("USER_GUILD_SETTINGS_UPDATE", &data).unwrap()[..] {
+                [Update::GuildSettings { settings, .. }] => settings.notify,
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+        assert_eq!(settings(r#""1001""#), Some(Notify::Mentions));
+        assert_eq!(settings("null"), None, "the DMs' record keeps its default");
     }
 
     #[test]

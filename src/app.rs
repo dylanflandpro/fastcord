@@ -3,7 +3,7 @@
 use crate::backend::{Backend, Command, Event, Link, Session};
 use crate::events::Update;
 use crate::media::{self, Media};
-use crate::model::{Ack, Id, Model};
+use crate::model::{Ack, ChannelKind, Id, Model};
 use crate::notify::{self, Attention};
 use crate::theme::{self, Catalog, Palette};
 use std::collections::{HashMap, HashSet};
@@ -111,9 +111,16 @@ impl Selection {
 
     /// Opens the conversation a notification was about, in its guild or
     /// among the DMs, as if the person had picked it.
+    /// Only a conversation I can still read: never a voice channel, a
+    /// category, or a channel hidden from me since.
     pub fn reveal(&mut self, model: &Model, channel: Id) {
-        self.view = match model.guild_of(channel) {
-            Some(guild) => View::Guild(guild),
+        let readable = |g: &crate::model::Guild| {
+            let c = g.channel(channel)?;
+            let text = matches!(c.kind, ChannelKind::Text | ChannelKind::Announcement);
+            (text && g.can_view(c, model.me)).then_some(View::Guild(g.id))
+        };
+        self.view = match model.guilds.iter().find_map(readable) {
+            Some(view) => view,
             None if model.dm(channel).is_some() => View::DirectMessages,
             None => return,
         };
@@ -342,7 +349,15 @@ impl App {
         self.notifications.show_content()
     }
 
+    /// Turning previews off also takes down the notifications already
+    /// showing a message's text.
     pub fn set_notification_content(&mut self, show: bool) {
+        if self.notifications.show_content()
+            && !show
+            && let Some(backend) = &self.backend
+        {
+            backend.notify(notify::Notice::ClearAll);
+        }
         self.notifications.set_show_content(show);
     }
 
@@ -489,7 +504,7 @@ impl App {
                         true => self.selection.repair(&model),
                         false => self.selection = Selection::initial(Some(&model)),
                     }
-                    self.model = Some(model);
+                    self.model = Some(*model);
                 }
                 Event::AckDone { channel, flags } => {
                     self.reading.outstanding.remove(&channel);
@@ -729,6 +744,10 @@ mod tests {
         selection.reveal(&model, 900);
         assert_eq!(selection.view, View::DirectMessages);
         assert_eq!(selection.channel, Some(900));
+        selection.reveal(&model, 121);
+        assert_eq!(selection.channel, Some(900), "a voice channel");
+        selection.reveal(&model, 131);
+        assert_eq!(selection.channel, Some(900), "a channel hidden from me");
         selection.reveal(&model, 12345);
         assert_eq!(selection.channel, Some(900), "a channel gone since");
         selection.open_guild(&model, 200);

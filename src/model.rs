@@ -389,6 +389,12 @@ pub struct Model {
     /// My status is Do Not Disturb, for good or until the time Discord set:
     /// nothing notifies meanwhile.
     pub do_not_disturb: Option<Mute>,
+    /// The account's quiet mode: nothing notifies while it is on.
+    pub quiet_mode: bool,
+    /// People I blocked or ignored: nothing they send notifies.
+    pub blocked_or_ignored: HashSet<Id>,
+    /// Nicknames by guild, then user, as messages report them.
+    pub nicknames: HashMap<Id, HashMap<Id, String>>,
 }
 
 impl Model {
@@ -405,6 +411,14 @@ impl Model {
         let mut dms: Vec<&DmChannel> = self.dms.iter().collect();
         dms.sort_by_key(|d| std::cmp::Reverse(d.last_message_id));
         dms
+    }
+
+    /// What a guild calls someone: their nickname there, else their name.
+    pub fn name_in(&self, guild: Option<Id>, user: &User) -> String {
+        guild
+            .and_then(|g| self.nicknames.get(&g)?.get(&user.id))
+            .cloned()
+            .unwrap_or_else(|| user.display_name().to_owned())
     }
 
     pub fn messages(&self, channel: Id) -> &[Message] {
@@ -585,6 +599,29 @@ impl Model {
                 }
             }
             Update::DoNotDisturb(status) => self.do_not_disturb = status,
+            Update::QuietMode(on) => self.quiet_mode = on,
+            Update::BlockedOrIgnored {
+                user,
+                blocked_or_ignored,
+            } => {
+                if blocked_or_ignored {
+                    self.blocked_or_ignored.insert(user);
+                } else {
+                    self.blocked_or_ignored.remove(&user);
+                }
+            }
+            Update::People { guild, people } => {
+                for (user, nick) in people {
+                    if let (Some(guild), Some(nick)) = (guild, nick) {
+                        let nicknames = self.nicknames.entry(guild).or_default();
+                        match nick {
+                            Some(nick) => nicknames.insert(user.id, nick),
+                            None => nicknames.remove(&user.id),
+                        };
+                    }
+                    self.users.insert(user.id, user);
+                }
+            }
         }
     }
 
@@ -695,6 +732,9 @@ pub struct Ping {
     pub roles: Vec<Id>,
     /// Sent with @silent: it still counts as a mention, but notifies no one.
     pub silent: bool,
+    /// Sent by an account Discord flagged as a likely spammer: it never
+    /// notifies.
+    pub from_spammer: bool,
 }
 
 /// What a channel, DM or guild shows beside its name.
@@ -1820,7 +1860,7 @@ mod tests {
             me,
             everyone,
             roles: roles.to_vec(),
-            silent: false,
+            ..Ping::default()
         };
         let mut next = base;
         let mut send = |model: &mut Model, author, ping| {

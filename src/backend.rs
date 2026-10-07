@@ -75,7 +75,7 @@ pub enum Event {
     Session(Session),
     Link(Link),
     /// Everything at once, from READY.
-    Ready(Model),
+    Ready(Box<Model>),
     Update(Update),
     /// A history page could not be loaded; the interface offers to retry.
     HistoryFailed {
@@ -97,6 +97,7 @@ pub struct Backend {
     thread: std::thread::JoinHandle<()>,
     /// Whether acks wait or are on their way, which closing waits for.
     acking: Arc<AtomicBool>,
+    notifier: notify::Notifier,
 }
 
 impl Backend {
@@ -114,6 +115,8 @@ impl Backend {
                 }
             }
         };
+        let notifier = notify::desktop(opened);
+        let desktop = notifier.clone();
         let emit = move |event: Event| {
             if sender.send(event).is_ok() {
                 ctx.request_repaint();
@@ -126,10 +129,10 @@ impl Backend {
                     .enable_all()
                     .build()
                     .expect("the backend's async runtime");
-                let desktop = notify::desktop(opened);
+                let notice = |notice| desktop.send(notice);
                 let alerts = Alerts {
                     shared,
-                    notify: &desktop,
+                    notify: &notice,
                 };
                 let session = std::panic::AssertUnwindSafe(|| {
                     runtime.block_on(session(receiver, &emit, &busy, &alerts));
@@ -146,7 +149,13 @@ impl Backend {
             events,
             thread,
             acking,
+            notifier,
         }
+    }
+
+    /// Tells the desktop's notifier at once, without the network thread.
+    pub fn notify(&self, notice: Notice) {
+        self.notifier.send(notice);
     }
 
     /// Ends the backend as the window closes. Acks still waiting are sent
@@ -235,6 +244,11 @@ async fn session(
                 Served::Revoked => Some(Ended::Revoked),
             }
         };
+        // Signed out, or about to be: nothing of the account stays on the
+        // desktop, and its notifications no longer open anything.
+        if signs_out(ended.as_ref()) {
+            (alerts.notify)(Notice::ClearAll);
+        }
         match ended {
             Some(Ended::Revoked) => {
                 log::info!("Discord no longer accepts the session; signing in again");
@@ -269,6 +283,12 @@ async fn session(
             }
         }
     }
+}
+
+/// Whether a signed-in phase that ended so leaves the account: logged out
+/// (`None`) or revoked, rather than failed and waiting for Retry.
+fn signs_out(ended: Option<&Ended>) -> bool {
+    matches!(ended, None | Some(Ended::Revoked))
 }
 
 /// Why the live connection stopped for good.
@@ -318,7 +338,7 @@ struct Connection<'a> {
 impl Connection<'_> {
     fn ready(&self, model: Model) {
         self.notifications.borrow_mut().ready(&model);
-        (self.emit)(Event::Ready(model));
+        (self.emit)(Event::Ready(Box::new(model)));
     }
 
     fn update(&self, update: Update, me: Id) {
@@ -780,6 +800,14 @@ mod tests {
         connection.update(message(next + 1, me + 1), me);
         assert!(matches!(&notices.borrow()[..], [Notice::Show(n)] if n.channel == dm));
         assert_eq!(events.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn notifications_come_down_when_the_account_leaves() {
+        assert!(signs_out(None), "logged out");
+        assert!(signs_out(Some(&Ended::Revoked)));
+        assert!(!signs_out(Some(&Ended::Refused(4004))));
+        assert!(!signs_out(Some(&Ended::Unreadable)));
     }
 
     #[test]
