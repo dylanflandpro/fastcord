@@ -32,6 +32,12 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
   minutes, is acked (`app::acknowledge`). `acks.rs` holds them the web client's 3 s
   (none with mentions), retries failures without ever sending an older one after a
   newer, and drops what the gateway says must not be read; closing sends what waits.
+- `notify.rs`: desktop notifications. The backend decides as each message
+  arrives (`wanted`, the web client's `shouldNotify`), against its own copy of
+  the model without history, so a window that is not drawing does not hold
+  them up; the window shares its focus and open channel through `Shared`. Tests
+  never reach the desktop: `desktop()` (one D-Bus connection, zbus) is the only
+  real notifier.
 - `gateway.rs`: the live connection. `Gateway` is the protocol without I/O (hello,
   identify with the web client's capabilities, heartbeats, resume, close codes);
   `connect` drives one connection. The backend reconnects with doubling delays.
@@ -76,3 +82,6 @@ serde errors quote the text they failed on: log them through `backend::describe`
   scroll-back sessions become common.
 - Guilds over 75,000 members only send messages after a guild subscription
   (gateway op 37); smaller guilds are subscribed automatically on connect.
+- Notifications know nothing of threads and forum posts (fastcord does not
+  show them yet), and the "Notification previews" switch lives in memory only:
+  there is no settings file.

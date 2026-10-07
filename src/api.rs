@@ -140,12 +140,15 @@ fn retry_after(seconds: f64) -> Duration {
 }
 
 /// A user as Discord sends one.
-#[derive(serde::Deserialize)]
+#[derive(Clone, serde::Deserialize)]
 pub struct ApiUser {
     #[serde(deserialize_with = "snowflake")]
     pub id: u64,
     username: String,
     global_name: Option<String>,
+    /// Discord's flags on the account, such as the spammer one.
+    #[serde(default)]
+    pub public_flags: Option<u64>,
 }
 
 impl From<ApiUser> for User {

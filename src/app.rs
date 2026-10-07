@@ -3,10 +3,12 @@
 use crate::backend::{Backend, Command, Event, Link, Session};
 use crate::events::Update;
 use crate::media::{self, Media};
-use crate::model::{Ack, Id, Model};
+use crate::model::{Ack, ChannelKind, Id, Model};
+use crate::notify::{self, Attention};
 use crate::theme::{self, Catalog, Palette};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Which list the middle column shows.
@@ -105,6 +107,26 @@ impl Selection {
                 }
             }
         }
+    }
+
+    /// Opens the conversation a notification was about, in its guild or
+    /// among the DMs, as if the person had picked it.
+    /// Only a conversation I can still read: never a voice channel, a
+    /// category, or a channel hidden from me since.
+    /// `true` when it opened.
+    pub fn reveal(&mut self, model: &Model, channel: Id) -> bool {
+        let readable = |g: &crate::model::Guild| {
+            let c = g.channel(channel)?;
+            let text = matches!(c.kind, ChannelKind::Text | ChannelKind::Announcement);
+            (text && g.can_view(c, model.me)).then_some(View::Guild(g.id))
+        };
+        self.view = match model.guilds.iter().find_map(readable) {
+            Some(view) => view,
+            None if model.dm(channel).is_some() => View::DirectMessages,
+            None => return false,
+        };
+        self.open_channel(channel);
+        true
     }
 
     /// Shows the DM list on the most recent conversation, which is not
@@ -227,6 +249,10 @@ pub struct App {
     /// Messages that arrived while their channel's first page was loading.
     early_messages: HashMap<Id, Vec<Update>>,
     reading: Reading,
+    /// What notifications know of the window, shared with the backend.
+    notifications: Arc<notify::Shared>,
+    /// A notification was clicked: bring the window forward.
+    raise: bool,
 }
 
 /// What the conversation shows above or instead of its messages.
@@ -288,7 +314,10 @@ impl App {
             themes.start(dir.clone(), None, &waker);
         }
 
-        let backend = model.is_none().then(|| Backend::start(ctx.clone()));
+        let notifications = Arc::new(notify::Shared::default());
+        let backend = model
+            .is_none()
+            .then(|| Backend::start(ctx.clone(), notifications.clone()));
         let source = match backend {
             Some(_) => media::Source::Discord,
             None => media::Source::Demo,
@@ -312,7 +341,36 @@ impl App {
             failed_history: HashSet::new(),
             early_messages: HashMap::new(),
             reading: Reading::new(Instant::now()),
+            notifications,
+            raise: false,
         }
+    }
+
+    /// Whether notifications show what messages say.
+    pub fn notification_content(&self) -> bool {
+        self.notifications.show_content()
+    }
+
+    /// Turning previews off also takes down the notifications already
+    /// showing a message's text.
+    pub fn set_notification_content(&mut self, show: bool) {
+        let was = self.notifications.show_content();
+        // Stored first: a message arriving meanwhile is not shown in full.
+        self.notifications.set_show_content(show);
+        if was
+            && !show
+            && let Some(backend) = &self.backend
+        {
+            backend.notify(notify::Notice::ClearAll);
+        }
+    }
+
+    /// Tells notifications what the window shows, after each frame drawn.
+    fn report_attention(&self, ctx: &egui::Context) {
+        self.notifications.set_attention(Attention {
+            focused: ctx.input(|i| i.focused),
+            open: self.selection.channel,
+        });
     }
 
     /// Picks up a new desktop palette and reveals it.
@@ -450,12 +508,17 @@ impl App {
                         true => self.selection.repair(&model),
                         false => self.selection = Selection::initial(Some(&model)),
                     }
-                    self.model = Some(model);
+                    self.model = Some(*model);
                 }
                 Event::AckDone { channel, flags } => {
                     self.reading.outstanding.remove(&channel);
                     if let (Some(model), Some(flags)) = (&mut self.model, flags) {
                         model.save_flags(channel, flags);
+                    }
+                }
+                Event::Open(channel) => {
+                    if let Some(model) = &self.model {
+                        self.raise = self.selection.reveal(model, channel);
                     }
                 }
                 Event::HistoryFailed { channel } => {
@@ -569,6 +632,11 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.follow_theme(ctx);
         self.follow_backend();
+        if std::mem::take(&mut self.raise) {
+            // Wayland compositors may refuse a window that asks for focus
+            // without an activation token.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         self.drop_unreadable_acks();
         if let Some(channel) = self.selection.channel {
             self.request_history(channel, false);
@@ -585,6 +653,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         crate::ui::show(self, ui);
         self.read_open_conversation(ui.ctx());
+        self.report_attention(ui.ctx());
         self.transition.paint(ui.ctx());
     }
 }
@@ -663,6 +732,29 @@ mod tests {
         selection.open_direct_messages(&model);
         assert_eq!(selection.view, View::DirectMessages);
         assert_eq!(selection.channel, Some(900));
+    }
+
+    #[test]
+    fn a_clicked_notification_opens_its_conversation() {
+        let model = crate::demo::model();
+        let mut selection = Selection::initial(Some(&model));
+        assert!(selection.reveal(&model, 201));
+        assert_eq!(
+            (selection.view, selection.channel),
+            (View::Guild(200), Some(201))
+        );
+        assert!(selection.chosen, "opened as if picked: it is read");
+        selection.reveal(&model, 900);
+        assert_eq!(selection.view, View::DirectMessages);
+        assert_eq!(selection.channel, Some(900));
+        assert!(!selection.reveal(&model, 121));
+        assert_eq!(selection.channel, Some(900), "a voice channel");
+        selection.reveal(&model, 131);
+        assert_eq!(selection.channel, Some(900), "a channel hidden from me");
+        selection.reveal(&model, 12345);
+        assert_eq!(selection.channel, Some(900), "a channel gone since");
+        selection.open_guild(&model, 200);
+        assert_eq!(selection.channel, Some(201), "remembered in its guild");
     }
 
     #[test]

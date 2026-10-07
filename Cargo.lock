@@ -1529,6 +1529,7 @@ dependencies = [
  "tokio",
  "tokio-websockets",
  "webbrowser",
+ "zbus",
  "zbus-secret-service-keyring-store",
  "zeroize",
 ]

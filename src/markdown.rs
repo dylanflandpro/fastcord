@@ -232,6 +232,70 @@ impl Names for Directory<'_> {
     }
 }
 
+/// A message's text without its markdown, for a notification: mentions,
+/// emoji and timestamps as words, each spoiler as "(spoiler)" so it stays
+/// hidden, and each block on its own line.
+pub fn plain(
+    blocks: &[Block],
+    names: &dyn Names,
+    now: jiff::Timestamp,
+    tz: &jiff::tz::TimeZone,
+) -> String {
+    let mut lines = Vec::new();
+    for block in blocks {
+        plain_block(block, names, now, tz, &mut lines);
+    }
+    lines.join("\n").trim().to_owned()
+}
+
+const HIDDEN: &str = "(spoiler)";
+
+fn plain_block(
+    block: &Block,
+    names: &dyn Names,
+    now: jiff::Timestamp,
+    tz: &jiff::tz::TimeZone,
+    lines: &mut Vec<String>,
+) {
+    match block {
+        Block::Text(spans) | Block::Heading(_, spans) | Block::Subtext(spans) => {
+            let mut line = String::new();
+            let mut spoiler = None;
+            for span in spans {
+                if let Some(index) = span.style.spoiler {
+                    if spoiler != Some(index) {
+                        line.push_str(HIDDEN);
+                    }
+                    spoiler = Some(index);
+                    continue;
+                }
+                spoiler = None;
+                match &span.content {
+                    Content::Text(text) | Content::Code(text) => line.push_str(text),
+                    Content::Mention(mention) => line.push_str(&mention.label(names)),
+                    Content::Emoji { name, .. } => line.push_str(&format!(":{name}:")),
+                    Content::Timestamp { at, style } => line.push_str(&style.label(*at, now, tz)),
+                }
+            }
+            lines.push(line);
+        }
+        Block::Code { code, style, .. } => match style.spoiler {
+            Some(_) => lines.push(HIDDEN.to_owned()),
+            None => lines.push(code.clone()),
+        },
+        Block::Quote(blocks) => {
+            for block in blocks {
+                plain_block(block, names, now, tz, lines);
+            }
+        }
+        Block::List(list) => {
+            for block in list.items.iter().flatten() {
+                plain_block(block, names, now, tz, lines);
+            }
+        }
+    }
+}
+
 /// The styles of `<t:…:style>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimestampStyle {
@@ -1811,6 +1875,27 @@ mod tests {
         fn role(&self, id: Id) -> Option<&str> {
             (id == 3).then_some("modo")
         }
+    }
+
+    #[test]
+    fn plain_text_drops_the_markdown_and_keeps_spoilers_hidden() {
+        let plain = |content: &str| {
+            let now = jiff::Timestamp::UNIX_EPOCH;
+            plain(&parse(content), &Fixed, now, &jiff::tz::TimeZone::UTC)
+        };
+        assert_eq!(
+            plain("**hi** <@1>, see <#2> <@&3> <:wave:42>"),
+            "hi @Léa, see #général @modo :wave:"
+        );
+        assert_eq!(
+            plain("# Title\n> quoted\n- one\n- two"),
+            "Title\nquoted\none\ntwo"
+        );
+        assert_eq!(plain("a ||secret **bold**|| b"), "a (spoiler) b");
+        assert_eq!(plain("||one|| ||two||"), "(spoiler) (spoiler)");
+        assert_eq!(plain("```rust\nlet x = 1;\n```"), "let x = 1;");
+        assert_eq!(plain("<t:0:D>"), "1 January 1970");
+        assert_eq!(plain("   "), "");
     }
 
     #[test]

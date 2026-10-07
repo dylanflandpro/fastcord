@@ -9,6 +9,7 @@ use crate::credentials::{self, Token};
 use crate::events::{Decoder, Update};
 use crate::gateway::{self, End, Gateway};
 use crate::model::{Ack, Id, Model, User};
+use crate::notify::{self, Notice, Notifications};
 use crate::remote_auth::{self, Progress};
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
@@ -74,7 +75,7 @@ pub enum Event {
     Session(Session),
     Link(Link),
     /// Everything at once, from READY.
-    Ready(Model),
+    Ready(Box<Model>),
     Update(Update),
     /// A history page could not be loaded; the interface offers to retry.
     HistoryFailed {
@@ -86,6 +87,8 @@ pub enum Event {
         channel: Id,
         flags: Option<u32>,
     },
+    /// A notification for this channel was clicked.
+    Open(Id),
 }
 
 pub struct Backend {
@@ -94,14 +97,26 @@ pub struct Backend {
     thread: std::thread::JoinHandle<()>,
     /// Whether acks wait or are on their way, which closing waits for.
     acking: Arc<AtomicBool>,
+    notifier: notify::Notifier,
 }
 
 impl Backend {
-    pub fn start(ctx: egui::Context) -> Self {
+    /// `shared` is what the window tells notifications about itself.
+    pub fn start(ctx: egui::Context, shared: Arc<notify::Shared>) -> Self {
         let (commands, receiver) = unbounded_channel();
         let (sender, events) = mpsc::channel();
         let acking = Arc::new(AtomicBool::new(false));
         let busy = acking.clone();
+        let opened = {
+            let (sender, ctx) = (sender.clone(), ctx.clone());
+            move |channel| {
+                if sender.send(Event::Open(channel)).is_ok() {
+                    ctx.request_repaint();
+                }
+            }
+        };
+        let notifier = notify::desktop(opened);
+        let desktop = notifier.clone();
         let emit = move |event: Event| {
             if sender.send(event).is_ok() {
                 ctx.request_repaint();
@@ -114,8 +129,13 @@ impl Backend {
                     .enable_all()
                     .build()
                     .expect("the backend's async runtime");
+                let notice = |notice| desktop.send(notice);
+                let alerts = Alerts {
+                    shared,
+                    notify: &notice,
+                };
                 let session = std::panic::AssertUnwindSafe(|| {
-                    runtime.block_on(session(receiver, &emit, &busy));
+                    runtime.block_on(session(receiver, &emit, &busy, &alerts));
                 });
                 // The panic itself is in the panic log; the window must not
                 // keep waiting on a backend that is gone.
@@ -129,7 +149,13 @@ impl Backend {
             events,
             thread,
             acking,
+            notifier,
         }
+    }
+
+    /// Tells the desktop's notifier at once, without the network thread.
+    pub fn notify(&self, notice: Notice) {
+        self.notifier.send(notice);
     }
 
     /// Ends the backend as the window closes. Acks still waiting are sent
@@ -163,9 +189,21 @@ impl Backend {
 
 type Emit<'a> = &'a (dyn Fn(Event) + Send + Sync);
 
+/// Where notifications come from and go: what the window shares, and the
+/// notifier (the desktop's, or a fake in tests).
+struct Alerts<'a> {
+    shared: Arc<notify::Shared>,
+    notify: &'a dyn Fn(Notice),
+}
+
 /// Restore or sign in, stay signed in until logged out, then start over.
 /// Returns when the window is gone.
-async fn session(mut commands: UnboundedReceiver<Command>, emit: Emit<'_>, busy: &AtomicBool) {
+async fn session(
+    mut commands: UnboundedReceiver<Command>,
+    emit: Emit<'_>,
+    busy: &AtomicBool,
+    alerts: &Alerts<'_>,
+) {
     let api = Api::new();
     let keyring = Keyring::start();
     loop {
@@ -191,15 +229,31 @@ async fn session(mut commands: UnboundedReceiver<Command>, emit: Emit<'_>, busy:
         let token = RefCell::new(token);
         let acks = RefCell::new(AckQueue::default());
         let send = |ack, token| deliver(&api, ack, token);
+        let connection = Connection {
+            acks: &acks,
+            emit,
+            notifications: RefCell::new(Notifications::new(alerts.shared.clone())),
+            notify: alerts.notify,
+        };
         let ended = tokio::select! {
-            ended = stay_connected(&api, &keyring, &token, &acks, emit) => Some(ended),
+            ended = stay_connected(&api, &keyring, &token, &connection) => Some(ended),
             served = serve(&mut commands, &api, &token, emit, &acks, busy, send) => match served {
-                Served::Closed => return,
+                Served::Closed => {
+                    // The window is gone: so are the notifications it
+                    // would open.
+                    (alerts.notify)(Notice::ClearAll);
+                    return;
+                }
                 Served::LoggedOut => None,
                 // A history request found the token revoked.
                 Served::Revoked => Some(Ended::Revoked),
             }
         };
+        // Signed out, or about to be: nothing of the account stays on the
+        // desktop, and its notifications no longer open anything.
+        if signs_out(ended.as_ref()) {
+            (alerts.notify)(Notice::ClearAll);
+        }
         match ended {
             Some(Ended::Revoked) => {
                 log::info!("Discord no longer accepts the session; signing in again");
@@ -234,6 +288,12 @@ async fn session(mut commands: UnboundedReceiver<Command>, emit: Emit<'_>, busy:
             }
         }
     }
+}
+
+/// Whether a signed-in phase that ended so leaves the account: logged out
+/// (`None`) or revoked, rather than failed and waiting for Retry.
+fn signs_out(ended: Option<&Ended>) -> bool {
+    matches!(ended, None | Some(Ended::Revoked))
 }
 
 /// Why the live connection stopped for good.
@@ -271,6 +331,35 @@ pub fn describe(error: &serde_json::Error) -> String {
     )
 }
 
+/// Where the gateway's events go: the window, the acks waiting, and
+/// notifications.
+struct Connection<'a> {
+    acks: &'a RefCell<AckQueue>,
+    emit: Emit<'a>,
+    notifications: RefCell<Notifications>,
+    notify: &'a dyn Fn(Notice),
+}
+
+impl Connection<'_> {
+    fn ready(&self, model: Model) {
+        self.notifications.borrow_mut().ready(&model);
+        (self.emit)(Event::Ready(Box::new(model)));
+    }
+
+    fn update(&self, update: Update, me: Id) {
+        // At once, not after a round trip through the window.
+        self.acks.borrow_mut().follow(&update, me);
+        let notice = self
+            .notifications
+            .borrow_mut()
+            .follow(&update, std::time::Instant::now());
+        if let Some(notice) = notice {
+            (self.notify)(notice);
+        }
+        (self.emit)(Event::Update(update));
+    }
+}
+
 /// Keeps the gateway connected and reports what it delivers, reconnecting
 /// with growing delays, until Discord ends the session for good. A token
 /// Discord rotates replaces `token` at once and is queued for the keyring.
@@ -278,9 +367,9 @@ async fn stay_connected(
     api: &Api,
     keyring: &Keyring,
     token: &RefCell<Token>,
-    acks: &RefCell<AckQueue>,
-    emit: Emit<'_>,
+    connection: &Connection<'_>,
 ) -> Ended {
+    let emit = connection.emit;
     let properties = api.client_properties().await;
     let mut me = 0;
     let mut gateway = Gateway::default();
@@ -314,15 +403,13 @@ async fn stay_connected(
                         });
                     }
                     me = model.me;
-                    emit(Event::Ready(model));
+                    connection.ready(model);
                     return true;
                 }
                 match decoder.event(name, data) {
-                    Ok(updates) => updates.into_iter().for_each(|update| {
-                        // At once, not after a round trip through the window.
-                        acks.borrow_mut().follow(&update, me);
-                        emit(Event::Update(update));
-                    }),
+                    Ok(updates) => updates
+                        .into_iter()
+                        .for_each(|update| connection.update(update, me)),
                     Err(error) => log::warn!("unreadable {name}: {}", describe(&error)),
                 }
                 true
@@ -679,6 +766,54 @@ async fn log_out(api: &Api, keyring: &Keyring, token: &Token) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_messages_reach_the_notifier_and_the_window() {
+        let acks = RefCell::new(AckQueue::default());
+        let events = std::sync::Mutex::new(Vec::new());
+        let emit = |event: Event| events.lock().unwrap().push(event);
+        let notices = RefCell::new(Vec::new());
+        let notify = |notice: Notice| notices.borrow_mut().push(notice);
+        let connection = Connection {
+            acks: &acks,
+            emit: &emit,
+            notifications: RefCell::new(Notifications::new(Arc::default())),
+            notify: &notify,
+        };
+        let model = crate::demo::model();
+        let dm = model.dms_by_recency()[0].id;
+        let me = model.me;
+        let next = model.dm(dm).and_then(|d| d.last_message_id).unwrap() + 1;
+        connection.ready(model);
+        let message = |id, author| Update::MessageCreate {
+            channel: dm,
+            guild: None,
+            message: crate::model::Message {
+                id,
+                author: User {
+                    id: author,
+                    ..User::default()
+                },
+                content: "hi".into(),
+                attachments: vec![],
+                embeds: vec![],
+            },
+            ping: crate::model::Ping::default(),
+        };
+        connection.update(message(next, me), me);
+        assert!(notices.borrow().is_empty(), "my own message");
+        connection.update(message(next + 1, me + 1), me);
+        assert!(matches!(&notices.borrow()[..], [Notice::Show(n)] if n.channel == dm));
+        assert_eq!(events.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn notifications_come_down_when_the_account_leaves() {
+        assert!(signs_out(None), "logged out");
+        assert!(signs_out(Some(&Ended::Revoked)));
+        assert!(!signs_out(Some(&Ended::Refused(4004))));
+        assert!(!signs_out(Some(&Ended::Unreadable)));
+    }
 
     #[test]
     fn reconnect_delays_double_until_a_connection_holds() {

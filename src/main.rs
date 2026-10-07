@@ -12,6 +12,7 @@ mod gateway;
 mod markdown;
 mod media;
 mod model;
+mod notify;
 mod remote_auth;
 mod theme;
 mod ui;

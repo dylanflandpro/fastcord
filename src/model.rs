@@ -362,7 +362,7 @@ pub fn starts_group(previous: Option<&Message>, message: &Message) -> bool {
         || created_at(message.id).duration_since(created_at(previous.id)) > GROUP_WINDOW
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Model {
     /// The signed-in user.
     pub me: Id,
@@ -386,6 +386,16 @@ pub struct Model {
     /// Whether the account's unread settings stand apart from its
     /// notification settings (Discord's "new notifications").
     pub separate_unreads: bool,
+    /// My status is Do Not Disturb, for good or until the time Discord set:
+    /// nothing notifies meanwhile.
+    pub do_not_disturb: Option<Mute>,
+    /// The account's quiet mode: nothing notifies while it is on.
+    pub quiet_mode: bool,
+    /// People I blocked, and people I ignored: nothing they send notifies.
+    pub blocked: HashSet<Id>,
+    pub ignored: HashSet<Id>,
+    /// Nicknames by guild, then user, as messages report them.
+    pub nicknames: HashMap<Id, HashMap<Id, String>>,
 }
 
 impl Model {
@@ -402,6 +412,19 @@ impl Model {
         let mut dms: Vec<&DmChannel> = self.dms.iter().collect();
         dms.sort_by_key(|d| std::cmp::Reverse(d.last_message_id));
         dms
+    }
+
+    /// The web client's `isBlockedOrIgnored`.
+    pub fn blocked_or_ignored(&self, user: Id) -> bool {
+        self.blocked.contains(&user) || self.ignored.contains(&user)
+    }
+
+    /// What a guild calls someone: their nickname there, else their name.
+    pub fn name_in(&self, guild: Option<Id>, user: &User) -> String {
+        guild
+            .and_then(|g| self.nicknames.get(&g)?.get(&user.id))
+            .cloned()
+            .unwrap_or_else(|| user.display_name().to_owned())
     }
 
     pub fn messages(&self, channel: Id) -> &[Message] {
@@ -581,6 +604,33 @@ impl Model {
                     self.bump_last_message(Some(guild), channel, last);
                 }
             }
+            Update::DoNotDisturb(status) => self.do_not_disturb = status,
+            Update::QuietMode(on) => self.quiet_mode = on,
+            Update::Relationship {
+                user,
+                blocked,
+                ignored,
+            } => {
+                for (set, value) in [(&mut self.blocked, blocked), (&mut self.ignored, ignored)] {
+                    match value {
+                        Some(true) => set.insert(user),
+                        Some(false) => set.remove(&user),
+                        None => false,
+                    };
+                }
+            }
+            Update::People { guild, people } => {
+                for (user, nick) in people {
+                    if let (Some(guild), Some(nick)) = (guild, nick) {
+                        let nicknames = self.nicknames.entry(guild).or_default();
+                        match nick {
+                            Some(nick) => nicknames.insert(user.id, nick),
+                            None => nicknames.remove(&user.id),
+                        };
+                    }
+                    self.users.insert(user.id, user);
+                }
+            }
         }
     }
 
@@ -689,6 +739,11 @@ pub struct Ping {
     /// @everyone or @here, when the author was allowed to.
     pub everyone: bool,
     pub roles: Vec<Id>,
+    /// Sent with @silent: it still counts as a mention, but notifies no one.
+    pub silent: bool,
+    /// Sent by an account Discord flagged as a likely spammer: it never
+    /// notifies.
+    pub from_spammer: bool,
 }
 
 /// What a channel, DM or guild shows beside its name.
@@ -700,6 +755,15 @@ pub struct Badge {
     /// client.
     pub mentions: u32,
     pub muted: bool,
+}
+
+/// Whether a message pings me, as Discord counts it: by name always;
+/// @everyone (and @here) and my roles unless my settings suppress them.
+fn mentions_me(ping: &Ping, settings: Option<&GuildSettings>, my_roles: &[Id]) -> bool {
+    let suppress = |pick: fn(&GuildSettings) -> bool| settings.is_some_and(pick);
+    ping.me
+        || (ping.everyone && !suppress(|s| s.suppress_everyone))
+        || (!suppress(|s| s.suppress_roles) && ping.roles.iter().any(|r| my_roles.contains(r)))
 }
 
 /// A count as Discord's badges print it: in full below a thousand, then
@@ -886,24 +950,20 @@ impl Model {
         let guild = guild.and_then(|id| self.guild(id));
         let read_up_to = self.read_up_to(guild, channel);
         // A repeated or late event is not a new message.
-        let newest = match guild {
-            Some(guild) => guild.channel(channel).and_then(|c| c.last_message_id),
-            None => self.dm(channel).and_then(|d| d.last_message_id),
-        };
-        if newest.is_some_and(|newest| message.id <= newest) {
+        if self
+            .newest(guild, channel)
+            .is_some_and(|newest| message.id <= newest)
+        {
             return;
         }
         let counts = match guild {
             _ if message.author.id == self.me || message.id <= read_up_to => false,
             None => ping.me || !self.dm_muted(channel, now),
-            Some(guild) => {
-                let settings = self.guild_settings.get(&Some(guild.id));
-                let suppress = |pick: fn(&GuildSettings) -> bool| settings.is_some_and(pick);
-                ping.me
-                    || (ping.everyone && !suppress(|s| s.suppress_everyone))
-                    || (!suppress(|s| s.suppress_roles)
-                        && ping.roles.iter().any(|r| guild.my_roles.contains(r)))
-            }
+            Some(guild) => mentions_me(
+                ping,
+                self.guild_settings.get(&Some(guild.id)),
+                &guild.my_roles,
+            ),
         };
         let state = self.read_states.entry(channel).or_default();
         if message.author.id == self.me {
@@ -911,6 +971,66 @@ impl Model {
             state.mentions = 0;
         } else if counts {
             state.mentions += 1;
+        }
+    }
+
+    /// The newest message known in a channel or DM.
+    fn newest(&self, guild: Option<&Guild>, channel: Id) -> Option<Id> {
+        match guild {
+            Some(guild) => guild.channel(channel).and_then(|c| c.last_message_id),
+            None => self.dm(channel).and_then(|d| d.last_message_id),
+        }
+    }
+
+    /// Whether `message` is news: newer than the newest message known in its
+    /// channel (a repeated or late event is not) and than where I have read.
+    pub fn unseen(&self, channel: Id, guild: Option<Id>, message: Id) -> bool {
+        let guild = guild.and_then(|id| self.guild(id));
+        self.newest(guild, channel)
+            .is_none_or(|newest| message > newest)
+            && message > self.read_up_to(guild, channel)
+    }
+
+    /// Whether my settings let a message in `channel` notify, as the web
+    /// client's `shouldNotify` reads them: never in a muted guild, category,
+    /// channel or DM (mentions included), nor where the level is "nothing";
+    /// every message where it is "all", except in a voice channel's chat,
+    /// which only notifies while connected to it (never, here); otherwise
+    /// only mentions of me, of @everyone and of my roles, unless my
+    /// settings suppress the last two. DMs follow the DM settings and
+    /// notify on every message by default.
+    pub fn notifies(&self, channel: Id, ping: &Ping, now: jiff::Timestamp) -> bool {
+        if self.dm(channel).is_some() {
+            let settings = self.guild_settings.get(&None);
+            let notify = settings
+                .and_then(|s| s.channels.get(&channel).and_then(|c| c.notify).or(s.notify))
+                .unwrap_or(Notify::All);
+            return !self.dm_muted(channel, now)
+                && match notify {
+                    Notify::All => true,
+                    Notify::Mentions => mentions_me(ping, settings, &[]),
+                    Notify::Nothing => false,
+                };
+        }
+        let Some((guild, channel)) = self
+            .guilds
+            .iter()
+            .find_map(|g| g.channel(channel).map(|c| (g, c)))
+        else {
+            return false;
+        };
+        let scope = self.scope(guild, now);
+        let guild_muted = scope
+            .settings
+            .and_then(|s| s.muted)
+            .is_some_and(|m| m.active(now));
+        if guild_muted || scope.muted(channel) {
+            return false;
+        }
+        match scope.notify(channel) {
+            Notify::Nothing => false,
+            Notify::All if channel.kind != ChannelKind::Voice => true,
+            Notify::All | Notify::Mentions => mentions_me(ping, scope.settings, &guild.my_roles),
         }
     }
 
@@ -1749,6 +1869,7 @@ mod tests {
             me,
             everyone,
             roles: roles.to_vec(),
+            ..Ping::default()
         };
         let mut next = base;
         let mut send = |model: &mut Model, author, ping| {
