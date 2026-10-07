@@ -8,7 +8,7 @@
 //! (`***a***` is italic around bold); and the same wording for mentions it
 //! cannot resolve and for timestamps.
 
-use crate::model::{Id, Model, User};
+use crate::model::{Id, Model, Original, Reply, User};
 use std::collections::HashMap;
 
 /// A message's text, block by block.
@@ -176,6 +176,26 @@ impl Mention {
                 .map_or_else(|| "#unknown".into(), |name| format!("#{name}")),
             Self::Everyone => "@everyone".into(),
             Self::Here => "@here".into(),
+        }
+    }
+}
+
+/// A reply's line above it: what it answers on one line, as [`plain`] text
+/// (mentions and emoji by name, spoilers hidden); or the official client's
+/// words when there is no text to show.
+pub fn reply_snippet(
+    reply: &Reply,
+    names: &dyn Names,
+    now: jiff::Timestamp,
+    tz: &jiff::tz::TimeZone,
+) -> String {
+    match &reply.original {
+        Original::Deleted => "Original message was deleted".into(),
+        Original::Unknown => "Message could not be loaded".into(),
+        Original::Shown(_, text) if text.trim().is_empty() => "Click to see attachment".into(),
+        Original::Shown(_, text) => {
+            let text = plain(&parse(text), names, now, tz);
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
         }
     }
 }
@@ -1896,6 +1916,32 @@ mod tests {
         assert_eq!(plain("```rust\nlet x = 1;\n```"), "let x = 1;");
         assert_eq!(plain("<t:0:D>"), "1 January 1970");
         assert_eq!(plain("   "), "");
+    }
+
+    #[test]
+    fn a_reply_snippet_is_one_plain_line() {
+        let reply = |original| Reply {
+            id: 9,
+            original,
+            ping: true,
+        };
+        let shown = |text: &str| reply(Original::Shown(User::default(), text.into()));
+        let names = Fixed;
+        let (now, tz) = (jiff::Timestamp::UNIX_EPOCH, jiff::tz::TimeZone::UTC);
+        let snippet = |reply: Reply| reply_snippet(&reply, &names, now, &tz);
+        assert_eq!(
+            snippet(shown("**Salut** <@1>,\n> dans <#2> <:wave:123> ||secret||")),
+            "Salut @Léa, dans #général :wave: (spoiler)"
+        );
+        assert_eq!(snippet(shown("")), "Click to see attachment");
+        assert_eq!(
+            snippet(reply(Original::Deleted)),
+            "Original message was deleted"
+        );
+        assert_eq!(
+            snippet(reply(Original::Unknown)),
+            "Message could not be loaded"
+        );
     }
 
     #[test]

@@ -5,7 +5,9 @@ use crate::backend::{Backend, Change, Command, Event, Link, Outgoing, Session, W
 use crate::compose::Unsent;
 use crate::events::Update;
 use crate::media::{self, Media};
-use crate::model::{Ack, ChannelKind, Delivery, Emoji, Id, Message, Model, ReactionRequest};
+use crate::model::{
+    Ack, ChannelKind, Delivery, Emoji, Id, Message, Model, ReactionRequest, ReplyTo,
+};
 use crate::notify::{self, Attention};
 use crate::theme::{self, Catalog, Palette};
 use std::collections::{HashMap, HashSet};
@@ -233,6 +235,8 @@ fn place(model: &Model, channel: Id) -> Place {
 struct Posted {
     channel: Id,
     content: String,
+    /// What it answers, with my ping choice.
+    reply: Option<ReplyTo>,
     /// On its way to Discord.
     flying: bool,
     /// Its answer was lost: it may be on Discord.
@@ -254,6 +258,8 @@ pub struct Composer {
     pub drafts: HashMap<Id, String>,
     /// Why the channel's draft was not sent, until it changes.
     pub notice: Option<(Id, String)>,
+    /// The message each channel's draft answers, until sent or dropped.
+    pub replies: HashMap<Id, ReplyTo>,
     /// The message of mine open for editing.
     pub editing: Option<Editing>,
     posted: HashMap<Id, Posted>,
@@ -308,25 +314,62 @@ impl Composer {
             Err(Unsent::Blank | Unsent::TooLong) => return None,
         };
         let nonce = crate::model::next_nonce(self.last_nonce, now);
-        if !model.add_pending(channel, nonce, content.clone()) {
+        // A reply to a message deleted meanwhile goes as a plain message.
+        let reply = self.replies.get(&channel).copied();
+        let reply = reply.filter(|r| model.message(channel, r.message).is_some());
+        if !model.add_pending(channel, nonce, content.clone(), reply) {
             return None;
         }
         self.last_nonce = nonce;
         self.drafts.remove(&channel);
+        self.replies.remove(&channel);
         self.notice = None;
+        Some(self.posting(model, channel, nonce, content, reply))
+    }
+
+    /// Keeps a message until Discord confirms it, and what to post.
+    fn posting(
+        &mut self,
+        model: &Model,
+        channel: Id,
+        nonce: Id,
+        content: String,
+        reply: Option<ReplyTo>,
+    ) -> Outgoing {
         let posted = Posted {
             channel,
             content: content.clone(),
+            reply,
             flying: true,
             unsure: false,
             checking: false,
         };
         self.posted.insert(nonce, posted);
-        Some(Outgoing {
-            place: place(model, channel),
+        let place = place(model, channel);
+        Outgoing {
+            place,
             nonce,
             content,
-        })
+            reply,
+        }
+    }
+
+    /// Reply on a message: the draft will answer it, pinging its author
+    /// unless switched off, as the official client starts a reply. Only
+    /// where I may write, and on a message Discord has.
+    pub fn reply(&mut self, model: &Model, channel: Id, id: Id) {
+        let sent = model
+            .message(channel, id)
+            .is_some_and(|m| m.delivery == Delivery::Sent);
+        if sent && model.can_send(channel) {
+            self.replies.insert(
+                channel,
+                ReplyTo {
+                    message: id,
+                    ping: true,
+                },
+            );
+        }
     }
 
     /// Edit on one of my messages: its text opens in place.
@@ -381,10 +424,15 @@ impl Composer {
             return Saved::ConfirmDelete(channel, id);
         }
         editing.saving = true;
+        // A reply that did not ping stays quiet, as the web client keeps
+        // it. Whatever is not known of it (an original not loaded) counts
+        // as not pinged: an edit never pings by guess.
+        let quiet = message.reply.as_deref().is_some_and(|r| !r.ping);
         Saved::Edit(Write::Edit {
             place: place(model, channel),
             id,
             content,
+            quiet,
         })
     }
 
@@ -405,20 +453,16 @@ impl Composer {
         if !model.can_send(channel) {
             return None;
         }
+        // A reply goes again as it went, pinging or not; one whose original
+        // is gone meanwhile goes as a plain message, as `send` does.
+        let failed = model.message(channel, nonce).and_then(|m| m.reply.as_ref());
+        let reply = failed.map(|r| ReplyTo {
+            message: r.id,
+            ping: r.ping,
+        });
+        let reply = reply.filter(|r| model.message(channel, r.message).is_some());
         let content = model.resend(channel, nonce)?;
-        let posted = Posted {
-            channel,
-            content: content.clone(),
-            flying: true,
-            unsure: false,
-            checking: false,
-        };
-        self.posted.insert(nonce, posted);
-        Some(Outgoing {
-            place: place(model, channel),
-            nonce,
-            content,
-        })
+        Some(self.posting(model, channel, nonce, content, reply))
     }
 
     /// Delete on a message that failed.
@@ -446,7 +490,7 @@ impl Composer {
         if model.send_settled(channel, nonce, delivery.clone()) {
             return;
         }
-        if model.add_pending(channel, nonce, posted.content.clone()) {
+        if model.add_pending(channel, nonce, posted.content.clone(), posted.reply) {
             model.send_settled(channel, nonce, delivery);
         } else if !posted.flying
             && let Some(posted) = self.posted.remove(&nonce)
@@ -514,6 +558,10 @@ impl Composer {
             draft.push('\n');
         }
         draft.push_str(&posted.content);
+        // It answered a message: the draft answers it again, as it did.
+        if let Some(reply) = posted.reply {
+            self.replies.entry(posted.channel).or_insert(reply);
+        }
     }
 
     fn next_id(&mut self, now: jiff::Timestamp) -> Id {
@@ -938,7 +986,9 @@ impl App {
                 self.demo_outbox.push((due, outgoing));
                 return;
             }
-            Write::Edit { place, id, content } => {
+            Write::Edit {
+                place, id, content, ..
+            } => {
                 let channel = place.channel;
                 let content = Some(content);
                 let (attachments, embeds, edited) = (None, None, true);
@@ -1282,6 +1332,7 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Original;
 
     #[test]
     fn history_is_asked_for_once_then_page_by_page_to_the_start() {
@@ -1667,6 +1718,7 @@ mod tests {
             place,
             id: mine,
             content,
+            quiet: false,
         };
         assert_eq!(composer.save_edit(&model), Saved::Edit(write));
         // Not shown before Discord has it, and not saved twice.
@@ -1696,6 +1748,99 @@ mod tests {
 
     fn demo_app() -> App {
         App::new(&egui::Context::default(), Some(crate::demo::model()), None)
+    }
+
+    #[test]
+    fn a_reply_answers_its_message_and_pings_unless_switched_off() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        let (_, sam) = general(&model);
+        composer.reply(&model, 111, sam);
+        composer.replies.get_mut(&111).unwrap().ping = false;
+        composer.drafts.insert(111, "oui".into());
+        let outgoing = composer.send(&mut model, 111, now()).unwrap();
+        let quiet = Some(ReplyTo {
+            message: sam,
+            ping: false,
+        });
+        assert_eq!(outgoing.reply, quiet);
+        assert!(composer.replies.is_empty(), "one message answers it");
+        let shown = model.messages(111).last().unwrap().reply.clone().unwrap();
+        assert!(matches!(shown.original, Original::Shown(ref author, _) if author.id == 4));
+        assert!(!shown.ping);
+        // Retried, it answers the same way.
+        composer.settled(&mut model, 111, outgoing.nonce, Delivery::Failed(None));
+        let retried = composer.retry(&mut model, 111, outgoing.nonce).unwrap();
+        assert_eq!(retried.reply, quiet);
+        // A pending message cannot be answered, nor anything where I may not write.
+        composer.reply(&model, 111, outgoing.nonce);
+        let annonce = model.messages(101)[0].id;
+        composer.reply(&model, 101, annonce);
+        assert!(composer.replies.is_empty());
+    }
+
+    #[test]
+    fn a_reply_put_back_or_retried_keeps_what_it_answers() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        let (_, sam) = general(&model);
+        let quiet = ReplyTo {
+            message: sam,
+            ping: false,
+        };
+        composer.replies.insert(111, quiet);
+        composer.drafts.insert(111, "oui".into());
+        let first = composer.send(&mut model, 111, now()).unwrap().nonce;
+        composer.settled(&mut model, 111, first, Delivery::Failed(None));
+        // Put back in the draft by a new READY: it answers Sam again.
+        let history = model.messages.remove(&111).unwrap();
+        composer.after_ready();
+        assert_eq!(composer.drafts[&111], "oui");
+        assert_eq!(composer.replies[&111], quiet);
+        // Retried after Sam's message went: a plain message, as send does.
+        model.messages.insert(111, history);
+        composer.replies.clear();
+        composer.drafts.insert(111, "encore".into());
+        composer.replies.insert(111, quiet);
+        let second = composer.send(&mut model, 111, now()).unwrap().nonce;
+        composer.settled(&mut model, 111, second, Delivery::Failed(None));
+        model.apply(Update::MessageDelete {
+            channel: 111,
+            ids: vec![sam],
+        });
+        assert_eq!(composer.retry(&mut model, 111, second).unwrap().reply, None);
+    }
+
+    #[test]
+    fn editing_a_quiet_reply_keeps_it_quiet() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        let (mine, _) = general(&model);
+        let edited = |composer: &mut Composer, model: &Model| {
+            composer.edit(model, 111, mine);
+            composer.editing.as_mut().unwrap().draft = "autre".into();
+            match composer.save_edit(model) {
+                Saved::Edit(Write::Edit { quiet, .. }) => quiet,
+                saved => panic!("{saved:?}"),
+            }
+        };
+        // Dylan's demo reply pinged Sam.
+        assert!(!edited(&mut composer, &model));
+        composer.editing = None;
+        let reply = model.messages.get_mut(&111).unwrap()[8]
+            .reply
+            .as_mut()
+            .unwrap();
+        reply.ping = false;
+        assert!(edited(&mut composer, &model));
+        composer.editing = None;
+        // Its original not loaded: still quiet, never a ping by guess.
+        let reply = model.messages.get_mut(&111).unwrap()[8]
+            .reply
+            .as_mut()
+            .unwrap();
+        reply.original = Original::Unknown;
+        assert!(edited(&mut composer, &model));
     }
 
     #[test]

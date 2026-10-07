@@ -8,7 +8,7 @@ use crate::api::{self, Api, Attempt, Place, Verdict};
 use crate::credentials::{self, Token};
 use crate::events::{Decoder, Update};
 use crate::gateway::{self, End, Gateway};
-use crate::model::{Ack, Id, Model, ReactionRequest, User};
+use crate::model::{Ack, Id, Model, ReactionRequest, ReplyTo, User};
 use crate::notify::{self, Notice, Notifications};
 use crate::outbox::Outbox;
 use crate::remote_auth::{self, Progress};
@@ -55,11 +55,12 @@ pub enum Command {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Write {
     Send(Outgoing),
-    /// My message's new text.
+    /// My message's new text; `quiet` for a reply that did not ping.
     Edit {
         place: Place,
         id: Id,
         content: String,
+        quiet: bool,
     },
     Delete {
         place: Place,
@@ -88,6 +89,7 @@ pub struct Outgoing {
     pub place: Place,
     pub nonce: Id,
     pub content: String,
+    pub reply: Option<ReplyTo>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -350,10 +352,17 @@ async fn session(
                         place,
                         nonce,
                         content,
-                    }) => api.send_message(&token, *place, *nonce, content).await,
-                    Write::Edit { place, id, content } => {
-                        api.edit_message(&token, *place, *id, content).await
+                        reply,
+                    }) => {
+                        api.send_message(&token, *place, *nonce, content, *reply)
+                            .await
                     }
+                    Write::Edit {
+                        place,
+                        id,
+                        content,
+                        quiet,
+                    } => api.edit_message(&token, *place, *id, content, *quiet).await,
                     Write::Delete { place, id } => api.delete_message(&token, *place, *id).await,
                 };
                 (attempt, token)
@@ -1602,6 +1611,7 @@ mod tests {
             place: PLACE(channel),
             nonce,
             content: "salut".into(),
+            reply: None,
         }))
     }
 
@@ -1746,6 +1756,7 @@ mod tests {
                 place: PLACE(7),
                 id,
                 content: "non".into(),
+                quiet: false,
             })
         };
         let delete = |id| {

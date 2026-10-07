@@ -3,8 +3,8 @@
 
 use crate::model::{
     Attachment, Channel, ChannelKind, ChannelSettings, Delivery, DmChannel, Embed, EmbedField,
-    EmbedImage, Emoji, Guild, GuildSettings, Id, Message, Model, Mute, Notify, Overwrite,
-    OverwriteKind, Permissions, Reaction, ReadState, Role, User, id_at,
+    EmbedImage, Emoji, Guild, GuildSettings, Id, Message, Model, Mute, Notify, Original, Overwrite,
+    OverwriteKind, Permissions, Reaction, ReadState, Reply, Role, User, id_at,
 };
 use std::collections::HashMap;
 
@@ -100,6 +100,7 @@ impl Timeline {
                     reactions: vec![],
                     delivery: Delivery::Sent,
                     edited: false,
+                    reply: None,
                 }
             })
             .collect()
@@ -349,7 +350,12 @@ pub fn model() -> Model {
                 "> Objectif : ouvrir en moins d'une seconde 🚀\n<@1> j'ai testé : ||0,4 s à froid, pari tenu||",
             ),
         ]);
-    // Dylan fixed a typo since.
+    // Dylan answers Sam's question as a reply, and fixed a typo since.
+    general[8].reply = Some(Box::new(Reply {
+        id: general[7].id,
+        original: Original::Shown(sam.clone(), general[7].content.clone()),
+        ping: true,
+    }));
     general[8].edited = true;
     model.messages.insert(111, general);
     model.messages.insert(
