@@ -107,6 +107,8 @@ pub struct Channel {
     pub parent: Option<Id>,
     pub position: i32,
     pub overwrites: Vec<Overwrite>,
+    /// The newest message, which tells whether the channel is unread.
+    pub last_message_id: Option<Id>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -118,6 +120,10 @@ pub struct Guild {
     pub roles: Vec<Role>,
     /// The signed-in member's roles.
     pub my_roles: Vec<Id>,
+    /// When I joined: a channel I never read is unread from then on.
+    pub joined_at: Option<jiff::Timestamp>,
+    /// What notifies members who left the guild's setting alone.
+    pub default_notify: Notify,
 }
 
 /// One line of a guild's channel list.
@@ -373,6 +379,13 @@ pub struct Model {
     /// Per channel, the oldest message fetched, shown or not: where the next
     /// page of history starts.
     pub cursors: HashMap<Id, Id>,
+    /// How far I have read each channel and DM.
+    pub read_states: HashMap<Id, ReadState>,
+    /// My notification settings per guild; `None` holds the DMs'.
+    pub guild_settings: HashMap<Option<Id>, GuildSettings>,
+    /// Whether the account's unread settings stand apart from its
+    /// notification settings (Discord's "new notifications").
+    pub separate_unreads: bool,
 }
 
 impl Model {
@@ -500,11 +513,18 @@ impl Model {
                     self.complete.insert(channel);
                 }
             }
-            Update::MessageCreate { channel, message } => {
+            Update::MessageCreate {
+                channel,
+                guild,
+                message,
+                ping,
+            } => {
                 self.users.insert(message.author.id, message.author.clone());
+                self.count_message(channel, guild, &message, &ping);
                 if let Some(dm) = self.dms.iter_mut().find(|d| d.id == channel) {
                     dm.last_message_id = dm.last_message_id.max(Some(message.id));
                 }
+                self.bump_last_message(guild, channel, Some(message.id));
                 // A channel whose history was never asked for gets it, this
                 // message included, when it is opened.
                 if let Some(loaded) = self.messages.get_mut(&channel)
@@ -546,6 +566,356 @@ impl Model {
                 self.dms.retain(|d| d.id != id);
                 self.forget_history(id);
             }
+            Update::Acked {
+                channel,
+                message,
+                manual,
+                mentions,
+                flags,
+            } => self.acked(channel, message, manual, mentions, flags),
+            Update::GuildSettings { guild, settings } => {
+                self.guild_settings.insert(guild, settings);
+            }
+            Update::LastMessages { guild, channels } => {
+                for (channel, last) in channels {
+                    self.bump_last_message(Some(guild), channel, last);
+                }
+            }
+        }
+    }
+
+    /// Moves a guild channel's newest message forward, never back: a late
+    /// or partial report must not hide newer messages.
+    fn bump_last_message(&mut self, guild: Option<Id>, channel: Id, last: Option<Id>) {
+        if let Some(channel) = self
+            .guilds
+            .iter_mut()
+            .filter(|g| guild.is_none_or(|id| g.id == id))
+            .find_map(|g| g.channels.iter_mut().find(|c| c.id == channel))
+        {
+            channel.last_message_id = channel.last_message_id.max(last);
+        }
+    }
+}
+
+// What I have read, what I muted, and the badges they make. The rules
+// follow the web client's read state and guild settings stores.
+
+/// How far I have read a channel or DM, as Discord keeps it per account.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadState {
+    /// The last message read; any later one is unread. `None` when Discord
+    /// has no position on record.
+    pub last_read: Option<Id>,
+    /// Unread mentions of me. In a DM every message counts, unless it is
+    /// muted: Discord counts them so.
+    pub mentions: u32,
+    /// Discord's read state flags, which an ack sends back when they change.
+    pub flags: Option<u32>,
+}
+
+/// A mute, for good or until a time Discord set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mute {
+    pub until: Option<jiff::Timestamp>,
+}
+
+impl Mute {
+    /// A temporary mute ends on its own: Discord sends nothing when it does.
+    pub fn active(self, now: jiff::Timestamp) -> bool {
+        self.until.is_none_or(|end| now < end)
+    }
+}
+
+/// Which messages notify me (Discord's `message_notifications`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Notify {
+    All,
+    Mentions,
+    Nothing,
+}
+
+/// Which messages mark a channel unread, when the account separates this
+/// from notifications (Discord's "new notifications").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unreads {
+    All,
+    Mentions,
+}
+
+/// My settings for one channel or category; `None` inherits.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ChannelSettings {
+    pub muted: Option<Mute>,
+    pub notify: Option<Notify>,
+    pub unreads: Option<Unreads>,
+}
+
+/// My settings in one guild, or across DMs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GuildSettings {
+    pub muted: Option<Mute>,
+    /// `None` follows the guild's default.
+    pub notify: Option<Notify>,
+    pub unreads: Option<Unreads>,
+    pub suppress_everyone: bool,
+    pub suppress_roles: bool,
+    /// Per channel or category; a category's settings cover its channels.
+    pub channels: HashMap<Id, ChannelSettings>,
+}
+
+/// Who a message pings, as Discord resolved it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Ping {
+    /// Mentions me by name.
+    pub me: bool,
+    /// @everyone or @here, when the author was allowed to.
+    pub everyone: bool,
+    pub roles: Vec<Id>,
+}
+
+/// What a channel, DM or guild shows beside its name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Badge {
+    /// Messages I have not read that the unread settings let through.
+    pub unread: bool,
+    /// Unread mentions of me. They show even when muted, as in the official
+    /// client.
+    pub mentions: u32,
+    pub muted: bool,
+}
+
+/// A count as Discord's badges print it: in full below a thousand, then
+/// "1k+" up to "9k+".
+pub fn badge_count(count: u32) -> String {
+    if count < 1000 {
+        count.to_string()
+    } else {
+        format!("{}k+", (count / 1000).min(9))
+    }
+}
+
+/// One guild's settings, looked up once for all its channels.
+struct Scope<'a> {
+    guild: &'a Guild,
+    settings: Option<&'a GuildSettings>,
+    now: jiff::Timestamp,
+    /// Whether unreads follow their own setting (Discord's new
+    /// notifications); before that, every message marks a channel unread.
+    separate_unreads: bool,
+}
+
+impl Scope<'_> {
+    fn channel(&self, id: Option<Id>) -> ChannelSettings {
+        id.and_then(|id| self.settings?.channels.get(&id).copied())
+            .unwrap_or_default()
+    }
+
+    /// Muted itself or through its category. The guild's own mute only
+    /// quiets its rail entry.
+    fn muted(&self, channel: &Channel) -> bool {
+        [Some(channel.id), channel.parent]
+            .into_iter()
+            .any(|id| self.channel(id).muted.is_some_and(|m| m.active(self.now)))
+    }
+
+    /// The channel's, else its category's, else the guild's, else the
+    /// guild's default.
+    fn notify(&self, channel: &Channel) -> Notify {
+        let own = self.channel(Some(channel.id)).notify;
+        own.or(self.channel(channel.parent).notify)
+            .or(self.settings.and_then(|s| s.notify))
+            .unwrap_or(self.guild.default_notify)
+    }
+
+    /// Discord's `resolveUnreadSetting`: an explicit unread setting on the
+    /// channel, its category or the guild; otherwise channels that do not
+    /// notify on every message mark themselves unread only on mentions.
+    fn unreads(&self, channel: &Channel) -> Unreads {
+        if !self.separate_unreads {
+            return Unreads::All;
+        }
+        let own = self.channel(Some(channel.id)).unreads;
+        own.or(self.channel(channel.parent).unreads)
+            .or(self.settings.and_then(|s| s.unreads))
+            .unwrap_or(match self.notify(channel) {
+                Notify::All => Unreads::All,
+                Notify::Mentions | Notify::Nothing => Unreads::Mentions,
+            })
+    }
+}
+
+impl Model {
+    fn read_state(&self, channel: Id) -> ReadState {
+        self.read_states.get(&channel).copied().unwrap_or_default()
+    }
+
+    fn scope<'a>(&'a self, guild: &'a Guild, now: jiff::Timestamp) -> Scope<'a> {
+        Scope {
+            guild,
+            settings: self.guild_settings.get(&Some(guild.id)),
+            now,
+            separate_unreads: self.separate_unreads,
+        }
+    }
+
+    /// Where I have read up to: the read state, or, without one, when I
+    /// joined the guild (nothing is unread, if that is unknown) or when the
+    /// DM began, as the official client counts.
+    fn read_up_to(&self, guild: Option<&Guild>, channel: Id) -> Id {
+        self.read_state(channel)
+            .last_read
+            .unwrap_or_else(|| match guild {
+                Some(guild) => guild.joined_at.map_or(Id::MAX, |at| id_at(at, 0)),
+                None => channel,
+            })
+    }
+
+    fn behind(&self, guild: Option<&Guild>, channel: Id, last_message: Option<Id>) -> bool {
+        last_message.is_some_and(|last| last > self.read_up_to(guild, channel))
+    }
+
+    /// A channel's row: unread only for channels I can open, outside a mute
+    /// and when its unread setting takes every message.
+    fn badge_in(&self, scope: &Scope<'_>, channel: &Channel) -> Badge {
+        let muted = scope.muted(channel);
+        let mentions = self.read_state(channel.id).mentions;
+        // Voice channels' text chat cannot be opened here, so it is never
+        // unread; the official client counts it only through mentions too.
+        let unread = matches!(channel.kind, ChannelKind::Text | ChannelKind::Announcement)
+            && !muted
+            && scope.unreads(channel) == Unreads::All
+            && self.behind(Some(scope.guild), channel.id, channel.last_message_id);
+        Badge {
+            unread,
+            mentions,
+            muted,
+        }
+    }
+
+    pub fn channel_badge(&self, guild: &Guild, channel: &Channel, now: jiff::Timestamp) -> Badge {
+        self.badge_in(&self.scope(guild, now), channel)
+    }
+
+    /// A guild's rail entry, over the channels I can view. A channel with
+    /// mentions counts as unread even when muted, as in the official
+    /// client; a muted guild mutes all its channels this way.
+    pub fn guild_badge(&self, guild: &Guild, now: jiff::Timestamp) -> Badge {
+        let scope = self.scope(guild, now);
+        let base = guild.base_permissions(self.me);
+        let muted = scope
+            .settings
+            .and_then(|s| s.muted)
+            .is_some_and(|m| m.active(now));
+        let mut total = Badge {
+            muted,
+            ..Badge::default()
+        };
+        for channel in &guild.channels {
+            if channel.kind == ChannelKind::Category
+                || !guild
+                    .overwritten(base, channel, self.me)
+                    .contains(Permissions::VIEW_CHANNEL)
+            {
+                continue;
+            }
+            let state = self.read_state(channel.id);
+            total.mentions += state.mentions;
+            if total.unread {
+                continue;
+            }
+            total.unread = if state.mentions > 0 {
+                self.behind(Some(guild), channel.id, channel.last_message_id)
+            } else {
+                !muted && self.badge_in(&scope, channel).unread
+            };
+        }
+        total
+    }
+
+    fn dm_muted(&self, dm: Id, now: jiff::Timestamp) -> bool {
+        self.guild_settings.get(&None).is_some_and(|s| {
+            [s.muted, s.channels.get(&dm).and_then(|c| c.muted)]
+                .into_iter()
+                .flatten()
+                .any(|m| m.active(now))
+        })
+    }
+
+    pub fn dm_badge(&self, dm: &DmChannel, now: jiff::Timestamp) -> Badge {
+        let muted = self.dm_muted(dm.id, now);
+        Badge {
+            unread: !muted && self.behind(None, dm.id, dm.last_message_id),
+            mentions: self.read_state(dm.id).mentions,
+            muted,
+        }
+    }
+
+    /// The count on the direct messages button. A muted DM's count still
+    /// shows, as in the official client, but only mentions of me add to it.
+    pub fn dm_mentions(&self) -> u32 {
+        self.dms
+            .iter()
+            .map(|dm| self.read_state(dm.id).mentions)
+            .sum()
+    }
+
+    /// What a new message changes in the read state, as the web client
+    /// keeps it between acks: my own message marks the channel read up to
+    /// it; someone else's counts as a mention when it pings me (in a DM,
+    /// every message does unless the DM is muted).
+    fn count_message(&mut self, channel: Id, guild: Option<Id>, message: &Message, ping: &Ping) {
+        let now = created_at(message.id);
+        let guild = guild.and_then(|id| self.guild(id));
+        let read_up_to = self.read_up_to(guild, channel);
+        // A repeated or late event is not a new message.
+        let newest = match guild {
+            Some(guild) => guild.channel(channel).and_then(|c| c.last_message_id),
+            None => self.dm(channel).and_then(|d| d.last_message_id),
+        };
+        if newest.is_some_and(|newest| message.id <= newest) {
+            return;
+        }
+        let counts = match guild {
+            _ if message.author.id == self.me || message.id <= read_up_to => false,
+            None => ping.me || !self.dm_muted(channel, now),
+            Some(guild) => {
+                let settings = self.guild_settings.get(&Some(guild.id));
+                let suppress = |pick: fn(&GuildSettings) -> bool| settings.is_some_and(pick);
+                ping.me
+                    || (ping.everyone && !suppress(|s| s.suppress_everyone))
+                    || (!suppress(|s| s.suppress_roles)
+                        && ping.roles.iter().any(|r| guild.my_roles.contains(r)))
+            }
+        };
+        let state = self.read_states.entry(channel).or_default();
+        if message.author.id == self.me {
+            state.last_read = state.last_read.max(Some(message.id));
+            state.mentions = 0;
+        } else if counts {
+            state.mentions += 1;
+        }
+    }
+
+    /// A read reported by Discord, from this session or another. A manual
+    /// one (marked unread) may move back; others only move forward, so a
+    /// late echo of an older ack does not undo a newer read.
+    fn acked(
+        &mut self,
+        channel: Id,
+        message: Id,
+        manual: bool,
+        mentions: Option<u32>,
+        flags: Option<u32>,
+    ) {
+        let state = self.read_states.entry(channel).or_default();
+        state.flags = flags.or(state.flags);
+        if manual {
+            state.last_read = Some(message);
+            state.mentions = mentions.unwrap_or(state.mentions);
+        } else if state.last_read.is_none_or(|read| message >= read) {
+            state.last_read = Some(message);
+            state.mentions = mentions.unwrap_or(0);
         }
     }
 }
@@ -562,6 +932,7 @@ mod tests {
             parent,
             position,
             overwrites: vec![],
+            last_message_id: None,
         }
     }
 
@@ -582,6 +953,8 @@ mod tests {
                 permissions: Permissions::VIEW_CHANNEL,
             }],
             my_roles: vec![],
+            joined_at: None,
+            default_notify: Notify::All,
         }
     }
 
@@ -974,7 +1347,9 @@ mod tests {
         };
         model.apply(Update::MessageCreate {
             channel: 7,
+            guild: None,
             message: said(50, 1, "unseen"),
+            ping: Ping::default(),
         });
         assert!(!model.messages.contains_key(&7), "not loaded, not started");
         model.apply(Update::History {
@@ -985,11 +1360,15 @@ mod tests {
         });
         model.apply(Update::MessageCreate {
             channel: 8,
+            guild: None,
             message: said(60, 2, "new"),
+            ping: Ping::default(),
         });
         model.apply(Update::MessageCreate {
             channel: 8,
+            guild: None,
             message: said(60, 2, "new"),
+            ping: Ping::default(),
         });
         assert_eq!(model.messages(8).len(), 2, "a repeated event adds nothing");
         assert_eq!(model.dm(8).unwrap().last_message_id, Some(60));
@@ -1064,5 +1443,372 @@ mod tests {
         };
         let order: Vec<Id> = model.dms_by_recency().iter().map(|d| d.id).collect();
         assert_eq!(order, [3, 1, 2]);
+    }
+
+    fn at(text: &str) -> jiff::Timestamp {
+        text.parse().unwrap()
+    }
+
+    const NOW: &str = "2026-10-08T00:00:00Z";
+
+    /// A guild I joined at noon, with #10 (newest message `after + 20`),
+    /// voice #11 and category #12 holding #13 (newest `after + 30`), where
+    /// `after` is the first snowflake after I joined.
+    fn unread_model() -> Model {
+        let joined = at("2026-10-07T12:00:00Z");
+        let after = id_at(joined, 0) + 1;
+        let mut g = guild(vec![
+            Channel {
+                last_message_id: Some(after + 20),
+                ..channel(10, ChannelKind::Text, None, 0)
+            },
+            Channel {
+                last_message_id: Some(after + 25),
+                ..channel(11, ChannelKind::Voice, None, 1)
+            },
+            channel(12, ChannelKind::Category, None, 2),
+            Channel {
+                last_message_id: Some(after + 30),
+                ..channel(13, ChannelKind::Text, Some(12), 0)
+            },
+        ]);
+        g.joined_at = Some(joined);
+        Model {
+            me: ME,
+            guilds: vec![g],
+            ..Model::default()
+        }
+    }
+
+    fn newest(model: &Model, channel: Id) -> Id {
+        let g = model.guild(GUILD).unwrap();
+        g.channel(channel).unwrap().last_message_id.unwrap()
+    }
+
+    fn shown(unread: bool, mentions: u32, muted: bool) -> Badge {
+        Badge {
+            unread,
+            mentions,
+            muted,
+        }
+    }
+
+    fn badge(model: &Model, channel: Id) -> Badge {
+        let g = model.guild(GUILD).unwrap();
+        model.channel_badge(g, g.channel(channel).unwrap(), at(NOW))
+    }
+
+    fn guild_badge(model: &Model) -> Badge {
+        model.guild_badge(model.guild(GUILD).unwrap(), at(NOW))
+    }
+
+    fn read(model: &mut Model, channel: Id, last_read: Option<Id>, mentions: u32) {
+        model.read_states.insert(
+            channel,
+            ReadState {
+                last_read,
+                mentions,
+                flags: None,
+            },
+        );
+    }
+
+    fn settings(model: &mut Model, settings: GuildSettings) {
+        model.guild_settings.insert(Some(GUILD), settings);
+    }
+
+    fn channel_settings(channels: &[(Id, ChannelSettings)]) -> GuildSettings {
+        GuildSettings {
+            channels: channels.iter().copied().collect(),
+            ..GuildSettings::default()
+        }
+    }
+
+    #[test]
+    fn a_channel_is_unread_past_its_read_state_or_my_joining() {
+        let mut model = unread_model();
+        // Never read: everything since I joined is new.
+        assert!(badge(&model, 10).unread);
+        assert!(!badge(&model, 11).unread, "voice is never unread");
+        let last = newest(&model, 10);
+        read(&mut model, 10, Some(last), 0);
+        assert!(!badge(&model, 10).unread);
+        let last = newest(&model, 10);
+        read(&mut model, 10, Some(last - 1), 2);
+        assert_eq!(badge(&model, 10), shown(true, 2, false));
+        // Without a join date, a channel never read stays quiet.
+        model.guilds[0].joined_at = None;
+        assert!(!badge(&model, 13).unread);
+    }
+
+    #[test]
+    fn mutes_hide_unreads_but_not_mentions_until_they_end() {
+        let mut model = unread_model();
+        read(&mut model, 13, None, 1);
+        let until = |end: &str| ChannelSettings {
+            muted: Some(Mute {
+                until: Some(at(end)),
+            }),
+            ..ChannelSettings::default()
+        };
+        // The category until tomorrow; #10 until an hour ago.
+        settings(
+            &mut model,
+            channel_settings(&[
+                (12, until("2026-10-09T00:00:00Z")),
+                (10, until("2026-10-07T23:00:00Z")),
+            ]),
+        );
+        assert_eq!(badge(&model, 13), shown(false, 1, true));
+        assert!(badge(&model, 10).unread, "an ended mute is over");
+        let g = model.guild(GUILD).unwrap();
+        let later = at("2026-10-09T00:00:01Z");
+        assert!(model.channel_badge(g, g.channel(13).unwrap(), later).unread);
+    }
+
+    #[test]
+    fn a_guild_sums_what_i_can_view() {
+        let mut model = unread_model();
+        // #13 is unread with two mentions; #10 is unread with five, but
+        // hidden.
+        let last = newest(&model, 11);
+        read(&mut model, 11, Some(last), 0);
+        read(&mut model, 10, None, 5);
+        read(&mut model, 13, None, 2);
+        model.guilds[0].channels[0]
+            .overwrites
+            .push(overwrite(GUILD, OverwriteKind::Role, false));
+        assert_eq!(guild_badge(&model), shown(true, 2, false));
+        // Muted, the guild is unread only through channels with mentions.
+        settings(
+            &mut model,
+            GuildSettings {
+                muted: Some(Mute { until: None }),
+                ..GuildSettings::default()
+            },
+        );
+        assert_eq!(guild_badge(&model), shown(true, 2, true));
+        read(&mut model, 13, None, 0);
+        assert_eq!(guild_badge(&model), shown(false, 0, true));
+        // Its own list still marks the channel.
+        assert!(badge(&model, 13).unread);
+    }
+
+    #[test]
+    fn under_new_notifications_only_mentions_guilds_stay_quiet() {
+        let mut model = unread_model();
+        model.guilds[0].default_notify = Notify::Mentions;
+        assert!(badge(&model, 10).unread, "the old settings: every message");
+        model.separate_unreads = true;
+        assert!(!badge(&model, 10).unread);
+        assert!(!guild_badge(&model).unread);
+        // Mentions still mark the guild.
+        read(&mut model, 13, None, 1);
+        assert_eq!(guild_badge(&model), shown(true, 1, false));
+        // An explicit setting on the category wins over notifications.
+        let all = ChannelSettings {
+            unreads: Some(Unreads::All),
+            ..ChannelSettings::default()
+        };
+        settings(&mut model, channel_settings(&[(12, all)]));
+        assert!(badge(&model, 13).unread && !badge(&model, 10).unread);
+        // So does a channel notifying on every message.
+        let notify_all = ChannelSettings {
+            notify: Some(Notify::All),
+            ..ChannelSettings::default()
+        };
+        settings(&mut model, channel_settings(&[(10, notify_all)]));
+        assert!(badge(&model, 10).unread);
+    }
+
+    #[test]
+    fn dms_count_their_unread_messages() {
+        let now = at(NOW);
+        let dm = |id, last| DmChannel {
+            id,
+            recipients: vec![],
+            last_message_id: Some(last),
+        };
+        let mut model = Model {
+            dms: vec![dm(5, 50), dm(6, 60), dm(7, 70)],
+            ..Model::default()
+        };
+        read(&mut model, 5, Some(50), 0);
+        read(&mut model, 6, Some(55), 2);
+        // Never read: unread since the DM began.
+        read(&mut model, 7, None, 1);
+        let badges: Vec<(bool, u32)> = model
+            .dms
+            .iter()
+            .map(|d| model.dm_badge(d, now))
+            .map(|b| (b.unread, b.mentions))
+            .collect();
+        assert_eq!(badges, [(false, 0), (true, 2), (true, 1)]);
+        // Muted, #6 loses its unread mark; its count still adds up.
+        let muted = ChannelSettings {
+            muted: Some(Mute { until: None }),
+            ..ChannelSettings::default()
+        };
+        model.guild_settings.insert(
+            None,
+            GuildSettings {
+                channels: HashMap::from([(6, muted)]),
+                ..GuildSettings::default()
+            },
+        );
+        assert_eq!(model.dm_badge(&model.dms[1], now), shown(false, 2, true));
+        assert_eq!(model.dm_mentions(), 3);
+    }
+
+    fn create(model: &mut Model, channel: Id, guild: Option<Id>, message: Message, ping: Ping) {
+        model.apply(crate::events::Update::MessageCreate {
+            channel,
+            guild,
+            message,
+            ping,
+        });
+    }
+
+    #[test]
+    fn live_messages_count_the_mentions_that_reach_me() {
+        let mut model = unread_model();
+        model.guilds[0].my_roles = vec![50];
+        let base = newest(&model, 10);
+        read(&mut model, 10, Some(base), 0);
+        let ping = |me, everyone, roles: &[Id]| Ping {
+            me,
+            everyone,
+            roles: roles.to_vec(),
+        };
+        let mut next = base;
+        let mut send = |model: &mut Model, author, ping| {
+            next += 1;
+            create(model, 10, Some(GUILD), message(next, author), ping);
+            next
+        };
+        send(&mut model, 2, Ping::default());
+        assert_eq!(badge(&model, 10), shown(true, 0, false));
+        assert_eq!(newest(&model, 10), base + 1, "the newest message moves");
+        send(&mut model, 2, ping(true, false, &[]));
+        send(&mut model, 2, ping(false, true, &[]));
+        send(&mut model, 2, ping(false, false, &[50]));
+        send(&mut model, 2, ping(false, false, &[51]));
+        assert_eq!(badge(&model, 10).mentions, 3);
+        settings(
+            &mut model,
+            GuildSettings {
+                suppress_everyone: true,
+                suppress_roles: true,
+                ..GuildSettings::default()
+            },
+        );
+        send(&mut model, 2, ping(false, true, &[50]));
+        assert_eq!(badge(&model, 10).mentions, 3, "suppressed");
+        // A repeated event counts once.
+        let last = newest(&model, 10);
+        create(
+            &mut model,
+            10,
+            Some(GUILD),
+            message(last, 2),
+            ping(true, false, &[]),
+        );
+        assert_eq!(badge(&model, 10).mentions, 3);
+        // My own message, from another device, reads the channel.
+        let mine = send(&mut model, ME, Ping::default());
+        assert_eq!(badge(&model, 10), shown(false, 0, false));
+        assert_eq!(model.read_states[&10].last_read, Some(mine));
+    }
+
+    #[test]
+    fn every_dm_message_counts_unless_muted() {
+        let mut model = Model {
+            me: ME,
+            dms: vec![DmChannel {
+                id: 5,
+                recipients: vec![],
+                last_message_id: Some(50),
+            }],
+            ..Model::default()
+        };
+        read(&mut model, 5, Some(50), 0);
+        create(&mut model, 5, None, message(51, 2), Ping::default());
+        assert_eq!(model.dm_mentions(), 1);
+        model.guild_settings.insert(
+            None,
+            GuildSettings {
+                muted: Some(Mute { until: None }),
+                ..GuildSettings::default()
+            },
+        );
+        create(&mut model, 5, None, message(52, 2), Ping::default());
+        assert_eq!(model.dm_mentions(), 1, "muted");
+        let me = Ping {
+            me: true,
+            ..Ping::default()
+        };
+        create(&mut model, 5, None, message(53, 2), me);
+        assert_eq!(model.dm_mentions(), 2, "a mention gets through");
+    }
+
+    #[test]
+    fn acks_from_discord_move_forward_unless_manual() {
+        use crate::events::Update;
+        let mut model = Model::default();
+        read(&mut model, 10, Some(100), 0);
+        let ack = |message, manual, mentions| Update::Acked {
+            channel: 10,
+            message,
+            manual,
+            mentions,
+            flags: None,
+        };
+        model.apply(ack(90, false, None));
+        assert_eq!(model.read_states[&10].last_read, Some(100), "a late echo");
+        model.apply(ack(120, false, None));
+        assert_eq!(model.read_states[&10].last_read, Some(120));
+        // Marked unread on another device.
+        model.apply(ack(80, true, Some(4)));
+        assert_eq!(
+            model.read_states[&10],
+            ReadState {
+                last_read: Some(80),
+                mentions: 4,
+                flags: None
+            }
+        );
+    }
+
+    #[test]
+    fn newest_messages_never_move_back() {
+        use crate::events::Update;
+        let mut model = unread_model();
+        let last = newest(&model, 10);
+        model.apply(Update::LastMessages {
+            guild: GUILD,
+            channels: vec![(10, Some(last - 5)), (13, None)],
+        });
+        assert_eq!(newest(&model, 10), last);
+        assert!(
+            model
+                .guild(GUILD)
+                .unwrap()
+                .channel(13)
+                .unwrap()
+                .last_message_id
+                .is_some()
+        );
+        model.apply(Update::LastMessages {
+            guild: GUILD,
+            channels: vec![(10, Some(last + 1))],
+        });
+        assert_eq!(newest(&model, 10), last + 1);
+    }
+
+    #[test]
+    fn badge_counts_shorten_past_a_thousand() {
+        assert_eq!(badge_count(999), "999");
+        assert_eq!(badge_count(1000), "1k+");
+        assert_eq!(badge_count(25_000), "9k+");
     }
 }

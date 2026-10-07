@@ -13,7 +13,8 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
 ## Layout
 
 - `model.rs`: Discord's objects and the rules that order them (sidebar, DM recency,
-  message grouping). It has no egui types: put behaviour here and test it here.
+  message grouping, unread badges and mutes). It has no egui types: put behaviour
+  here and test it here.
 - `app.rs`: `App` holds the `Model`, the `Selection` (what is open) and the palette.
   Navigation lives on `Selection`, which takes `&Model`, so `ui.rs` draws from
   `&app.model` while it changes `app.selection`. Keep the model borrowed in place.
