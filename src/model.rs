@@ -934,12 +934,13 @@ impl Model {
             return None;
         }
         let message = state.last_read.map_or(last, |read| read.max(last));
+        // The flags are recorded once Discord has them (`save_flags`).
         self.read_states.insert(
             channel,
             ReadState {
                 last_read: Some(message),
                 mentions: 0,
-                flags: Some(flags),
+                flags: state.flags,
             },
         );
         Some(Ack {
@@ -951,9 +952,24 @@ impl Model {
         })
     }
 
+    /// The flags an ack carried, once Discord saved them.
+    pub fn save_flags(&mut self, channel: Id, flags: u32) {
+        self.read_states.entry(channel).or_default().flags = Some(flags);
+    }
+
+    /// Whether a channel or DM is still there for me to read.
+    pub fn can_read(&self, channel: Id) -> bool {
+        self.dm(channel).is_some()
+            || self
+                .guilds
+                .iter()
+                .any(|g| g.channel(channel).is_some_and(|c| g.can_view(c, self.me)))
+    }
+
     /// A read reported by Discord, from this session or another. A manual
     /// one (marked unread) may move back; others only move forward, so a
-    /// late echo of an older ack does not undo a newer read.
+    /// late echo of an older ack does not undo a newer read, and the echo
+    /// of the current one leaves mentions counted since alone.
     fn acked(
         &mut self,
         channel: Id,
@@ -967,7 +983,7 @@ impl Model {
         if manual {
             state.last_read = Some(message);
             state.mentions = mentions.unwrap_or(state.mentions);
-        } else if state.last_read.is_none_or(|read| message >= read) {
+        } else if state.last_read.is_none_or(|read| message > read) {
             state.last_read = Some(message);
             state.mentions = mentions.unwrap_or(0);
         }
@@ -1821,6 +1837,10 @@ mod tests {
         assert_eq!(model.read_states[&10].last_read, Some(100), "a late echo");
         model.apply(ack(120, false, None));
         assert_eq!(model.read_states[&10].last_read, Some(120));
+        // The echo of the current read leaves a mention since alone.
+        model.read_states.get_mut(&10).unwrap().mentions = 1;
+        model.apply(ack(120, false, Some(0)));
+        assert_eq!(model.read_states[&10].mentions, 1);
         // Marked unread on another device.
         model.apply(ack(80, true, Some(4)));
         assert_eq!(
@@ -1881,15 +1901,17 @@ mod tests {
                 immediate: true,
             })
         );
+        // The flags wait for Discord to save them.
         assert_eq!(
             model.read_states[&10],
             ReadState {
                 last_read: Some(last),
                 mentions: 0,
-                flags: Some(IS_GUILD_CHANNEL),
+                flags: None,
             }
         );
         assert_eq!(model.mark_read(10), None, "nothing new");
+        model.save_flags(10, IS_GUILD_CHANNEL);
         model.apply(crate::events::Update::LastMessages {
             guild: GUILD,
             channels: vec![(10, Some(last + 1))],

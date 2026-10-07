@@ -6,6 +6,7 @@
 //! client properties with the live build number, the cookies and the
 //! fingerprint Discord hands out before sign-in, and the page they come from.
 
+use crate::acks::{Delivery, MAX_RETRY_WAIT};
 use crate::credentials::Token;
 use crate::model::{Ack, DISCORD_EPOCH_MS, Id, User};
 use crate::remote_auth;
@@ -472,14 +473,15 @@ impl Api {
     }
 
     /// Tells Discord I read `ack.channel` up to `ack.message`, as the web
-    /// client's read state store does.
-    pub async fn ack(&self, token: &Token, ack: &Ack) -> Result<(), Error> {
+    /// client's read state store does. Never fails: what went wrong says
+    /// whether to try again.
+    pub async fn ack(&self, token: &Token, ack: &Ack) -> Delivery {
         let web = self.web().await;
         let page = match ack.guild {
             Some(guild) => format!("/channels/{guild}/{}", ack.channel),
             None => format!("/channels/@me/{}", ack.channel),
         };
-        let response = Self::dress(
+        let sent = Self::dress(
             self.client
                 .post(format!(
                     "{BASE}/channels/{}/messages/{}/ack",
@@ -491,16 +493,24 @@ impl Api {
             &page,
         )
         .send()
-        .await
-        .map_err(|_| Error::Network)?;
-        match response.status() {
-            status if status.is_success() => Ok(()),
-            reqwest::StatusCode::UNAUTHORIZED => Err(Error::Unauthorized),
-            status => {
-                log::warn!("ack refused with HTTP {status}");
-                Err(Error::Protocol)
-            }
+        .await;
+        let Ok(response) = sent else {
+            return Delivery::Retry(None);
+        };
+        let status = response.status();
+        let wait = match status {
+            reqwest::StatusCode::TOO_MANY_REQUESTS => response
+                .json::<RateLimited>()
+                .await
+                .ok()
+                .map(|limited| limited.retry_after),
+            _ => None,
+        };
+        let delivery = delivery(status.as_u16(), wait);
+        if matches!(delivery, Delivery::Dropped | Delivery::Retry(_)) && status.is_client_error() {
+            log::info!("ack answered HTTP {status}");
         }
+        delivery
     }
 
     /// Ends the session on Discord's side, so the token stops working even
@@ -526,6 +536,24 @@ impl Api {
     }
 }
 
+/// What an ack's answer means: 401 ends the session; 403 and 404 (no
+/// longer mine to read, or gone) and other refusals drop it; rate limits
+/// (after Discord's wait, capped), server errors and the rest come back.
+fn delivery(status: u16, retry_after: Option<f64>) -> Delivery {
+    match status {
+        200..=299 => Delivery::Saved,
+        401 => Delivery::Unauthorized,
+        429 => Delivery::Retry(Some(
+            retry_after
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .map_or(Duration::from_secs(1), Duration::from_secs_f64)
+                .min(MAX_RETRY_WAIT),
+        )),
+        400..=499 => Delivery::Dropped,
+        _ => Delivery::Retry(None),
+    }
+}
+
 /// Days since Discord's epoch, rounded up, as the web client reports when
 /// a channel was last viewed.
 fn last_viewed(now: jiff::Timestamp) -> i64 {
@@ -546,6 +574,23 @@ fn ack_body(ack: &Ack, now: jiff::Timestamp) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ack_answers_say_what_comes_next() {
+        assert_eq!(delivery(204, None), Delivery::Saved);
+        assert_eq!(delivery(401, None), Delivery::Unauthorized);
+        assert_eq!(delivery(404, None), Delivery::Dropped);
+        assert_eq!(delivery(403, None), Delivery::Dropped);
+        assert_eq!(
+            delivery(429, Some(2.5)),
+            Delivery::Retry(Some(Duration::from_millis(2500)))
+        );
+        assert_eq!(
+            delivery(429, Some(3600.0)),
+            Delivery::Retry(Some(MAX_RETRY_WAIT))
+        );
+        assert_eq!(delivery(502, None), Delivery::Retry(None));
+    }
 
     #[test]
     fn an_ack_sends_what_the_web_client_does() {
