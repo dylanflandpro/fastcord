@@ -1,8 +1,9 @@
 //! The three columns: servers, channels (or DMs), and the open conversation.
 
-use crate::app::{App, View};
+use crate::app::{App, Selection, View};
 use crate::model::{self, ChannelKind, Entry, Id, Message, Model};
 use crate::theme::{self, Icon, Palette};
+use egui::text::{LayoutJob, TextWrapping};
 use egui::{Align2, CornerRadius, Frame, Margin, Rect, Response, Sense, Vec2};
 
 const RAIL_WIDTH: f32 = 72.0;
@@ -11,14 +12,14 @@ const ROW_HEIGHT: f32 = 32.0;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
-    let Some(model) = app.model.take() else {
+    let Some(model) = &app.model else {
         not_connected(ui, &palette);
         return;
     };
-    rail(app, &model, ui);
-    sidebar(app, &model, ui);
-    conversation(app, &model, ui);
-    app.model = Some(model);
+    let selection = &mut app.selection;
+    rail(selection, model, &palette, ui);
+    sidebar(selection, model, &palette, ui);
+    conversation(*selection, model, &palette, ui);
 }
 
 fn not_connected(ui: &mut egui::Ui, palette: &Palette) {
@@ -38,8 +39,7 @@ fn not_connected(ui: &mut egui::Ui, palette: &Palette) {
 }
 
 /// The server rail: direct messages first, then each guild.
-fn rail(app: &mut App, model: &Model, ui: &mut egui::Ui) {
-    let palette = app.palette;
+fn rail(selection: &mut Selection, model: &Model, palette: &Palette, ui: &mut egui::Ui) {
     egui::Panel::left("rail")
         .resizable(false)
         .exact_size(RAIL_WIDTH)
@@ -51,27 +51,27 @@ fn rail(app: &mut App, model: &Model, ui: &mut egui::Ui) {
         )
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
-            let dms = app.view == View::DirectMessages;
-            if guild_button(ui, &palette, GuildMark::Icon(Icon::MessageCircle), dms)
+            let dms = selection.view == View::DirectMessages;
+            if guild_button(ui, palette, GuildMark::Icon(Icon::MessageCircle), dms)
                 .on_hover_text("Direct messages")
                 .clicked()
             {
-                app.open_direct_messages();
+                selection.open_direct_messages(model);
             }
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for guild in &model.guilds {
-                    let selected = app.view == View::Guild(guild.id);
+                    let selected = selection.view == View::Guild(guild.id);
                     if guild_button(
                         ui,
-                        &palette,
+                        palette,
                         GuildMark::Initials(&initials(&guild.name)),
                         selected,
                     )
                     .on_hover_text(&guild.name)
                     .clicked()
                     {
-                        app.open_guild(guild.id);
+                        selection.open_guild(model, guild.id);
                     }
                 }
             });
@@ -127,8 +127,7 @@ fn initials(name: &str) -> String {
 }
 
 /// The middle column: a guild's channels, or the DM list.
-fn sidebar(app: &mut App, model: &Model, ui: &mut egui::Ui) {
-    let palette = app.palette;
+fn sidebar(selection: &mut Selection, model: &Model, palette: &Palette, ui: &mut egui::Ui) {
     egui::Panel::left("sidebar")
         .resizable(true)
         .default_size(240.0)
@@ -140,7 +139,7 @@ fn sidebar(app: &mut App, model: &Model, ui: &mut egui::Ui) {
                 .inner_margin(Margin::symmetric(8, 12)),
         )
         .show(ui, |ui| {
-            let title = match app.view {
+            let title = match selection.view {
                 View::DirectMessages => "Direct messages",
                 View::Guild(id) => model.guild(id).map_or("", |g| g.name.as_str()),
             };
@@ -152,24 +151,26 @@ fn sidebar(app: &mut App, model: &Model, ui: &mut egui::Ui) {
             );
             ui.add_space(8.0);
             ui.separator();
+            // One scroll position per list, kept when switching away.
             egui::ScrollArea::vertical()
+                .id_salt(selection.view)
                 .auto_shrink(false)
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    match app.view {
+                    match selection.view {
                         View::DirectMessages => {
                             for dm in model.dms_by_recency() {
-                                let selected = app.channel == Some(dm.id);
+                                let selected = selection.channel == Some(dm.id);
                                 if row(
                                     ui,
-                                    &palette,
+                                    palette,
                                     Some(Icon::MessageCircle),
                                     &dm.title(),
                                     selected,
                                 )
                                 .clicked()
                                 {
-                                    app.channel = Some(dm.id);
+                                    selection.channel = Some(dm.id);
                                 }
                             }
                         }
@@ -193,13 +194,13 @@ fn sidebar(app: &mut App, model: &Model, ui: &mut egui::Ui) {
                                             ChannelKind::Announcement => Icon::Megaphone,
                                             ChannelKind::Text | ChannelKind::Category => Icon::Hash,
                                         };
-                                        let selected = app.channel == Some(channel.id);
+                                        let selected = selection.channel == Some(channel.id);
                                         let response =
-                                            row(ui, &palette, Some(icon), &channel.name, selected);
+                                            row(ui, palette, Some(icon), &channel.name, selected);
                                         // Voice comes after the first version.
                                         if response.clicked() && channel.kind != ChannelKind::Voice
                                         {
-                                            app.channel = Some(channel.id);
+                                            selection.channel = Some(channel.id);
                                         }
                                     }
                                 }
@@ -217,7 +218,7 @@ fn row(
     text: &str,
     selected: bool,
 ) -> Response {
-    let (rect, response) =
+    let (rect, mut response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click());
     let fill = if selected {
         Some(palette.surface_active)
@@ -246,20 +247,22 @@ fn row(
         );
         x += size + 8.0;
     }
-    ui.painter().text(
-        egui::pos2(x, rect.center().y),
-        Align2::LEFT_CENTER,
-        text,
-        theme::regular(14.0),
-        ink,
-    );
+    // One line, cut with "…" at the row's edge; the full text shows on hover.
+    let mut job = LayoutJob::simple_singleline(text.to_owned(), theme::regular(14.0), ink);
+    job.wrap = TextWrapping::truncate_at_width(rect.right() - 8.0 - x);
+    let galley = ui.painter().layout_job(job);
+    let elided = galley.elided;
+    let top = rect.center().y - galley.size().y / 2.0;
+    ui.painter().galley(egui::pos2(x, top), galley, ink);
+    if elided {
+        response = response.on_hover_text(text);
+    }
     response
 }
 
 /// The open channel: its name, then its messages, newest at the bottom.
-fn conversation(app: &mut App, model: &Model, ui: &mut egui::Ui) {
-    let palette = app.palette;
-    let Some(channel) = app.channel else {
+fn conversation(selection: Selection, model: &Model, palette: &Palette, ui: &mut egui::Ui) {
+    let Some(channel) = selection.channel else {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(palette.window))
             .show(ui, |_| {});
@@ -276,7 +279,7 @@ fn conversation(app: &mut App, model: &Model, ui: &mut egui::Ui) {
         .show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.label(
-                    egui::RichText::new(channel_title(model, app.view, channel))
+                    egui::RichText::new(channel_title(model, selection.view, channel))
                         .font(theme::semibold(15.0))
                         .color(palette.text),
                 );
@@ -296,13 +299,16 @@ fn conversation(app: &mut App, model: &Model, ui: &mut egui::Ui) {
                 });
                 return;
             }
+            let clock = Clock::now();
+            // One scroll position per channel, so each opens where it was left.
             egui::ScrollArea::vertical()
+                .id_salt(channel)
                 .auto_shrink(false)
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
                     let mut previous: Option<&Message> = None;
                     for message in messages {
-                        message_line(ui, &palette, previous, message);
+                        message_line(ui, palette, &clock, previous, message);
                         previous = Some(message);
                     }
                 });
@@ -323,6 +329,7 @@ fn channel_title(model: &Model, view: View, channel: Id) -> String {
 fn message_line(
     ui: &mut egui::Ui,
     palette: &Palette,
+    clock: &Clock,
     previous: Option<&Message>,
     message: &Message,
 ) {
@@ -335,7 +342,7 @@ fn message_line(
                     .color(palette.text),
             );
             ui.label(
-                egui::RichText::new(time_label(model::created_at(message.id)))
+                egui::RichText::new(clock.label(model::created_at(message.id)))
                     .font(theme::regular(12.0))
                     .color(palette.dim),
             );
@@ -351,15 +358,31 @@ fn message_line(
     );
 }
 
-/// "14:05" today, "07/10/2026 14:05" before.
-fn time_label(at: jiff::Timestamp) -> String {
-    let tz = jiff::tz::TimeZone::system();
-    let at = at.to_zoned(tz.clone());
-    let today = jiff::Timestamp::now().to_zoned(tz).date();
-    if at.date() == today {
-        at.strftime("%H:%M").to_string()
-    } else {
-        at.strftime("%d/%m/%Y %H:%M").to_string()
+/// The local time zone and date, read once per frame rather than once per
+/// message.
+struct Clock {
+    tz: jiff::tz::TimeZone,
+    today: jiff::civil::Date,
+}
+
+impl Clock {
+    fn now() -> Self {
+        Self::at(jiff::Timestamp::now(), jiff::tz::TimeZone::system())
+    }
+
+    fn at(now: jiff::Timestamp, tz: jiff::tz::TimeZone) -> Self {
+        let today = now.to_zoned(tz.clone()).date();
+        Self { tz, today }
+    }
+
+    /// "14:05" today, "07/10/2026 14:05" before.
+    fn label(&self, at: jiff::Timestamp) -> String {
+        let at = at.to_zoned(self.tz.clone());
+        if at.date() == self.today {
+            at.strftime("%H:%M").to_string()
+        } else {
+            at.strftime("%d/%m/%Y %H:%M").to_string()
+        }
     }
 }
 
@@ -373,5 +396,24 @@ mod tests {
         assert_eq!(initials("Omarchy"), "O");
         assert_eq!(initials("a b c d"), "abc");
         assert_eq!(initials("Équipe Ops"), "ÉO");
+    }
+
+    #[test]
+    fn time_labels_drop_the_date_for_today() {
+        let paris = jiff::tz::TimeZone::get("Europe/Paris").unwrap();
+        let clock = Clock::at("2026-10-07T20:00:00Z".parse().unwrap(), paris);
+        assert_eq!(
+            clock.label("2026-10-07T12:05:00Z".parse().unwrap()),
+            "14:05"
+        );
+        // Yesterday in UTC, but already today in Paris.
+        assert_eq!(
+            clock.label("2026-10-06T22:30:00Z".parse().unwrap()),
+            "00:30"
+        );
+        assert_eq!(
+            clock.label("2026-10-06T12:05:00Z".parse().unwrap()),
+            "06/10/2026 14:05"
+        );
     }
 }
