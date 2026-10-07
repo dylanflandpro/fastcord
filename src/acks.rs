@@ -271,6 +271,7 @@ mod tests {
             attachments: vec![],
             embeds: vec![],
             reactions: vec![],
+            delivery: crate::model::Delivery::Sent,
         };
         let marked = |channel| Update::Acked {
             channel,
@@ -286,6 +287,7 @@ mod tests {
                 guild: Some(1),
                 message: mine,
                 ping: Default::default(),
+                nonce: None,
             },
             9,
         );

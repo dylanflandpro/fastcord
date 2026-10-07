@@ -124,6 +124,141 @@ struct Experiments {
 const RATE_LIMIT_RETRIES: u32 = 2;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
 
+/// The body the web client posts for a message, fields in its order.
+#[derive(serde::Serialize)]
+struct NewMessage<'a> {
+    /// What the browser's network information reports; desktop browsers
+    /// leave it unknown.
+    mobile_network_type: &'static str,
+    content: &'a str,
+    /// A snowflake for now, as a string: Discord echoes it back with the
+    /// message so the copy shown while it was on its way can be replaced.
+    nonce: String,
+    tts: bool,
+    flags: u64,
+}
+
+/// A channel, and its guild (`None` for a DM): where a request is made
+/// from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Place {
+    pub channel: Id,
+    pub guild: Option<Id>,
+}
+
+impl Place {
+    /// The page the web client would be on.
+    fn page(self) -> String {
+        match self.guild {
+            Some(guild) => format!("/channels/{guild}/{}", self.channel),
+            None => format!("/channels/@me/{}", self.channel),
+        }
+    }
+}
+
+fn new_message(content: &str, nonce: Id) -> NewMessage<'_> {
+    NewMessage {
+        mobile_network_type: "unknown",
+        content,
+        nonce: nonce.to_string(),
+        tts: false,
+        flags: 0,
+    }
+}
+
+/// How far one try at a request that changes something got.
+#[derive(Debug, PartialEq)]
+pub enum Attempt {
+    /// Discord answered; its body, when it could be read.
+    Answered { status: u16, body: Option<String> },
+    /// No connection: the request never reached Discord.
+    Unreachable,
+    /// It left, but no answer came back: it may have arrived.
+    Lost,
+}
+
+/// What an attempt means, as the web client's message queue reads it.
+#[derive(Debug, PartialEq)]
+pub enum Verdict {
+    /// Done; the stored message, when the answer could be read.
+    Sent(Option<String>),
+    /// Rate limited: try again after this long, the wait Discord asked for.
+    Wait(Duration),
+    /// The token was refused.
+    Unauthorized,
+    /// Not done, in Discord's words when it gave some (slowmode, a missing
+    /// permission).
+    Refused(Option<String>),
+    /// Maybe done: the answer was lost.
+    Unsure,
+}
+
+/// How many times a rate-limited write is tried again, and the longest wait
+/// taken: longer than that, Discord's refusal stands.
+const WRITE_RETRIES: u32 = 3;
+const LONGEST_WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// The status comes first: a success is one whatever its body.
+pub fn verdict(attempt: &Attempt, retries: u32) -> Verdict {
+    let (status, body) = match attempt {
+        Attempt::Answered { status, body } => (*status, body.as_deref()),
+        Attempt::Unreachable => return Verdict::Refused(None),
+        Attempt::Lost => return Verdict::Unsure,
+    };
+    if (200..300).contains(&status) {
+        return Verdict::Sent(body.map(str::to_owned));
+    }
+    if status == 401 {
+        return Verdict::Unauthorized;
+    }
+    // A proxy's 502 or 504 can come after Discord stored the message, and
+    // Retry would post it twice (the nonce does not deduplicate).
+    if status >= 500 {
+        log::warn!("a write answered HTTP {status}");
+        return Verdict::Unsure;
+    }
+    let refusal = body.and_then(|body| serde_json::from_str::<Refusal>(body).ok());
+    let code = refusal.as_ref().map_or(0, |r| r.code);
+    let wait = body
+        .and_then(|body| serde_json::from_str::<RateLimited>(body).ok())
+        .map(|limited| server_wait(limited.retry_after));
+    if status == 429 && code != SLOWMODE && retries < WRITE_RETRIES {
+        let wait = wait.unwrap_or(Duration::from_secs(1));
+        if wait <= LONGEST_WAIT {
+            return Verdict::Wait(wait);
+        }
+    }
+    // Status and code only: the reason may quote what was sent.
+    log::warn!("a write failed with HTTP {status} (code {code})");
+    if body.is_some_and(|body| serde_json::from_str::<Challenge>(body).is_ok()) {
+        return Verdict::Refused(Some(
+            "Discord asked for a captcha, which fastcord cannot show here yet.".into(),
+        ));
+    }
+    Verdict::Refused(refusal.and_then(|r| r.message))
+}
+
+/// The wait Discord asked for, in full.
+fn server_wait(seconds: f64) -> Duration {
+    if seconds.is_finite() && seconds > 0.0 {
+        Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
+    } else {
+        Duration::from_millis(500)
+    }
+}
+
+/// Discord's error body (`{"code": 50013, "message": "Missing Permissions"}`).
+#[derive(serde::Deserialize)]
+struct Refusal {
+    #[serde(default)]
+    code: u64,
+    message: Option<String>,
+}
+
+/// The error code for a slowmode refusal: a 429 that waiting a few seconds
+/// will not fix, which the official client reports instead of retrying.
+const SLOWMODE: u64 = 20016;
+
 #[derive(serde::Deserialize)]
 struct RateLimited {
     /// Seconds, fractional.
@@ -554,6 +689,34 @@ impl Api {
         reacted(status.as_u16(), wait)
     }
 
+    /// Posts a message as the web client does, once: the caller reads the
+    /// attempt with [`verdict`] and waits out rate limits.
+    pub async fn send_message(
+        &self,
+        token: &Token,
+        place: Place,
+        nonce: Id,
+        content: &str,
+    ) -> Attempt {
+        let url = format!("{BASE}/channels/{}/messages", place.channel);
+        let request = self.client.post(url).json(&new_message(content, nonce));
+        self.attempt(token, place, request).await
+    }
+
+    /// One try at a request that changes something, from the channel's page.
+    async fn attempt(&self, token: &Token, place: Place, request: RequestBuilder) -> Attempt {
+        let web = self.web().await;
+        let request = request.header(reqwest::header::AUTHORIZATION, token.expose());
+        match Self::dress(request, &web, &place.page()).send().await {
+            Err(error) if error.is_connect() => Attempt::Unreachable,
+            Err(_) => Attempt::Lost,
+            Ok(response) => Attempt::Answered {
+                status: response.status().as_u16(),
+                body: response.text().await.ok(),
+            },
+        }
+    }
+
     /// Ends the session on Discord's side, so the token stops working even
     /// if a copy survived somewhere.
     pub async fn logout(&self, token: &Token) -> Result<(), Error> {
@@ -796,6 +959,100 @@ mod tests {
         assert_eq!(header("X-Captcha-Key"), "solved");
         assert_eq!(header("X-Captcha-Rqtoken"), "t");
         assert_eq!(header("X-Captcha-Session-Id"), "s");
+    }
+
+    #[test]
+    fn a_message_is_posted_as_the_web_client_posts_it() {
+        let body = serde_json::to_string(&new_message("salut :)", 1425000000000000000)).unwrap();
+        assert_eq!(
+            body,
+            r#"{"mobile_network_type":"unknown","content":"salut :)","nonce":"1425000000000000000","tts":false,"flags":0}"#
+        );
+    }
+
+    #[test]
+    fn verdicts_read_the_status_first() {
+        let answered = |status, body: &str| Attempt::Answered {
+            status,
+            body: Some(body.to_owned()),
+        };
+        let sent = Attempt::Answered {
+            status: 200,
+            body: None,
+        };
+        assert_eq!(
+            verdict(&sent, 0),
+            Verdict::Sent(None),
+            "an unreadable body still sent it"
+        );
+        assert_eq!(
+            verdict(&answered(200, "{}"), 0),
+            Verdict::Sent(Some("{}".into()))
+        );
+        assert_eq!(verdict(&answered(401, "{}"), 0), Verdict::Unauthorized);
+        assert_eq!(verdict(&Attempt::Lost, 0), Verdict::Unsure);
+        assert_eq!(verdict(&Attempt::Unreachable, 0), Verdict::Refused(None));
+        let limited = answered(
+            429,
+            r#"{"message":"You are being rate limited.","retry_after":42.5,"global":false}"#,
+        );
+        assert_eq!(
+            verdict(&limited, 0),
+            Verdict::Wait(Duration::from_millis(42_500)),
+            "in full"
+        );
+        let refused = Verdict::Refused(Some("You are being rate limited.".into()));
+        assert_eq!(verdict(&limited, WRITE_RETRIES), refused);
+        let slowmode = answered(
+            429,
+            r#"{"message":"Slowmode is enabled.","code":20016,"retry_after":3}"#,
+        );
+        assert_eq!(
+            verdict(&slowmode, 0),
+            Verdict::Refused(Some("Slowmode is enabled.".into()))
+        );
+        let forbidden = answered(403, r#"{"message":"Missing Permissions","code":50013}"#);
+        assert_eq!(
+            verdict(&forbidden, 0),
+            Verdict::Refused(Some("Missing Permissions".into()))
+        );
+        let captcha = answered(
+            400,
+            r#"{"captcha_key":["captcha-required"],"captcha_sitekey":"x"}"#,
+        );
+        assert!(matches!(verdict(&captcha, 0), Verdict::Refused(Some(r)) if r.contains("captcha")));
+        assert_eq!(verdict(&answered(502, "<html>"), 0), Verdict::Unsure);
+        assert_eq!(verdict(&answered(500, "{}"), 0), Verdict::Unsure);
+    }
+
+    #[test]
+    fn places_are_their_pages() {
+        assert_eq!(
+            Place {
+                channel: 7,
+                guild: None
+            }
+            .page(),
+            "/channels/@me/7"
+        );
+        assert_eq!(
+            Place {
+                channel: 7,
+                guild: Some(1)
+            }
+            .page(),
+            "/channels/1/7"
+        );
+    }
+
+    #[test]
+    fn reads_discords_refusals() {
+        let refusal: Refusal = serde_json::from_str(
+            r#"{"message":"Slowmode is enabled.","code":20016,"retry_after":3.2}"#,
+        )
+        .unwrap();
+        assert_eq!(refusal.code, SLOWMODE);
+        assert_eq!(refusal.message.as_deref(), Some("Slowmode is enabled."));
     }
 
     #[test]

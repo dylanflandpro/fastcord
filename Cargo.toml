@@ -55,6 +55,9 @@ thiserror = "2.0.21"
 # Pictures in messages. eframe already brings it in for PNG; the media
 # proxy serves WebP, and senders post JPEG and GIF.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+# `:smile:` → 😄 in the composer: GitHub's shortcodes, which Discord's mostly
+# share. Its only dependency, phf, is already in the tree.
+emojis = "0.9"
 
 # Desktop notifications, spoken over D-Bus on one connection. zbus is
 # already in the tree (the keyring and accesskit bring it), so nothing new.

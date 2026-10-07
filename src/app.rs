@@ -1,9 +1,11 @@
 //! The window: the model, what is open, and the palette it is drawn in.
 
-use crate::backend::{Backend, Command, Event, Link, Session};
+use crate::api::Place;
+use crate::backend::{Backend, Command, Event, Link, Outgoing, Session};
+use crate::compose::Unsent;
 use crate::events::Update;
 use crate::media::{self, Media};
-use crate::model::{Ack, ChannelKind, Emoji, Id, Model, ReactionRequest};
+use crate::model::{Ack, ChannelKind, Delivery, Emoji, Id, Message, Model, ReactionRequest};
 use crate::notify::{self, Attention};
 use crate::theme::{self, Catalog, Palette};
 use std::collections::{HashMap, HashSet};
@@ -217,6 +219,224 @@ fn acknowledge(
     }
     model.mark_read(channel)
 }
+/// Where a request about `channel` is made from.
+fn place(model: &Model, channel: Id) -> Place {
+    Place {
+        channel,
+        guild: model.guild_of(channel),
+    }
+}
+
+/// A message I sent that Discord has not confirmed: kept here as well as
+/// in its conversation, which a new READY replaces, so it is never lost.
+#[derive(Clone, Debug, PartialEq)]
+struct Posted {
+    channel: Id,
+    content: String,
+    /// On its way to Discord.
+    flying: bool,
+    /// Its answer was lost: it may be on Discord.
+    unsure: bool,
+    /// A new READY took its copy while it was unsure: it waits for its
+    /// channel's history to say whether it arrived.
+    checking: bool,
+}
+
+/// What the composer says of a message put back in the draft that may have
+/// gone through after all.
+pub const MAYBE_SENT: &str = "A message put back here may already have been sent: check the conversation before sending it again.";
+
+/// What I write: a draft per channel, kept while I look elsewhere as the
+/// official client keeps them, the messages Discord has not confirmed yet,
+/// and the nonces handed out.
+#[derive(Default)]
+pub struct Composer {
+    pub drafts: HashMap<Id, String>,
+    /// Why the channel's draft was not sent, until it changes.
+    pub notice: Option<(Id, String)>,
+    posted: HashMap<Id, Posted>,
+    last_nonce: Id,
+}
+
+impl Composer {
+    /// Sends `channel`'s draft: it shows at once, pending, and the backend
+    /// gets what to post. Nothing happens (the draft stays) when the draft
+    /// is blank, too long or something fastcord does not do (which the
+    /// notice says), when I may not write there, or before the channel's
+    /// history is shown.
+    pub fn send(
+        &mut self,
+        model: &mut Model,
+        channel: Id,
+        now: jiff::Timestamp,
+    ) -> Option<Outgoing> {
+        let draft = self.drafts.get(&channel)?;
+        if !model.can_send(channel) {
+            return None;
+        }
+        let content = match crate::compose::prepare(draft) {
+            Ok(content) => content,
+            Err(Unsent::Unsupported(why)) => {
+                self.notice = Some((channel, why));
+                return None;
+            }
+            Err(Unsent::Blank | Unsent::TooLong) => return None,
+        };
+        let nonce = crate::model::next_nonce(self.last_nonce, now);
+        if !model.add_pending(channel, nonce, content.clone()) {
+            return None;
+        }
+        self.last_nonce = nonce;
+        self.drafts.remove(&channel);
+        self.notice = None;
+        let posted = Posted {
+            channel,
+            content: content.clone(),
+            flying: true,
+            unsure: false,
+            checking: false,
+        };
+        self.posted.insert(nonce, posted);
+        Some(Outgoing {
+            place: place(model, channel),
+            nonce,
+            content,
+        })
+    }
+
+    /// Retry on a message that failed, while I may still write there.
+    pub fn retry(&mut self, model: &mut Model, channel: Id, nonce: Id) -> Option<Outgoing> {
+        if !model.can_send(channel) {
+            return None;
+        }
+        let content = model.resend(channel, nonce)?;
+        let posted = Posted {
+            channel,
+            content: content.clone(),
+            flying: true,
+            unsure: false,
+            checking: false,
+        };
+        self.posted.insert(nonce, posted);
+        Some(Outgoing {
+            place: place(model, channel),
+            nonce,
+            content,
+        })
+    }
+
+    /// Delete on a message that failed.
+    pub fn discard(&mut self, model: &mut Model, channel: Id, nonce: Id) {
+        if model.discard(channel, nonce) {
+            self.posted.remove(&nonce);
+        }
+    }
+
+    /// Discord confirmed the message sent with `nonce`.
+    pub fn confirmed(&mut self, nonce: Id) {
+        self.posted.remove(&nonce);
+    }
+
+    /// What became of a message, shown on its copy. Without one (a new
+    /// READY replaced the conversation), it shows again; before the
+    /// conversation is back, its text returns to the channel's draft.
+    pub fn settled(&mut self, model: &mut Model, channel: Id, nonce: Id, delivery: Delivery) {
+        let Some(posted) = self.posted.get_mut(&nonce) else {
+            model.send_settled(channel, nonce, delivery);
+            return;
+        };
+        posted.flying = delivery.in_flight();
+        posted.unsure = delivery == Delivery::Unsure;
+        if model.send_settled(channel, nonce, delivery.clone()) {
+            return;
+        }
+        if model.add_pending(channel, nonce, posted.content.clone()) {
+            model.send_settled(channel, nonce, delivery);
+        } else if !posted.flying
+            && let Some(posted) = self.posted.remove(&nonce)
+        {
+            self.restore(posted);
+        }
+    }
+
+    /// A new READY replaced the conversations and the copies in them: what
+    /// is no longer on its way goes back to its draft, oldest first.
+    pub fn after_ready(&mut self) {
+        let mut landed: Vec<Id> = self
+            .posted
+            .iter()
+            .filter(|(_, p)| !p.flying && !p.checking)
+            .map(|(&n, _)| n)
+            .collect();
+        landed.sort_unstable();
+        for nonce in landed {
+            let Some(posted) = self.posted.get_mut(&nonce) else {
+                continue;
+            };
+            // Maybe on Discord: the reloaded history will say.
+            if posted.unsure {
+                posted.checking = true;
+            } else if let Some(posted) = self.posted.remove(&nonce) {
+                self.restore(posted);
+            }
+        }
+    }
+
+    /// `channel`'s history is back: an unsure message whose copy went with
+    /// a READY is there, by me with its text, or it goes back to the draft
+    /// with a word that it may have been sent after all.
+    pub fn history_loaded(&mut self, model: &Model, channel: Id) {
+        let mut checked: Vec<Id> = self
+            .posted
+            .iter()
+            .filter(|(_, p)| p.checking && p.channel == channel)
+            .map(|(&n, _)| n)
+            .collect();
+        checked.sort_unstable();
+        for nonce in checked {
+            let Some(posted) = self.posted.remove(&nonce) else {
+                continue;
+            };
+            let mine = model
+                .messages(channel)
+                .iter()
+                .filter(|m| m.author.id == model.me);
+            if mine
+                .into_iter()
+                .any(|m| m.delivery == Delivery::Sent && m.content == posted.content)
+            {
+                continue;
+            }
+            self.restore(posted);
+            self.notice = Some((channel, MAYBE_SENT.into()));
+        }
+    }
+
+    fn restore(&mut self, posted: Posted) {
+        let draft = self.drafts.entry(posted.channel).or_default();
+        if !draft.is_empty() {
+            draft.push('\n');
+        }
+        draft.push_str(&posted.content);
+    }
+
+    fn next_id(&mut self, now: jiff::Timestamp) -> Id {
+        self.last_nonce = crate::model::next_nonce(self.last_nonce, now);
+        self.last_nonce
+    }
+}
+
+/// Whether a message whose answer was lost may be retried: once the gateway
+/// showed it was alive after the loss. A resume replays what it missed
+/// before RESUMED, and a heartbeat's acknowledgement comes after what was
+/// already on its way: had the message arrived, its copy would be here.
+pub fn unsure_settled(since: Instant, alive_at: Option<Instant>) -> bool {
+    alive_at.is_some_and(|at| at > since)
+}
+
+/// How long a demo message takes to "reach Discord": long enough to see it
+/// pending.
+const DEMO_DELIVERY: std::time::Duration = std::time::Duration::from_millis(700);
 
 pub struct App {
     /// `None` until the account is connected.
@@ -253,6 +473,14 @@ pub struct App {
     notifications: Arc<notify::Shared>,
     /// A notification was clicked: bring the window forward.
     raise: bool,
+    pub composer: Composer,
+    /// Demo runs have no Discord: what they send arrives here, by when.
+    demo_outbox: Vec<(std::time::Instant, Outgoing)>,
+    /// Messages whose answer was lost, as channel and nonce, since when.
+    unsure: HashMap<(Id, Id), Instant>,
+    /// When the gateway last showed it was alive (connected, or answered a
+    /// heartbeat), while it is connected.
+    alive_at: Option<Instant>,
 }
 
 /// What the conversation shows above or instead of its messages.
@@ -343,6 +571,10 @@ impl App {
             reading: Reading::new(Instant::now()),
             notifications,
             raise: false,
+            composer: Composer::default(),
+            demo_outbox: Vec::new(),
+            unsure: HashMap::new(),
+            alive_at: None,
         }
     }
 
@@ -462,6 +694,125 @@ impl App {
         self.failed_history.clear();
         self.early_messages.clear();
         self.media.clear();
+        self.composer = Composer::default();
+        self.unsure.clear();
+    }
+
+    /// Enter in the composer.
+    pub fn send_draft(&mut self, channel: Id) {
+        let Some(model) = &mut self.model else {
+            return;
+        };
+        if let Some(outgoing) = self.composer.send(model, channel, jiff::Timestamp::now()) {
+            self.post(outgoing);
+        }
+    }
+
+    /// Retry on a message that failed.
+    pub fn retry_send(&mut self, channel: Id, nonce: Id) {
+        let Some(model) = &mut self.model else {
+            return;
+        };
+        if let Some(outgoing) = self.composer.retry(model, channel, nonce) {
+            self.post(outgoing);
+        }
+    }
+
+    /// Delete on a message that failed.
+    pub fn discard_failed(&mut self, channel: Id, nonce: Id) {
+        if let Some(model) = &mut self.model {
+            self.composer.discard(model, channel, nonce);
+        }
+    }
+
+    /// What the backend says of a message I sent.
+    fn settled(&mut self, channel: Id, nonce: Id, delivery: Delivery) {
+        if delivery == Delivery::Unsure {
+            self.unsure.insert((channel, nonce), Instant::now());
+        }
+        if let Some(model) = &mut self.model {
+            self.composer.settled(model, channel, nonce, delivery);
+        }
+    }
+
+    /// My own message came back from Discord: it is confirmed.
+    fn confirm(&mut self, update: &Update) {
+        let me = self.model.as_ref().map(|m| m.me);
+        if let Update::MessageCreate {
+            message,
+            nonce: Some(nonce),
+            ..
+        } = update
+            && Some(message.author.id) == me
+        {
+            self.composer.confirmed(*nonce);
+            self.unsure.retain(|&(_, n), _| n != *nonce);
+        }
+    }
+
+    /// Offers Retry on the messages whose answer was lost, once the gateway
+    /// has had its chance to confirm them.
+    fn settle_unsure(&mut self) {
+        let alive_at = self.alive_at;
+        let (settled, waiting): (HashMap<_, _>, _) = std::mem::take(&mut self.unsure)
+            .into_iter()
+            .partition(|&(_, since)| unsure_settled(since, alive_at));
+        self.unsure = waiting;
+        for (channel, nonce) in settled.into_keys() {
+            self.settled(channel, nonce, Delivery::Failed(None));
+        }
+    }
+
+    fn post(&mut self, outgoing: Outgoing) {
+        match &self.backend {
+            Some(backend) => backend.send(Command::Send(outgoing)),
+            None => self
+                .demo_outbox
+                .push((std::time::Instant::now() + DEMO_DELIVERY, outgoing)),
+        }
+    }
+
+    /// Demo runs confirm what was sent, as Discord would, once it is due,
+    /// or refuse it where the demo says Discord would.
+    fn deliver_demo(&mut self, ctx: &egui::Context) {
+        let now = std::time::Instant::now();
+        let (due, waiting) = std::mem::take(&mut self.demo_outbox)
+            .into_iter()
+            .partition(|(at, _)| *at <= now);
+        self.demo_outbox = waiting;
+        if let Some((at, _)) = self.demo_outbox.iter().min_by_key(|(at, _)| *at) {
+            ctx.request_repaint_after(*at - now);
+        }
+        for (_, Outgoing { place, nonce, .. }) in due {
+            let channel = place.channel;
+            if let Some(reason) = crate::demo::refusal(channel) {
+                self.settled(channel, nonce, Delivery::Failed(Some(reason.into())));
+                continue;
+            }
+            let Some(model) = &mut self.model else {
+                return;
+            };
+            let pending = model.messages(channel).iter().find(|m| m.id == nonce);
+            let Some(pending) = pending.cloned() else {
+                continue;
+            };
+            let message = Message {
+                id: self.composer.next_id(jiff::Timestamp::now()),
+                delivery: Delivery::Sent,
+                ..pending
+            };
+            let update = Update::MessageCreate {
+                channel,
+                guild: place.guild,
+                message,
+                ping: crate::model::Ping::default(),
+                nonce: Some(nonce),
+            };
+            self.confirm(&update);
+            if let Some(model) = &mut self.model {
+                model.apply(update);
+            }
+        }
     }
 
     /// Where the open channel's history stands.
@@ -528,7 +879,10 @@ impl App {
                 }
                 self.session = session;
             }
-            Event::Link(link) => self.link = link,
+            Event::Link(link) => {
+                self.link = link;
+                self.alive_at = (link == Link::Connected).then(Instant::now);
+            }
             Event::Ready(model) => {
                 // A new session after a reconnect missed what happened
                 // meanwhile: histories load again rather than stay
@@ -538,6 +892,10 @@ impl App {
                     false => self.selection = Selection::initial(Some(&model)),
                 }
                 self.model = Some(*model);
+                // The copies of my unconfirmed messages went with the old
+                // conversations.
+                self.composer.after_ready();
+                self.unsure.clear();
             }
             Event::AckDone { channel, flags } => {
                 self.reading.outstanding.remove(&channel);
@@ -560,7 +918,30 @@ impl App {
                 self.loading_history.remove(&channel);
                 self.failed_history.insert(channel);
             }
+            Event::SendFailed {
+                channel,
+                nonce,
+                reason,
+            } => self.settled(channel, nonce, Delivery::Failed(reason)),
+            Event::SendUnsure { channel, nonce } => self.settled(channel, nonce, Delivery::Unsure),
+            Event::SendHeld {
+                channel,
+                nonce,
+                wait,
+            } => {
+                let wait =
+                    jiff::SignedDuration::try_from(wait).unwrap_or(jiff::SignedDuration::MAX);
+                let now = jiff::Timestamp::now();
+                let until = now.checked_add(wait).unwrap_or(now);
+                self.settled(channel, nonce, Delivery::Held(until));
+            }
+            Event::Alive => {
+                if self.link == Link::Connected {
+                    self.alive_at = Some(Instant::now());
+                }
+            }
             Event::Update(update) => {
+                self.confirm(&update);
                 // A message arriving while its channel's first page loads
                 // may be newer than the page: keep it for after.
                 if let Update::MessageCreate { channel, .. } = &update
@@ -593,6 +974,9 @@ impl App {
                     model.apply(update);
                     if let Some(early) = landed.and_then(|c| self.early_messages.remove(&c)) {
                         early.into_iter().for_each(|update| model.apply(update));
+                    }
+                    if let Some(channel) = landed {
+                        self.composer.history_loaded(model, channel);
                     }
                     self.selection.repair(model);
                 }
@@ -672,6 +1056,8 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         self.drop_unreadable_acks();
+        self.deliver_demo(ctx);
+        self.settle_unsure();
         if let Some(channel) = self.selection.channel {
             self.request_history(channel, false);
         }
@@ -892,6 +1278,171 @@ mod tests {
         model.apply(Update::DmRemove(900));
         selection.repair(&model);
         assert_eq!(selection.channel, Some(901));
+    }
+
+    /// The demo's messages are dated from the real clock.
+    fn now() -> jiff::Timestamp {
+        jiff::Timestamp::now()
+    }
+
+    #[test]
+    fn a_draft_is_sent_once_and_shows_at_once() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        composer.drafts.insert(111, " :wave: salut ".into());
+        let outgoing = composer.send(&mut model, 111, now()).unwrap();
+        assert_eq!(outgoing.content, "👋 salut");
+        assert_eq!(outgoing.place.guild, Some(100));
+        let shown = model.messages(111).last().unwrap();
+        assert_eq!(
+            (shown.id, &shown.delivery),
+            (outgoing.nonce, &Delivery::Sending)
+        );
+        assert_eq!(shown.author.id, model.me);
+        assert!(!composer.drafts.contains_key(&111));
+        assert_eq!(composer.send(&mut model, 111, now()), None, "nothing left");
+    }
+
+    #[test]
+    fn some_drafts_stay_unsent() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        // No permission in #annonces, blank, too long, history not loaded.
+        model.messages.remove(&112);
+        for (channel, draft) in [
+            (101, "salut".to_owned()),
+            (111, "  \n".to_owned()),
+            (113, "a".repeat(2001)),
+            (112, "salut".to_owned()),
+        ] {
+            composer.drafts.insert(channel, draft);
+            assert_eq!(composer.send(&mut model, channel, now()), None);
+            assert!(composer.drafts.contains_key(&channel));
+        }
+    }
+
+    /// A message sent in `channel`, and its nonce.
+    fn sent(model: &mut Model, composer: &mut Composer, channel: Id, text: &str) -> Id {
+        composer.drafts.insert(channel, text.into());
+        composer.send(model, channel, now()).unwrap().nonce
+    }
+
+    fn delivery(model: &Model, channel: Id, nonce: Id) -> Option<Delivery> {
+        let message = model.messages(channel).iter().find(|m| m.id == nonce);
+        message.map(|m| m.delivery.clone())
+    }
+
+    #[test]
+    fn a_retry_sends_the_same_message_again() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        let nonce = sent(&mut model, &mut composer, 900, "un");
+        assert_eq!(composer.retry(&mut model, 900, nonce), None, "on its way");
+        composer.settled(&mut model, 900, nonce, Delivery::Failed(None));
+        let retried = composer.retry(&mut model, 900, nonce).unwrap();
+        // The same nonce: a copy that arrived after all confirms it.
+        assert_eq!((retried.nonce, retried.content.as_str()), (nonce, "un"));
+        assert_eq!(delivery(&model, 900, nonce), Some(Delivery::Sending));
+        // Retry asks again whether I may still write there.
+        composer.settled(&mut model, 900, nonce, Delivery::Failed(None));
+        model.dms.retain(|d| d.id != 900);
+        assert_eq!(composer.retry(&mut model, 900, nonce), None);
+    }
+
+    #[test]
+    fn what_fastcord_does_not_do_stays_in_the_draft_with_a_notice() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        composer.drafts.insert(111, "/nick Dyl".into());
+        assert_eq!(composer.send(&mut model, 111, now()), None);
+        let notice = composer.notice.clone().unwrap();
+        assert_eq!(notice, (111, crate::compose::SLASH.into()));
+        assert!(composer.drafts.contains_key(&111));
+        // A command the web client runs as text goes, and the notice with it.
+        composer.drafts.insert(111, "/shrug".into());
+        assert_eq!(
+            composer.send(&mut model, 111, now()).unwrap().content,
+            "¯\\_(ツ)_/¯"
+        );
+        assert_eq!(composer.notice, None);
+    }
+
+    #[test]
+    fn a_message_whose_copy_is_gone_is_never_lost() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        let first = sent(&mut model, &mut composer, 111, "un");
+        let second = sent(&mut model, &mut composer, 111, "deux");
+        let third = sent(&mut model, &mut composer, 111, "trois");
+        composer.settled(&mut model, 111, first, Delivery::Failed(None));
+        composer.settled(&mut model, 111, second, Delivery::Failed(None));
+        // A new READY: the conversation is replaced, its history not back.
+        model.messages.clear();
+        composer.drafts.insert(111, "brouillon".into());
+        composer.after_ready();
+        assert_eq!(
+            composer.drafts[&111], "brouillon\nun\ndeux",
+            "failed ones, oldest first"
+        );
+        // The one still on its way fails later: its text comes back too.
+        composer.settled(&mut model, 111, third, Delivery::Failed(None));
+        assert_eq!(composer.drafts[&111], "brouillon\nun\ndeux\ntrois");
+        assert!(composer.posted.is_empty());
+    }
+
+    #[test]
+    fn an_unsure_message_waits_for_its_history_after_ready() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        let arrived = sent(&mut model, &mut composer, 111, "arrivé");
+        let lost = sent(&mut model, &mut composer, 111, "perdu");
+        composer.settled(&mut model, 111, arrived, Delivery::Unsure);
+        composer.settled(&mut model, 111, lost, Delivery::Unsure);
+        let mut history = model.messages.remove(&111).unwrap();
+        composer.after_ready();
+        assert!(
+            !composer.drafts.contains_key(&111),
+            "nothing yet: it may be there"
+        );
+        // The reloaded history holds the first, by me.
+        history.retain(|m| m.delivery == Delivery::Sent);
+        let mut there = history[0].clone();
+        (there.id, there.author.id, there.content) = (arrived + 7, model.me, "arrivé".into());
+        history.push(there);
+        model.messages.insert(111, history);
+        composer.history_loaded(&model, 111);
+        assert_eq!(composer.drafts[&111], "perdu");
+        assert_eq!(composer.notice, Some((111, MAYBE_SENT.into())));
+        assert!(composer.posted.is_empty());
+    }
+
+    #[test]
+    fn a_failure_shows_again_once_the_conversation_is_back() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        let nonce = sent(&mut model, &mut composer, 111, "un");
+        let history = model.messages.remove(&111).unwrap();
+        composer.after_ready();
+        model.messages.insert(111, history);
+        let reason = Some("Slowmode is enabled.".to_owned());
+        composer.settled(&mut model, 111, nonce, Delivery::Failed(reason.clone()));
+        assert_eq!(delivery(&model, 111, nonce), Some(Delivery::Failed(reason)));
+        composer.confirmed(nonce);
+        assert!(composer.posted.is_empty());
+    }
+
+    #[test]
+    fn retry_waits_for_the_gateway_after_a_lost_answer() {
+        let since = Instant::now();
+        let at = |s| Some(since + Duration::from_secs(s));
+        assert!(!unsure_settled(since, None), "offline: no way to know");
+        // Alive before the loss says nothing of it, however long ago.
+        assert!(!unsure_settled(
+            since,
+            since.checked_sub(Duration::from_secs(60))
+        ));
+        // Reconnected, or a heartbeat answered, after the loss.
+        assert!(unsure_settled(since, at(1)));
     }
 
     #[test]

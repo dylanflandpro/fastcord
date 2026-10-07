@@ -2,12 +2,12 @@
 
 mod sign_in;
 
-use crate::app::{self, App, HistoryStatus, ScrollAnchor, Selection, View};
+use crate::app::{self, App, Composer, HistoryStatus, ScrollAnchor, Selection, View};
 use crate::backend::{Command, Link};
 use crate::markdown::{self, Action, Block, Content, Directory, Span, Style};
 use crate::media::{self, Media, Picture, Shown};
 use crate::model::{
-    self, Attachment, Badge, ChannelKind, Embed, EmbedField, Entry, Id, Message, Model,
+    self, Attachment, Badge, ChannelKind, Delivery, Embed, EmbedField, Entry, Id, Message, Model,
     ReactionKind,
 };
 use crate::theme::{self, Icon, Palette};
@@ -33,14 +33,20 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
     status_bar(app, ui);
     let status = app.selection.channel.map(|c| app.history_status(c));
-    let (request, bottom) = {
+    let (request, bottom, send) = {
         let Some(model) = &app.model else {
             return;
         };
         let selection = &mut app.selection;
         rail(selection, model, &palette, ui);
         sidebar(selection, model, &palette, ui);
-        conversation(selection, model, &palette, status, &mut app.media, ui)
+        let state = &mut app.composer;
+        let send = selection
+            .channel
+            .filter(|&channel| composer(channel, model, state, &palette, ui));
+        let (request, bottom) =
+            conversation(selection, model, &palette, status, &mut app.media, ui);
+        (request, bottom, send)
     };
     app.report_bottom(bottom);
     let clicked =
@@ -49,18 +55,135 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         app.toggle_reaction(channel, message, emoji);
     }
     viewer(&mut app.media, &palette, ui);
+    if let Some(channel) = send {
+        app.send_draft(channel);
+    }
     match request {
-        Some(HistoryRequest::Older(channel)) => app.request_history(channel, true),
-        Some(HistoryRequest::Retry(channel)) => app.retry_history(channel),
+        Some(Request::Older(channel)) => app.request_history(channel, true),
+        Some(Request::Retry(channel)) => app.retry_history(channel),
+        Some(Request::Resend(channel, nonce)) => app.retry_send(channel, nonce),
+        Some(Request::Discard(channel, nonce)) => app.discard_failed(channel, nonce),
         None => {}
     }
 }
 
-/// What the conversation asks of its history.
-enum HistoryRequest {
+/// What the conversation asks for.
+enum Request {
     /// Scrolled to the top: the page before.
     Older(Id),
     Retry(Id),
+    /// Retry and Delete on a message that failed: channel, nonce.
+    Resend(Id, Id),
+    Discard(Id, Id),
+}
+
+/// Discord's words for a channel where I may not write.
+const NO_PERMISSION: &str = "You do not have permission to send messages in this channel.";
+
+/// The box under the conversation. Enter sends, Shift+Enter starts a new
+/// line, and the counter shows near the limit, as in the official client.
+/// `true` when Enter asks to send.
+fn composer(
+    channel: Id,
+    model: &Model,
+    state: &mut Composer,
+    palette: &Palette,
+    ui: &mut egui::Ui,
+) -> bool {
+    let mut send = false;
+    let margin = Margin {
+        left: 16,
+        right: 16,
+        top: 0,
+        bottom: 20,
+    };
+    egui::Panel::bottom("composer")
+        .show_separator_line(false)
+        .frame(Frame::new().fill(palette.window).inner_margin(margin))
+        .show(ui, |ui| {
+            let field = Frame::new()
+                .fill(palette.surface)
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(16, 11));
+            field.show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if !model.can_send(channel) {
+                    let text = egui::RichText::new(NO_PERMISSION).color(palette.dim);
+                    ui.label(text.font(theme::regular(15.0)));
+                    return;
+                }
+                // Why the draft was not sent (a command fastcord lacks).
+                if let Some((_, notice)) = state.notice.as_ref().filter(|(c, _)| *c == channel) {
+                    let text = egui::RichText::new(notice).font(theme::regular(13.0));
+                    ui.label(text.color(palette.warning));
+                }
+                let draft = state.drafts.entry(channel).or_default();
+                let id = egui::Id::new(("composer", channel));
+                let hint = egui::RichText::new(model.placeholder(channel)).color(palette.dim);
+                // Grows with the draft up to a part of the window, then
+                // scrolls.
+                let tallest = ui.ctx().content_rect().height() * 0.4;
+                // Tab stays here, and types nothing for now (autocomplete
+                // will take it): it would move the cursor to the messages'
+                // buttons, where Space or Enter click.
+                if ui.memory(|m| m.has_focus(id)) {
+                    ui.input_mut(|i| i.events.retain(|e| !is_tab(e)));
+                }
+                let edit = egui::ScrollArea::vertical()
+                    .id_salt(id)
+                    .max_height(tallest)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        let newline =
+                            egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter);
+                        ui.add(
+                            egui::TextEdit::multiline(draft)
+                                .id(id)
+                                .hint_text(hint)
+                                .font(theme::regular(TEXT_SIZE))
+                                .text_color(palette.text)
+                                .frame(Frame::NONE)
+                                .margin(Margin::ZERO)
+                                .desired_rows(1)
+                                .desired_width(f32::INFINITY)
+                                .lock_focus(true)
+                                .return_key(newline),
+                        )
+                    })
+                    .inner;
+                // Opening a channel puts the cursor in its composer.
+                let opened = egui::Id::new("composer-channel");
+                if ui.data(|d| d.get_temp::<Id>(opened)) != Some(channel) {
+                    ui.data_mut(|d| d.insert_temp(opened, channel));
+                    edit.request_focus();
+                }
+                // Only an Enter typed here sends: not the one that opened the
+                // channel as the cursor came, nor one held down.
+                let held = egui::Id::new(("composer-held", channel));
+                let had_focus = ui.data(|d| d.get_temp::<bool>(held)).unwrap_or(false);
+                let focused = edit.has_focus();
+                send = had_focus && focused && ui.input(|i| enter_sends(&i.events));
+                ui.data_mut(|d| d.insert_temp(held, focused));
+                if edit.changed() {
+                    state.notice = None;
+                }
+                if let Some(left) = crate::compose::counter(draft) {
+                    let color = if left < 0 {
+                        palette.danger
+                    } else {
+                        palette.secondary
+                    };
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        ui.label(
+                            egui::RichText::new(left.to_string())
+                                .font(theme::semibold(13.0))
+                                .color(color),
+                        );
+                    });
+                }
+            });
+        });
+    send
 }
 
 /// The connection's state and the account, along the bottom of the window.
@@ -442,7 +565,7 @@ fn conversation(
     status: Option<HistoryStatus>,
     media: &mut Media,
     ui: &mut egui::Ui,
-) -> (Option<HistoryRequest>, Option<Id>) {
+) -> (Option<Request>, Option<Id>) {
     let Some(channel) = selection.channel else {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(palette.window))
@@ -485,7 +608,7 @@ fn conversation(
                     }
                     HistoryStatus::Failed => {
                         if failed(ui, palette, "Couldn't load messages.") {
-                            request = Some(HistoryRequest::Retry(channel));
+                            request = Some(Request::Retry(channel));
                         }
                     }
                     HistoryStatus::Idle => {
@@ -535,7 +658,7 @@ fn conversation(
                                 }
                                 HistoryStatus::Failed => {
                                     if failed(ui, palette, "Couldn't load older messages.") {
-                                        request = Some(HistoryRequest::Retry(channel));
+                                        request = Some(Request::Retry(channel));
                                     }
                                 }
                                 HistoryStatus::Idle => {}
@@ -546,9 +669,31 @@ fn conversation(
                 if messages.is_empty() && complete {
                     return;
                 }
+                // Failed messages read in red, as the official client shows them.
+                let red = Palette {
+                    text: palette.danger,
+                    ..*palette
+                };
+                let failed = |m: &Message| matches!(m.delivery, Delivery::Failed(_));
+                let red_reader = messages.iter().any(failed).then(|| Reader {
+                    palette: &red,
+                    clock: Clock::now(),
+                    names: Directory::new(model, channel),
+                    revealed: reader.revealed.clone(),
+                });
                 let mut previous: Option<&Message> = None;
                 for message in messages {
-                    message_line(ui, &reader, media, previous, message);
+                    let body = red_reader.as_ref().filter(|_| failed(message));
+                    let body = body.unwrap_or(&reader);
+                    match message_line(ui, &reader, body, media, previous, message) {
+                        Some(Failure::Retry) => {
+                            request = Some(Request::Resend(channel, message.id));
+                        }
+                        Some(Failure::Delete) => {
+                            request = Some(Request::Discard(channel, message.id));
+                        }
+                        None => {}
+                    }
                     previous = Some(message);
                 }
             });
@@ -577,7 +722,7 @@ fn conversation(
             // before, until the channel's first message is in.
             let fills = height > output.inner_rect.height();
             if !complete && status == HistoryStatus::Idle && (at_top || !fills) {
-                request = Some(HistoryRequest::Older(channel));
+                request = Some(Request::Older(channel));
             }
         });
     (request, bottom)
@@ -618,13 +763,113 @@ fn channel_title(model: &Model, view: View, channel: Id) -> String {
     }
 }
 
+/// Whether this frame's keys send the draft: Enter does, Shift+Enter (a
+/// new line) and a held Enter repeating do not.
+fn enter_sends(events: &[egui::Event]) -> bool {
+    events.iter().any(|event| {
+        matches!(event, egui::Event::Key { key: egui::Key::Enter, pressed: true, repeat: false, modifiers, .. } if !modifiers.shift)
+    })
+}
+
+fn is_tab(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key {
+            key: egui::Key::Tab,
+            ..
+        }
+    )
+}
+
+/// How opaque a message's content is drawn: half until Discord has it.
+fn opacity(delivery: &Delivery) -> f32 {
+    match delivery {
+        Delivery::Sending | Delivery::Held(_) | Delivery::Unsure => 0.5,
+        Delivery::Sent | Delivery::Failed(_) => 1.0,
+    }
+}
+
+/// The line under a message that waits: Discord asked to slow down, or its
+/// answer was lost.
+fn waiting_note(delivery: &Delivery, now: jiff::Timestamp) -> Option<String> {
+    match delivery {
+        Delivery::Held(until) => {
+            let left = until.duration_since(now).as_secs_f64().ceil().max(0.0);
+            Some(match left {
+                0.0 => "Discord asked to slow down: sending…".into(),
+                _ => format!("Discord asked to slow down: sending in {left} s."),
+            })
+        }
+        Delivery::Unsure => Some("Not sure it went through: waiting for Discord to say.".into()),
+        _ => None,
+    }
+}
+
+/// The line under a failed message: Discord's reason, or the official
+/// client's words when it gave none (the network was down).
+fn failure_text(reason: Option<&str>) -> &str {
+    reason.unwrap_or("Message failed to send.")
+}
+
+/// A small button whose id comes from `key` (what it acts on), never from
+/// its place in the drawing order. egui credits a click to the widget
+/// pressed, by id: a layout that shifts between press and release (a page
+/// landing above, a message going) must not hand it to another message's.
+fn keyed_button(
+    ui: &mut egui::Ui,
+    key: impl std::hash::Hash + std::fmt::Debug,
+    text: impl Into<egui::WidgetText>,
+) -> Response {
+    // Placed in the row like any widget (a child Ui would not wrap with a
+    // wrapped row), then made clickable under its own id, and painted as
+    // egui paints a small button.
+    let galley = text.into().into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+    let padding = egui::vec2(ui.spacing().button_padding.x, 0.0);
+    let (rect, _) = ui.allocate_exact_size(galley.size() + 2.0 * padding, Sense::hover());
+    // Clicked, never focused: the keyboard must not reach a message's
+    // buttons by accident (Tab, then Space).
+    let response = ui.interact(rect, egui::Id::new(key), Sense::CLICK);
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let frame = rect.expand(visuals.expansion);
+        let painter = ui.painter();
+        painter.rect(
+            frame,
+            visuals.corner_radius,
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(
+            rect.center() - galley.size() / 2.0,
+            galley,
+            visuals.text_color(),
+        );
+    }
+    response
+}
+
+/// What is asked of a message that failed.
+enum Failure {
+    Retry,
+    Delete,
+}
+
+/// A message, under its author's name when it starts a group. `body` draws
+/// its content: red when it failed. One on its way is dimmed.
 fn message_line(
     ui: &mut egui::Ui,
     reader: &Reader<'_>,
+    body: &Reader<'_>,
     media: &mut Media,
     previous: Option<&Message>,
     message: &Message,
-) {
+) -> Option<Failure> {
     let palette = reader.palette;
     if model::starts_group(previous, message) {
         ui.add_space(14.0);
@@ -642,14 +887,39 @@ fn message_line(
         });
     }
     let body = Body {
-        reader,
+        reader: body,
         message: message.id,
         part: 0,
     };
-    body.blocks(ui, &parsed(ui, &message.content));
-    attachments(ui, &body, media, &message.attachments);
-    embeds(ui, &body, media, &message.embeds);
+    ui.scope(|ui| {
+        ui.multiply_opacity(opacity(&message.delivery));
+        body.blocks(ui, &parsed(ui, &message.content));
+        attachments(ui, &body, media, &message.attachments);
+        embeds(ui, &body, media, &message.embeds);
+    });
     reactions(ui, palette, message);
+    if let Some(note) = waiting_note(&message.delivery, reader.clock.now) {
+        let text = egui::RichText::new(note).font(theme::regular(12.0));
+        ui.label(text.color(palette.secondary));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(500));
+    }
+    let Delivery::Failed(reason) = &message.delivery else {
+        return None;
+    };
+    let mut failure = None;
+    ui.horizontal_wrapped(|ui| {
+        let text = egui::RichText::new(failure_text(reason.as_deref()));
+        let text = text.font(theme::regular(12.0));
+        ui.label(text.color(palette.danger));
+        if keyed_button(ui, ("retry", message.id), "Retry").clicked() {
+            failure = Some(Failure::Retry);
+        }
+        if keyed_button(ui, ("discard", message.id), "Delete").clicked() {
+            failure = Some(Failure::Delete);
+        }
+    });
+    failure
 }
 
 /// Where a click on a reaction waits for `show`, which can change the app.
@@ -736,11 +1006,9 @@ fn reaction_pill(
         .painter()
         .layout_no_wrap(label.clone(), theme::regular(13.0), color);
     let (rect, _) = ui.allocate_exact_size(galley.size() + PADDING * 2.0, Sense::hover());
-    let sense = if burst {
-        Sense::hover()
-    } else {
-        Sense::click()
-    };
+    // Clicked, never focused: the keyboard must not toggle a reaction by
+    // accident (Tab, then Space).
+    let sense = if burst { Sense::hover() } else { Sense::CLICK };
     let mut response = ui.interact(rect, id, sense);
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), mine, &label)
@@ -1589,6 +1857,7 @@ mod tests {
             attachments: vec![],
             embeds: vec![],
             reactions: names.map(reaction).to_vec(),
+            ..Default::default()
         };
         let drawn = pills(&message, 0, 200.0);
         assert_eq!(drawn.len(), 6);
@@ -1619,6 +1888,7 @@ mod tests {
             attachments: vec![],
             embeds: vec![],
             reactions: vec![reaction("🎉", 1, 1), reaction("😂", 2, 0)],
+            ..Default::default()
         };
         let first = pill_ids(&message, 0);
         message.reactions.reverse();
@@ -1656,6 +1926,310 @@ mod tests {
         assert_eq!(
             clock.label("2026-10-06T12:05:00Z".parse().unwrap()),
             "06/10/2026 14:05"
+        );
+    }
+
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// Draws one frame, headless, with these events. Each key pressed is
+    /// released at the end, as a tap: egui counts a key pressed again
+    /// before its release as held, repeating.
+    fn frame(ctx: &egui::Context, mut events: Vec<egui::Event>, draw: impl FnMut(&mut egui::Ui)) {
+        let released: Vec<egui::Event> = events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } => Some(egui::Event::Key {
+                    key: *key,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: *modifiers,
+                }),
+                _ => None,
+            })
+            .collect();
+        events.extend(released);
+        let input = egui::RawInput {
+            events,
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, draw);
+        // Nothing renders: the font atlas is never uploaded.
+        output.textures_delta.clear();
+    }
+
+    /// Draws the composer for one frame, headless, with these events.
+    fn compose(
+        ctx: &egui::Context,
+        model: &Model,
+        state: &mut Composer,
+        channel: Id,
+        events: Vec<egui::Event>,
+    ) -> bool {
+        let mut sent = false;
+        frame(ctx, events, |ui| {
+            sent = composer(channel, model, state, &Palette::dark(), ui);
+        });
+        sent
+    }
+
+    #[test]
+    fn the_composer_sends_on_enter_and_breaks_lines_on_shift_enter() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let model = crate::demo::model();
+        let mut state = Composer::default();
+        // Opening the channel focuses the composer: typing goes there.
+        assert!(!compose(&ctx, &model, &mut state, 111, vec![]));
+        let typed = vec![egui::Event::Text("salut".into())];
+        assert!(!compose(&ctx, &model, &mut state, 111, typed));
+        let shift = key(egui::Key::Enter, egui::Modifiers::SHIFT);
+        assert!(!compose(&ctx, &model, &mut state, 111, vec![shift]));
+        assert_eq!(state.drafts[&111], "salut\n");
+        let enter = key(egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(compose(&ctx, &model, &mut state, 111, vec![enter.clone()]));
+        // A notice goes once the draft changes.
+        state.notice = Some((111, "Slash commands aren't supported yet.".into()));
+        compose(&ctx, &model, &mut state, 111, vec![]);
+        assert!(state.notice.is_some());
+        compose(
+            &ctx,
+            &model,
+            &mut state,
+            111,
+            vec![egui::Event::Text("!".into())],
+        );
+        assert_eq!(state.notice, None);
+        // Where I may not write, there is nothing to type in.
+        assert!(!compose(&ctx, &model, &mut state, 101, vec![]));
+        assert!(!compose(&ctx, &model, &mut state, 101, vec![enter]));
+        assert!(!state.drafts.contains_key(&101));
+    }
+
+    fn context() -> egui::Context {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        ctx
+    }
+
+    /// The demo app on #général, one of its messages with a reaction.
+    fn demo_app(ctx: &egui::Context) -> App {
+        let mut model = crate::demo::model();
+        let emoji = model::Emoji {
+            id: None,
+            name: "👍".into(),
+            animated: false,
+        };
+        model.messages.get_mut(&111).unwrap()[9].reactions = vec![model::Reaction {
+            emoji,
+            count: 1,
+            ..model::Reaction::default()
+        }];
+        let mut app = App::new(ctx, Some(model), None);
+        app.selection.open_channel(111);
+        app
+    }
+
+    fn show(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+        frame(ctx, events, |ui| super::show(app, ui));
+    }
+
+    fn reactions(app: &App) -> Vec<Vec<model::Reaction>> {
+        let messages = app.model.as_ref().unwrap().messages(111);
+        messages.iter().map(|m| m.reactions.clone()).collect()
+    }
+
+    #[test]
+    fn tab_and_space_never_reach_the_messages() {
+        let ctx = context();
+        let mut app = demo_app(&ctx);
+        let before = reactions(&app);
+        show(&ctx, &mut app, vec![]);
+        show(&ctx, &mut app, vec![egui::Event::Text(":smi".into())]);
+        // Tab then Space, again and again: each time, a focused message
+        // widget would take Space as a click.
+        for _ in 0..8 {
+            show(
+                &ctx,
+                &mut app,
+                vec![key(egui::Key::Tab, egui::Modifiers::NONE)],
+            );
+            let space = key(egui::Key::Space, egui::Modifiers::NONE);
+            show(&ctx, &mut app, vec![space, egui::Event::Text(" ".into())]);
+        }
+        assert_eq!(reactions(&app), before, "no reaction toggled");
+        let draft = &app.composer.drafts[&111];
+        assert!(
+            draft.starts_with(":smi") && !draft.contains('\t'),
+            "{draft:?}"
+        );
+        let composer = egui::Id::new(("composer", 111_u64));
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(composer),
+            "the cursor stays"
+        );
+    }
+
+    #[test]
+    fn the_enter_that_opens_a_channel_does_not_send_its_draft() {
+        let ctx = context();
+        let mut app = demo_app(&ctx);
+        app.composer.drafts.insert(112, "brouillon".into());
+        show(&ctx, &mut app, vec![]);
+        show(&ctx, &mut app, vec![]);
+        let count = |app: &App| app.model.as_ref().unwrap().messages(112).len();
+        let before = count(&app);
+        // The Enter that chose the channel arrives as its composer takes
+        // the cursor, and stays down a while, repeating.
+        app.selection.open_channel(112);
+        for _ in 0..3 {
+            show(&ctx, &mut app, vec![held(egui::Key::Enter)]);
+        }
+        let draft = app.composer.drafts.get(&112).map(String::as_str);
+        assert_eq!(draft, Some("brouillon"));
+        assert_eq!(count(&app), before);
+        // Released, then a fresh Enter: that one sends.
+        show(&ctx, &mut app, vec![released(egui::Key::Enter)]);
+        show(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert_eq!(count(&app), before + 1);
+    }
+
+    fn released(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// A key pressed and kept down: egui counts each press after the first
+    /// as a repeat.
+    fn held(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: true,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn enter_sends_but_shift_enter_does_not() {
+        assert!(enter_sends(&[key(egui::Key::Enter, egui::Modifiers::NONE)]));
+        assert!(!enter_sends(&[key(
+            egui::Key::Enter,
+            egui::Modifiers::SHIFT
+        )]));
+        assert!(!enter_sends(&[key(egui::Key::A, egui::Modifiers::NONE)]));
+        assert!(!enter_sends(&[held(egui::Key::Enter)]));
+    }
+
+    #[test]
+    fn a_keyed_button_keeps_its_id_whatever_is_drawn_before_it() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let ids = |before: usize| {
+            let mut ids = None;
+            frame(&ctx, vec![], |ui| {
+                for _ in 0..before {
+                    let _ = ui.small_button("autre");
+                }
+                let keyed = keyed_button(ui, ("retry", 5_u64), "Retry").id;
+                let plain = ui.small_button("Retry").id;
+                ids = Some((keyed, plain));
+            });
+            ids.unwrap()
+        };
+        let (keyed, plain) = ids(0);
+        let (moved_keyed, moved_plain) = ids(2);
+        assert_eq!(keyed, moved_keyed);
+        assert_ne!(plain, moved_plain, "an auto id follows the drawing order");
+    }
+
+    #[test]
+    fn keyed_buttons_wrap_with_their_row() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut rects = None;
+        frame(&ctx, vec![], |ui| {
+            ui.allocate_ui(egui::vec2(140.0, 200.0), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let bound = ui.max_rect().right();
+                    let note = ui.label("Message failed to send.").rect;
+                    let retry = keyed_button(ui, ("retry", 5_u64), "Retry").rect;
+                    let delete = keyed_button(ui, ("discard", 5_u64), "Delete").rect;
+                    rects = Some((bound, note, retry, delete));
+                });
+            });
+        });
+        let (bound, note, retry, delete) = rects.unwrap();
+        // Narrow: the buttons go to the next line rather than off the edge.
+        assert!(retry.right() <= bound + 0.5 && delete.right() <= bound + 0.5);
+        assert!(delete.top() > note.top(), "wrapped");
+        assert!(
+            retry.width() > 10.0 && delete.width() > 10.0,
+            "not squashed"
+        );
+    }
+
+    #[test]
+    fn waiting_messages_say_why() {
+        let now: jiff::Timestamp = "2026-10-07T12:00:00Z".parse().unwrap();
+        let held = |s| Delivery::Held(now + jiff::SignedDuration::from_millis(s));
+        let note = |delivery| waiting_note(&delivery, now);
+        assert_eq!(
+            note(held(12_300)).unwrap(),
+            "Discord asked to slow down: sending in 13 s."
+        );
+        assert_eq!(
+            note(held(-1)).unwrap(),
+            "Discord asked to slow down: sending…"
+        );
+        assert!(
+            note(Delivery::Unsure)
+                .unwrap()
+                .starts_with("Not sure it went through")
+        );
+        assert_eq!(note(Delivery::Sending), None);
+        assert_eq!(opacity(&held(0)), 0.5);
+        assert_eq!(opacity(&Delivery::Unsure), 0.5);
+    }
+
+    #[test]
+    fn pending_messages_are_dimmed_and_failures_explained() {
+        assert_eq!(opacity(&Delivery::Sending), 0.5);
+        assert_eq!(opacity(&Delivery::Failed(None)), 1.0);
+        assert_eq!(opacity(&Delivery::Sent), 1.0);
+        assert_eq!(failure_text(None), "Message failed to send.");
+        assert_eq!(
+            failure_text(Some("Slowmode is enabled.")),
+            "Slowmode is enabled."
         );
     }
 }
