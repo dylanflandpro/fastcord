@@ -5,7 +5,8 @@ mod sign_in;
 use crate::app::{self, App, HistoryStatus, ScrollAnchor, Selection, View};
 use crate::backend::{Command, Link};
 use crate::markdown::{self, Action, Block, Content, Directory, Span, Style};
-use crate::model::{self, ChannelKind, Entry, Id, Message, Model};
+use crate::media::{self, Media, Picture, Shown};
+use crate::model::{self, Attachment, ChannelKind, Embed, EmbedField, Entry, Id, Message, Model};
 use crate::theme::{self, Icon, Palette};
 use egui::cache::{ComputerMut, FrameCache};
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -36,8 +37,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         let selection = &mut app.selection;
         rail(selection, model, &palette, ui);
         sidebar(selection, model, &palette, ui);
-        conversation(selection, model, &palette, status, ui)
+        conversation(selection, model, &palette, status, &mut app.media, ui)
     };
+    viewer(&mut app.media, &palette, ui);
     match request {
         Some(HistoryRequest::Older(channel)) => app.request_history(channel, true),
         Some(HistoryRequest::Retry(channel)) => app.retry_history(channel),
@@ -326,6 +328,7 @@ fn conversation(
     model: &Model,
     palette: &Palette,
     status: Option<HistoryStatus>,
+    media: &mut Media,
     ui: &mut egui::Ui,
 ) -> Option<HistoryRequest> {
     let Some(channel) = selection.channel else {
@@ -431,7 +434,7 @@ fn conversation(
                 }
                 let mut previous: Option<&Message> = None;
                 for message in messages {
-                    message_line(ui, &reader, previous, message);
+                    message_line(ui, &reader, media, previous, message);
                     previous = Some(message);
                 }
             });
@@ -500,6 +503,7 @@ fn channel_title(model: &Model, view: View, channel: Id) -> String {
 fn message_line(
     ui: &mut egui::Ui,
     reader: &Reader<'_>,
+    media: &mut Media,
     previous: Option<&Message>,
     message: &Message,
 ) {
@@ -519,19 +523,388 @@ fn message_line(
             );
         });
     }
-    // Parsed once while the message stays on screen, not on every frame.
-    let blocks = ui.ctx().memory_mut(|memory| {
-        memory
-            .caches
-            .cache::<FrameCache<Arc<[Block]>, Parse>>()
-            .get(message.content.as_str())
-            .clone()
-    });
     let body = Body {
         reader,
         message: message.id,
+        part: 0,
     };
-    body.blocks(ui, &blocks);
+    body.blocks(ui, &parsed(ui, &message.content));
+    attachments(ui, &body, media, &message.attachments);
+    embeds(ui, &body, media, &message.embeds);
+}
+
+/// A message's embeds: pictures and GIF links on their own, the rest as
+/// cards.
+fn embeds(ui: &mut egui::Ui, body: &Body<'_>, media: &mut Media, embeds: &[Embed]) {
+    for (index, embed) in embeds.iter().enumerate() {
+        ui.add_space(4.0);
+        match media::standalone(embed) {
+            Some(image) => {
+                let shown = Picture::embed(image);
+                picture(ui, body.reader.palette, media, shown, media::ATTACHMENT_BOX);
+            }
+            None => {
+                let body = Body {
+                    part: (index + 1) << 8,
+                    ..*body
+                };
+                embed_card(ui, &body, media, embed);
+            }
+        }
+    }
+}
+
+/// Markdown parsed once while it stays on screen, not on every frame.
+fn parsed(ui: &egui::Ui, text: &str) -> Arc<[Block]> {
+    ui.ctx().memory_mut(|memory| {
+        memory
+            .caches
+            .cache::<FrameCache<Arc<[Block]>, Parse>>()
+            .get(text)
+            .clone()
+    })
+}
+
+/// The spoiler part of [`RevealedSpoilers`] for attachments, numbered by
+/// their place in the message.
+const ATTACHMENTS: usize = usize::MAX;
+
+/// The files sent with a message: pictures scaled to fit, the rest as cards.
+/// A picture behind a spoiler shows blurred until clicked, as in the
+/// official client.
+fn attachments(ui: &mut egui::Ui, body: &Body<'_>, media: &mut Media, files: &[Attachment]) {
+    let palette = body.reader.palette;
+    let body = Body {
+        part: ATTACHMENTS,
+        ..*body
+    };
+    for (index, attachment) in files.iter().enumerate() {
+        ui.add_space(4.0);
+        if !media::is_image(attachment) {
+            file_card(ui, palette, attachment);
+            continue;
+        }
+        let shown = Picture::attachment(attachment);
+        if media::is_spoiler(attachment) && !body.revealed()(index) {
+            if hidden_picture(ui, palette, media, shown).is_some_and(|r| r.clicked()) {
+                body.reveal(ui, index);
+            }
+        } else {
+            picture(ui, palette, media, shown, media::ATTACHMENT_BOX);
+        }
+    }
+}
+
+/// A picture scaled into `bounds`. Clicking it, or activating it from the
+/// keyboard, opens it full size. One Discord kept no copy of shows its link.
+fn picture(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    media: &mut Media,
+    picture: Picture<'_>,
+    bounds: [f32; 2],
+) {
+    let ppp = ui.ctx().pixels_per_point();
+    let shown = [bounds[0].min(ui.available_width()), bounds[1]];
+    let Some(response) = draw_picture(ui, palette, media, picture, (bounds, ppp), shown) else {
+        return;
+    };
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    if response.clicked() {
+        media.viewing = Some(picture.to_owned());
+    }
+}
+
+/// A spoiler's picture: a small copy stretched into a blur, darkened, with
+/// the official client's "SPOILER" label.
+fn hidden_picture(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    media: &mut Media,
+    picture: Picture<'_>,
+) -> Option<Response> {
+    let bounds = media::ATTACHMENT_BOX;
+    let ppp = ui.ctx().pixels_per_point() * media::SPOILER_SCALE;
+    let shown = [bounds[0].min(ui.available_width()), bounds[1]];
+    let response = draw_picture(ui, palette, media, picture, (bounds, ppp), shown)?;
+    let rect = response.rect;
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(4), Color32::from_black_alpha(90));
+    let label = painter.layout_no_wrap("SPOILER".into(), theme::semibold(13.0), Color32::WHITE);
+    let pill = Rect::from_center_size(rect.center(), label.size() + Vec2::new(20.0, 10.0));
+    painter.rect_filled(pill, CornerRadius::same(12), Color32::from_black_alpha(200));
+    painter.galley(pill.center() - label.size() / 2.0, label, Color32::WHITE);
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    Some(response)
+}
+
+/// Lays out a picture within `shown` points, from the copy `request` asks
+/// for (its bounds and pixels per point), its space kept while it loads so
+/// the conversation does not jump. Nothing is asked for off screen. `None`
+/// when Discord kept no copy, after drawing its link instead.
+fn draw_picture(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    media: &mut Media,
+    picture: Picture<'_>,
+    (bounds, ppp): ([f32; 2], f32),
+    shown: [f32; 2],
+) -> Option<Response> {
+    if picture.source.is_none() {
+        ui.hyperlink(picture.link);
+        return None;
+    }
+    // Only a picture Discord did not measure needs its copy to be sized.
+    let mut request = None;
+    let mut loaded = None;
+    if picture.size.is_none() {
+        request = picture.request(bounds, ppp);
+        loaded = request
+            .as_ref()
+            .and_then(|r| media.peek(r))
+            .map(|texture| texture.size.into());
+    }
+    let size = media::drawn_size(picture.size, loaded, shown, ppp);
+    let (rect, response) = ui.allocate_exact_size(Vec2::from(size), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let state = match request.or_else(|| picture.request(bounds, ppp)) {
+            Some(request) => media.get(ui.ctx(), request),
+            None => Shown::Failed,
+        };
+        paint_picture(ui, palette, state, rect);
+        if response.has_focus() {
+            focus_ring(ui, palette, rect);
+        }
+    }
+    Some(response)
+}
+
+fn paint_picture(ui: &egui::Ui, palette: &Palette, shown: Shown, rect: Rect) {
+    match shown {
+        Shown::Ready(texture) => egui::Image::from_texture(texture)
+            .corner_radius(CornerRadius::same(4))
+            .paint_at(ui, rect),
+        Shown::Loading => {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(4), palette.surface);
+        }
+        Shown::Failed => {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(4), palette.surface);
+            let side = rect.width().min(rect.height()).min(24.0);
+            Icon::Alert
+                .image(palette.dim, side)
+                .paint_at(ui, Rect::from_center_size(rect.center(), Vec2::splat(side)));
+        }
+    }
+}
+
+fn focus_ring(ui: &egui::Ui, palette: &Palette, rect: Rect) {
+    ui.painter().rect_stroke(
+        rect.expand(2.0),
+        CornerRadius::same(4),
+        Stroke::new(1.0, palette.accent),
+        egui::StrokeKind::Outside,
+    );
+}
+
+/// The picture opened full size, over everything, until Esc or a click
+/// beside it, with a link to the original as in the official client.
+fn viewer(media: &mut Media, palette: &Palette, ui: &mut egui::Ui) {
+    let Some(viewing) = media.viewing.clone() else {
+        return;
+    };
+    let ctx = ui.ctx().clone();
+    let shown = media::viewer_bounds(ctx.content_rect().size().into());
+    let ppp = ctx.pixels_per_point();
+    // The largest copy, the same whatever the window's size.
+    let bounds = [media::MAX_SIDE as f32 / ppp; 2];
+    let modal = egui::Modal::new(egui::Id::new("picture-viewer"))
+        .frame(Frame::new())
+        .backdrop_color(Color32::from_black_alpha(200))
+        .show(&ctx, |ui| {
+            let picture = viewing.picture();
+            draw_picture(ui, palette, media, picture, (bounds, ppp), shown);
+            ui.add_space(8.0);
+            ui.hyperlink_to(
+                egui::RichText::new("Open in Browser")
+                    .font(theme::regular(14.0))
+                    .color(Color32::WHITE),
+                picture.link,
+            );
+        });
+    if modal.should_close() {
+        media.viewing = None;
+    }
+}
+
+const FILE_CARD_WIDTH: f32 = 432.0;
+
+/// A file that is not a picture, as the official client shows it: icon,
+/// name and size. Clicking it opens it in the browser, which downloads it.
+fn file_card(ui: &mut egui::Ui, palette: &Palette, attachment: &Attachment) {
+    let response = Frame::new()
+        .fill(palette.panel)
+        .stroke(Stroke::new(1.0, palette.outline))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(FILE_CARD_WIDTH.min(ui.available_width() - 24.0).max(120.0));
+            ui.horizontal(|ui| {
+                ui.add(Icon::File.image(palette.secondary, 30.0));
+                ui.vertical(|ui| {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&attachment.filename)
+                                .font(theme::regular(15.0))
+                                .color(palette.accent),
+                        )
+                        .truncate(),
+                    );
+                    ui.label(
+                        egui::RichText::new(media::human_size(attachment.size))
+                            .font(theme::regular(12.0))
+                            .color(palette.dim),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add(Icon::Download.image(palette.secondary, 20.0));
+                });
+            });
+        })
+        .response
+        .interact(Sense::click());
+    if response.has_focus() {
+        focus_ring(ui, palette, response.rect);
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    }
+    if response.clicked() {
+        ui.ctx().open_url(egui::OpenUrl::new_tab(&attachment.url));
+    }
+}
+
+/// A link preview or a bot's embed, as the official client lays it out: a
+/// coloured bar, then provider, author, title, description and fields, the
+/// thumbnail beside them, the picture and the footer below.
+fn embed_card(ui: &mut egui::Ui, body: &Body<'_>, media: &mut Media, embed: &Embed) {
+    let palette = body.reader.palette;
+    let bar = embed.color.map_or(palette.surface_active, |c| {
+        let [_, r, g, b] = c.to_be_bytes();
+        Color32::from_rgb(r, g, b)
+    });
+    let layout = media::embed_layout(ui.available_width(), embed.thumbnail.is_some());
+    let padding = media::EMBED_PADDING as i8;
+    let response = Frame::new()
+        .fill(palette.panel)
+        .corner_radius(CornerRadius::same(4))
+        .inner_margin(Margin {
+            left: padding,
+            right: padding,
+            top: 10,
+            bottom: 14,
+        })
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_max_width(layout.text);
+                    embed_text(ui, body, embed);
+                });
+                if let Some(thumbnail) = &embed.thumbnail {
+                    ui.add_space(media::THUMBNAIL_GAP);
+                    let shown = Picture::embed(thumbnail);
+                    picture(ui, palette, media, shown, media::THUMBNAIL_BOX);
+                }
+            });
+            if let Some(image) = &embed.image {
+                picture(ui, palette, media, Picture::embed(image), layout.image);
+            }
+            if let Some(footer) = &embed.footer {
+                ui.label(
+                    egui::RichText::new(footer)
+                        .font(theme::regular(12.0))
+                        .color(palette.secondary),
+                );
+            }
+        })
+        .response;
+    let rect = response.rect;
+    ui.painter().rect_filled(
+        Rect::from_min_size(rect.min, Vec2::new(4.0, rect.height())),
+        CornerRadius {
+            nw: 4,
+            sw: 4,
+            ..CornerRadius::ZERO
+        },
+        bar,
+    );
+}
+
+fn embed_text(ui: &mut egui::Ui, body: &Body<'_>, embed: &Embed) {
+    let palette = body.reader.palette;
+    if let Some(provider) = &embed.provider {
+        ui.label(
+            egui::RichText::new(provider)
+                .font(theme::regular(12.0))
+                .color(palette.secondary),
+        );
+    }
+    if let Some(author) = &embed.author {
+        ui.label(
+            egui::RichText::new(author)
+                .font(theme::semibold(14.0))
+                .color(palette.text),
+        );
+    }
+    if let Some(title) = &embed.title {
+        let text = egui::RichText::new(title).font(theme::semibold(16.0));
+        match &embed.url {
+            Some(url) => {
+                ui.hyperlink_to(text.color(palette.accent), url);
+            }
+            None => {
+                ui.label(text.color(palette.text));
+            }
+        }
+    }
+    if let Some(description) = &embed.description {
+        body.blocks(ui, &parsed(ui, description));
+    }
+    embed_fields(ui, body, &embed.fields, embed.thumbnail.is_some());
+}
+
+/// The fields in rows, inline ones side by side in equal columns.
+fn embed_fields(ui: &mut egui::Ui, body: &Body<'_>, fields: &[EmbedField], thumbnail: bool) {
+    let width = ui.available_width();
+    let per_row = media::fields_per_row(thumbnail, width);
+    for row in media::field_rows(fields, per_row) {
+        let column = media::field_width(width, row.len());
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = media::FIELD_GAP;
+            for index in row.clone() {
+                let field = &fields[index];
+                let body = Body {
+                    part: body.part + 1 + index,
+                    ..*body
+                };
+                ui.vertical(|ui| {
+                    ui.set_width(column);
+                    ui.label(
+                        egui::RichText::new(&field.name)
+                            .font(theme::semibold(14.0))
+                            .color(body.reader.palette.text),
+                    );
+                    body.blocks(ui, &parsed(ui, &field.value));
+                });
+            }
+        });
+    }
 }
 
 #[derive(Default)]
@@ -547,8 +920,10 @@ impl ComputerMut<&str, Arc<[Block]>> for Parse {
 /// only, never on disk.
 const REVEALED: &str = "revealed-spoilers";
 
-/// Each revealed spoiler as (message, spoiler index).
-type RevealedSpoilers = HashSet<(Id, usize)>;
+/// Each revealed spoiler as (message, part, spoiler index). The part is the
+/// message's text (0), embed `e`'s description (`(e + 1) << 8`), its field
+/// `f` (that, plus `1 + f`: Discord allows 25 fields), or [`ATTACHMENTS`].
+type RevealedSpoilers = HashSet<(Id, usize, usize)>;
 
 const TEXT_SIZE: f32 = 15.0;
 
@@ -572,20 +947,25 @@ struct Look {
     bold: bool,
 }
 
-/// One message's text, drawn block by block as the official client lays
-/// it out.
+/// One message's text, or an embed's, drawn block by block as the official
+/// client lays it out.
+#[derive(Clone, Copy)]
 struct Body<'a> {
     reader: &'a Reader<'a>,
     message: Id,
+    part: usize,
 }
 
 impl Body<'_> {
     fn revealed(&self) -> impl Fn(usize) -> bool + '_ {
-        |spoiler| self.reader.revealed.contains(&(self.message, spoiler))
+        |spoiler| {
+            let key = (self.message, self.part, spoiler);
+            self.reader.revealed.contains(&key)
+        }
     }
 
     fn reveal(&self, ui: &egui::Ui, spoiler: usize) {
-        let key = (self.message, spoiler);
+        let key = (self.message, self.part, spoiler);
         ui.data_mut(|d| {
             Arc::make_mut(
                 d.get_temp_mut_or_default::<Arc<RevealedSpoilers>>(egui::Id::new(REVEALED)),
