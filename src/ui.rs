@@ -1,5 +1,7 @@
 //! The three columns: servers, channels (or DMs), and the open conversation.
 
+mod sign_in;
+
 use crate::app::{App, Selection, View};
 use crate::model::{self, ChannelKind, Entry, Id, Message, Model};
 use crate::theme::{self, Icon, Palette};
@@ -13,29 +15,13 @@ const ROW_HEIGHT: f32 = 32.0;
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
     let Some(model) = &app.model else {
-        not_connected(ui, &palette);
+        sign_in::show(app, ui);
         return;
     };
     let selection = &mut app.selection;
     rail(selection, model, &palette, ui);
     sidebar(selection, model, &palette, ui);
     conversation(*selection, model, &palette, ui);
-}
-
-fn not_connected(ui: &mut egui::Ui, palette: &Palette) {
-    egui::CentralPanel::default()
-        .frame(Frame::new().fill(palette.window))
-        .show(ui, |ui| {
-            ui.centered_and_justified(|ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Sign-in is not there yet. Run fastcord --demo to try the interface.",
-                    )
-                    .color(palette.secondary)
-                    .font(theme::regular(15.0)),
-                );
-            });
-        });
 }
 
 /// The server rail: direct messages first, then each guild.

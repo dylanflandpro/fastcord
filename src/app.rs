@@ -1,5 +1,6 @@
 //! The window: the model, what is open, and the palette it is drawn in.
 
+use crate::backend::{Backend, Command, Session};
 use crate::model::{Id, Model};
 use crate::theme::{self, Catalog, Palette};
 use std::path::PathBuf;
@@ -50,6 +51,12 @@ impl Selection {
 pub struct App {
     /// `None` until the account is connected.
     pub model: Option<Model>,
+    /// Where signing in stands. Demo runs have no backend and stay
+    /// [`Session::Checking`], unused, since their model is already there.
+    pub session: Session,
+    /// The QR code for [`Session::Qr`], built once per code.
+    pub qr: Option<qrcode::QrCode>,
+    backend: Option<Backend>,
     pub selection: Selection,
     pub palette: Palette,
     themes: Catalog,
@@ -79,9 +86,13 @@ impl App {
             themes.start(dir.clone(), None, &waker);
         }
 
+        let backend = model.is_none().then(|| Backend::start(ctx.clone()));
         Self {
             selection: Selection::initial(model.as_ref()),
             model,
+            session: Session::Checking,
+            qr: None,
+            backend,
             palette,
             themes,
             themes_dir,
@@ -118,6 +129,25 @@ impl App {
         }
     }
 
+    pub fn send(&self, command: Command) {
+        if let Some(backend) = &self.backend {
+            backend.send(command);
+        }
+    }
+
+    fn follow_session(&mut self) {
+        let Some(backend) = &self.backend else {
+            return;
+        };
+        for session in backend.events() {
+            self.qr = match &session {
+                Session::Qr(url) => qrcode::QrCode::new(url.as_bytes()).ok(),
+                _ => None,
+            };
+            self.session = session;
+        }
+    }
+
     fn set_palette(&mut self, ctx: &egui::Context, palette: Palette) {
         self.palette = palette;
         theme::apply(ctx, &palette);
@@ -127,6 +157,7 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.follow_theme(ctx);
+        self.follow_session();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

@@ -1,10 +1,15 @@
 //! fastcord: Discord, native and fast.
 
+mod api;
 mod app;
+mod backend;
+mod credentials;
 mod demo;
 mod model;
+mod remote_auth;
 mod theme;
 mod ui;
+mod websocket;
 
 use clap::Parser;
 
@@ -24,7 +29,7 @@ fn main() -> anyhow::Result<()> {
     let dirs = directories::ProjectDirs::from("", "", "fastcord");
 
     let filter = if cli.verbose {
-        "info,fastcord=debug"
+        "warn,fastcord=debug"
     } else {
         "warn,fastcord=info"
     };
@@ -53,8 +58,7 @@ fn main() -> anyhow::Result<()> {
     std::thread::spawn(fastframe_emoji::warm_up);
 
     let model = cli.demo.then(demo::model);
-    // Demo runs follow the desktop's palette too: they are the only way to see
-    // the interface until sign-in lands.
+    // Demo runs follow the desktop's palette too.
     let themes_dir = dirs.map(|d| d.config_dir().join("themes"));
 
     let options = eframe::NativeOptions {
