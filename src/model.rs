@@ -149,7 +149,12 @@ impl Guild {
     /// the @everyone overwrite, then all my roles' overwrites as one, then my
     /// own member overwrite, each denying before it allows.
     pub fn permissions(&self, channel: &Channel, me: Id) -> Permissions {
-        let base = self.base_permissions(me);
+        self.overwritten(self.base_permissions(me), channel, me)
+    }
+
+    /// [`Self::permissions`] from base permissions already worked out, so a
+    /// whole channel list computes them once.
+    fn overwritten(&self, base: Permissions, channel: &Channel, me: Id) -> Permissions {
         if base == Permissions::ALL {
             return base;
         }
@@ -166,7 +171,10 @@ impl Guild {
         let (allow, deny) = channel
             .overwrites
             .iter()
-            .filter(|o| o.kind == OverwriteKind::Role && self.my_roles.contains(&o.id))
+            // @everyone's overwrite was applied above, even if my roles list it.
+            .filter(|o| {
+                o.kind == OverwriteKind::Role && o.id != self.id && self.my_roles.contains(&o.id)
+            })
             .fold(
                 (Permissions::default(), Permissions::default()),
                 |(a, d), o| (a.union(o.allow), d.union(o.deny)),
@@ -187,10 +195,17 @@ impl Guild {
     /// category first, then each category followed by its channels. Within a
     /// group, text channels come before voice ones (each kind numbers its
     /// positions from zero), then by position, ties broken by id, as Discord
-    /// does. Channels `me` cannot view are left out, and so is a category
-    /// left without any, as the official client hides it; an empty category
-    /// still shows to whoever can view it.
+    /// does. Channels `me` cannot view are left out. A category shows when
+    /// one of its channels does, even if the category itself is hidden; one
+    /// whose channels are all hidden is left out, as the official client
+    /// does; one with no channel at all shows to whoever can view it.
     pub fn sidebar(&self, me: Id) -> Vec<Entry<'_>> {
+        // Worked out once: the list is drawn every frame.
+        let base = self.base_permissions(me);
+        let visible = |c: &Channel| {
+            self.overwritten(base, c, me)
+                .contains(Permissions::VIEW_CHANNEL)
+        };
         let mut categories: Vec<&Channel> = self
             .channels
             .iter()
@@ -208,7 +223,7 @@ impl Guild {
                 .channels
                 .iter()
                 .filter(|c| c.kind != ChannelKind::Category && parent(c) == category)
-                .filter(|c| self.can_view(c, me))
+                .filter(|c| visible(c))
                 .collect();
             channels.sort_by_key(|c| (c.kind == ChannelKind::Voice, c.position, c.id));
             channels
@@ -218,7 +233,7 @@ impl Guild {
         for &category in &categories {
             let channels = children(Some(category.id));
             let empty = !self.channels.iter().any(|c| c.parent == Some(category.id));
-            if channels.is_empty() && !(empty && self.can_view(category, me)) {
+            if channels.is_empty() && !(empty && visible(category)) {
                 continue;
             }
             entries.push(Entry::Category(category));
@@ -469,6 +484,34 @@ mod tests {
     }
 
     #[test]
+    fn my_role_overwrites_combine_with_allow_winning() {
+        // Applied one by one, B's deny would come last and hide it.
+        let mut guild = guild(vec![restricted(
+            2,
+            vec![
+                overwrite(50, OverwriteKind::Role, true),
+                overwrite(51, OverwriteKind::Role, false),
+            ],
+        )]);
+        guild.my_roles = vec![50, 51];
+        assert_eq!(ids(&guild.sidebar(ME)), ["2"]);
+    }
+
+    #[test]
+    fn the_everyone_overwrite_applies_once_even_listed_among_my_roles() {
+        // Folded in with my roles, @everyone's allow would beat role 50's deny.
+        let mut guild = guild(vec![restricted(
+            2,
+            vec![
+                overwrite(GUILD, OverwriteKind::Role, true),
+                overwrite(50, OverwriteKind::Role, false),
+            ],
+        )]);
+        guild.my_roles = vec![GUILD, 50];
+        assert!(guild.sidebar(ME).is_empty());
+    }
+
+    #[test]
     fn owner_and_administrators_see_everything() {
         let hidden = || {
             guild(vec![restricted(
@@ -504,15 +547,24 @@ mod tests {
                 parent: Some(10),
                 ..restricted(11, deny.clone())
             },
-            channel(20, ChannelKind::Category, None, 1),
             // Nothing under it yet: it shows, as long as it is itself visible.
             channel(30, ChannelKind::Category, None, 2),
             Channel {
                 kind: ChannelKind::Category,
-                ..restricted(40, deny)
+                ..restricted(40, deny.clone())
+            },
+            // Hidden itself, but a channel under it is shown to me.
+            Channel {
+                kind: ChannelKind::Category,
+                position: 3,
+                ..restricted(50, deny.clone())
+            },
+            Channel {
+                parent: Some(50),
+                ..restricted(51, vec![overwrite(ME, OverwriteKind::Member, true)])
             },
         ]);
-        assert_eq!(ids(&guild.sidebar(ME)), ["[20]", "[30]"]);
+        assert_eq!(ids(&guild.sidebar(ME)), ["[30]", "[50]", "51"]);
     }
 
     #[test]
