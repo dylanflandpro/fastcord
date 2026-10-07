@@ -1,4 +1,4 @@
-# cordfast
+# fastcord
 
 **Discord, native and fast.** A lightweight Discord client written in Rust with
 [egui](https://github.com/emilk/egui), built on
@@ -22,7 +22,7 @@ cargo run -- --demo   # offline sample servers, no Discord connection
 
 ## Disclaimer
 
-cordfast is an unofficial client and is not affiliated with Discord. Using an
+fastcord is an unofficial client and is not affiliated with Discord. Using an
 unofficial client may be against Discord's terms of service and could get an
 account suspended. Use it at your own risk.
 
