@@ -1,0 +1,34 @@
+[package]
+name = "fastcord"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+description = "A native Discord client built with Rust and egui"
+repository = "https://github.com/dylanflandpro/fastcord"
+keywords = ["discord", "chat", "egui"]
+categories = ["gui"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+log = "0.4"
+directories = "6"
+jiff = "0.2"
+# The whole interface. glow keeps the binary and the dependency tree small.
+eframe = { version = "0.36.1", default-features = false, features = ["accesskit", "glow", "default_fonts", "wayland", "x11"] }
+egui = "0.36.1"
+egui_extras = { version = "0.36.1", features = ["svg"] }
+# The foundation Spotifast and ZapFast share, taken piece by piece. Every
+# crate comes from the same tag; move them together.
+fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-emoji = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+fastframe-log = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
