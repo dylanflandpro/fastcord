@@ -107,10 +107,12 @@ pub enum Update {
     /// Quiet mode (the account setting that silences notifications)
     /// turned on or off.
     QuietMode(bool),
-    /// I blocked or ignored someone, or stopped to.
-    BlockedOrIgnored {
+    /// I blocked or ignored someone, or stopped to; `None` leaves that
+    /// side as it was (a partial update).
+    Relationship {
         user: Id,
-        blocked_or_ignored: bool,
+        blocked: Option<bool>,
+        ignored: Option<bool>,
     },
     /// People a message named (its author and those it mentions), with
     /// their nickname in `guild` when the event gave one.
@@ -438,22 +440,15 @@ struct WireRelationship {
     /// The other user.
     #[serde(deserialize_with = "snowflake")]
     id: Id,
-    #[serde(rename = "type", default)]
-    kind: u8,
-    #[serde(default)]
-    user_ignored: bool,
+    /// Absent from a partial update.
+    #[serde(rename = "type")]
+    kind: Option<u8>,
+    /// Ignored is a flag on any relationship, not a type of its own.
+    user_ignored: Option<bool>,
 }
 
 /// The relationship type of someone I blocked.
 const BLOCKED: u8 = 2;
-
-impl WireRelationship {
-    /// The web client's `isBlockedOrIgnored`: blocked, or ignored (a flag
-    /// on any other relationship).
-    fn blocked_or_ignored(&self) -> bool {
-        self.kind == BLOCKED || self.user_ignored
-    }
-}
 
 /// The account's notification settings: only the flag that separates
 /// unreads from notifications matters here.
@@ -1158,10 +1153,16 @@ impl Decoder {
                 .as_deref()
                 .and_then(|proto| quiet_mode(proto, false))
                 .unwrap_or(false),
-            blocked_or_ignored: ready
+            blocked: ready
                 .relationships
                 .iter()
-                .filter(|r| r.blocked_or_ignored())
+                .filter(|r| r.kind == Some(BLOCKED))
+                .map(|r| r.id)
+                .collect(),
+            ignored: ready
+                .relationships
+                .iter()
+                .filter(|r| r.user_ignored == Some(true))
                 .map(|r| r.id)
                 .collect(),
             ..Model::default()
@@ -1343,10 +1344,19 @@ impl Decoder {
             }
             "RELATIONSHIP_ADD" | "RELATIONSHIP_UPDATE" | "RELATIONSHIP_REMOVE" => {
                 let relationship: WireRelationship = serde_json::from_str(data)?;
-                vec![Update::BlockedOrIgnored {
+                // Removing a relationship ends a block and, as the web
+                // client reads the raw event, an ignore too.
+                let removed = name == "RELATIONSHIP_REMOVE";
+                vec![Update::Relationship {
                     user: relationship.id,
-                    blocked_or_ignored: name != "RELATIONSHIP_REMOVE"
-                        && relationship.blocked_or_ignored(),
+                    blocked: match removed {
+                        true => Some(false),
+                        false => relationship.kind.map(|kind| kind == BLOCKED),
+                    },
+                    ignored: match removed {
+                        true => Some(false),
+                        false => relationship.user_ignored,
+                    },
                 }]
             }
             _ => Vec::new(),
@@ -2200,22 +2210,54 @@ mod tests {
     fn blocked_and_ignored_people_come_from_relationships() {
         let mut decoder = Decoder::default();
         let (mut model, _) = decoder.ready(READY).unwrap();
-        assert_eq!(model.blocked_or_ignored, [9001, 9002].into());
-        let mut event = |name: &str, data: &str| {
+        let shunned = |model: &Model| {
+            let mut ids: Vec<Id> = [9001, 9002, 9003]
+                .into_iter()
+                .filter(|&id| model.blocked_or_ignored(id))
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(shunned(&model), [9001, 9002]);
+        let mut event = |model: &mut Model, name: &str, data: &str| {
             for update in decoder.event(name, data).unwrap() {
                 model.apply(update);
             }
         };
         event(
+            &mut model,
             "RELATIONSHIP_ADD",
             r#"{"id":"9003","type":2,"user":{"id":"9003","username":"x"}}"#,
         );
         event(
+            &mut model,
             "RELATIONSHIP_UPDATE",
             r#"{"id":"9002","type":1,"user_ignored":false}"#,
         );
-        event("RELATIONSHIP_REMOVE", r#"{"id":"9001","type":2}"#);
-        assert_eq!(model.blocked_or_ignored, [9003].into());
+        event(
+            &mut model,
+            "RELATIONSHIP_REMOVE",
+            r#"{"id":"9001","type":2}"#,
+        );
+        assert_eq!(shunned(&model), [9003]);
+        // A partial update leaves out what did not change.
+        event(
+            &mut model,
+            "RELATIONSHIP_UPDATE",
+            r#"{"id":"9003","nickname":"x"}"#,
+        );
+        event(
+            &mut model,
+            "RELATIONSHIP_UPDATE",
+            r#"{"id":"9002","user_ignored":true}"#,
+        );
+        assert_eq!(shunned(&model), [9002, 9003]);
+        event(
+            &mut model,
+            "RELATIONSHIP_UPDATE",
+            r#"{"id":"9003","type":1}"#,
+        );
+        assert_eq!(shunned(&model), [9002]);
     }
 
     #[test]

@@ -106,7 +106,7 @@ pub fn wanted(
     message.author.id != model.me
         && !ping.silent
         && !ping.from_spammer
-        && !model.blocked_or_ignored.contains(&message.author.id)
+        && !model.blocked_or_ignored(message.author.id)
         && !model.quiet_mode
         && !model.do_not_disturb.is_some_and(|dnd| dnd.active(now))
         && !(attention.focused && attention.open == Some(channel))
@@ -396,6 +396,34 @@ impl Notifier {
     }
 }
 
+/// The longest a notification server may take to answer before the
+/// notifier gives up on that call.
+const SERVER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Notices waiting for the notifier, with the stale ones dropped: a
+/// notification replaced by a later one for its channel, one that a later
+/// read or clear would take down at once, and everything before a clear.
+/// Order is otherwise kept, so whatever the queue held, the notifier only
+/// has as many notifications to show as there are channels.
+fn compact(notices: impl IntoIterator<Item = Notice>) -> VecDeque<Notice> {
+    let mut kept: VecDeque<Notice> = VecDeque::new();
+    for notice in notices {
+        match &notice {
+            Notice::ClearAll => kept.clear(),
+            Notice::Show(new) => {
+                kept.retain(|n| !matches!(n, Notice::Show(old) if old.channel == new.channel))
+            }
+            Notice::Read { channel, message } => kept.retain(|n| match n {
+                Notice::Show(old) => old.channel != *channel || old.message > *message,
+                Notice::Read { channel: c, .. } => c != channel,
+                Notice::ClearAll => true,
+            }),
+        }
+        kept.push_back(notice);
+    }
+    kept
+}
+
 /// The desktop's notifier: one D-Bus connection on its own thread, so a
 /// round trip never holds up the gateway. `opened` runs when a notification
 /// is clicked, with its channel. Never used in tests.
@@ -422,58 +450,179 @@ pub fn desktop(opened: impl Fn(Id) + Send + 'static) -> Notifier {
 }
 
 const NOTIFICATIONS: &str = "org.freedesktop.Notifications";
+const NOTIFICATIONS_PATH: &str = "/org/freedesktop/Notifications";
+
+/// What the notifier knows of the notification server.
+#[derive(Debug, Default)]
+struct ServerState {
+    /// Its unique bus name: signals from anyone else (a server since
+    /// replaced) are not about our notifications.
+    owner: Option<String>,
+    /// Whether it reads bodies as markup; `None` until it said. Unknown
+    /// counts as yes: escaped text only looks odd, unescaped text in
+    /// markup can break or restyle the notification.
+    markup: Option<bool>,
+    shown: Shown,
+}
+
+impl ServerState {
+    fn ours(&self, sender: Option<&str>) -> bool {
+        sender.is_some() && sender == self.owner.as_deref()
+    }
+
+    /// Another server took the name: what the last one showed is gone, and
+    /// the new one may read markup differently. A server starting for the
+    /// first time (activated by our first notification) has nothing to
+    /// forget.
+    fn owner_changed(&mut self, old: Option<String>, new: Option<String>) {
+        if old.is_some() {
+            self.shown.clear();
+        }
+        self.owner = new;
+        self.markup = None;
+    }
+}
+
+/// The notification server as the notifier talks to it.
+struct Server<'a> {
+    connection: zbus::Connection,
+    proxy: zbus::Proxy<'a>,
+    state: ServerState,
+}
+
+impl Server<'_> {
+    async fn markup(&mut self) -> bool {
+        if self.state.markup.is_none() {
+            let capabilities: zbus::Result<Vec<String>> =
+                self.proxy.call("GetCapabilities", &()).await;
+            self.state.markup = capabilities
+                .ok()
+                .map(|c| c.iter().any(|c| c == "body-markup"));
+        }
+        self.state.markup.unwrap_or(true)
+    }
+
+    async fn take(&mut self, notice: Notice) {
+        let close = match notice {
+            Notice::Show(notification) => {
+                let body = match self.markup().await {
+                    true => escape(&notification.body),
+                    false => notification.body.clone(),
+                };
+                let replaces = self.state.shown.replaces(notification.channel);
+                match notify(&self.proxy, replaces, &notification.title, &body).await {
+                    Ok(id) => self.state.shown.shown(&notification, id),
+                    Err(error) => log::warn!("a notification could not be shown: {error}"),
+                }
+                Vec::new()
+            }
+            Notice::Read { channel, message } => self
+                .state
+                .shown
+                .read(channel, message)
+                .into_iter()
+                .collect(),
+            Notice::ClearAll => self.state.shown.clear(),
+        };
+        for id in close {
+            self.close(id).await;
+        }
+    }
+
+    /// `CloseNotification` without waiting for an answer: a reply awaited
+    /// while signals pile up unread could stall the connection.
+    async fn close(&self, id: u32) {
+        let message = zbus::Message::method_call(NOTIFICATIONS_PATH, "CloseNotification")
+            .and_then(|m| m.destination(NOTIFICATIONS))
+            .and_then(|m| m.interface(NOTIFICATIONS))
+            .and_then(|m| m.with_flags(zbus::message::Flags::NoReplyExpected))
+            .and_then(|m| m.build(&id));
+        if let Ok(message) = message {
+            let _ = self.connection.send(&message).await;
+        }
+    }
+
+    fn ours(&self, signal: &zbus::Message) -> bool {
+        let header = signal.header();
+        self.state.ours(header.sender().map(|s| s.as_str()))
+    }
+}
 
 /// The freedesktop notification protocol over one session-bus connection.
+/// Signals are read between notices, one notice at a time, so they never
+/// pile up behind a burst.
 async fn serve_desktop(
     notices: &mut tokio::sync::mpsc::UnboundedReceiver<Notice>,
     opened: &dyn Fn(Id),
 ) -> zbus::Result<()> {
     use futures_util::StreamExt as _;
-    let connection = zbus::Connection::session().await?;
-    let path = "/org/freedesktop/Notifications";
-    let proxy = zbus::Proxy::new(&connection, NOTIFICATIONS, path, NOTIFICATIONS).await?;
-    let capabilities: Vec<String> = proxy.call("GetCapabilities", &()).await.unwrap_or_default();
-    let markup = capabilities.iter().any(|c| c == "body-markup");
+    let connection = zbus::connection::Builder::session()?
+        .method_timeout(SERVER_TIMEOUT)
+        .build()
+        .await?;
+    let proxy = zbus::Proxy::new(
+        &connection,
+        NOTIFICATIONS,
+        NOTIFICATIONS_PATH,
+        NOTIFICATIONS,
+    )
+    .await?;
+    let bus = zbus::fdo::DBusProxy::new(&connection).await?;
+    let mut owners = bus
+        .receive_name_owner_changed_with_args(&[(0, NOTIFICATIONS)])
+        .await?;
     let mut invoked = proxy.receive_signal("ActionInvoked").await?;
     let mut closed = proxy.receive_signal("NotificationClosed").await?;
-    let mut shown = Shown::default();
+    let owner = bus.get_name_owner(NOTIFICATIONS.try_into()?).await.ok();
+    let mut server = Server {
+        connection: connection.clone(),
+        proxy,
+        state: ServerState {
+            owner: owner.map(|o| o.to_string()),
+            ..ServerState::default()
+        },
+    };
+    let mut pending: VecDeque<Notice> = VecDeque::new();
     loop {
         tokio::select! {
-            notice = notices.recv() => {
-                let Some(notice) = notice else {
-                    return Ok(());
-                };
-                let close = match notice {
-                    Notice::Show(notification) => {
-                        let body = match markup {
-                            true => escape(&notification.body),
-                            false => notification.body.clone(),
-                        };
-                        let replaces = shown.replaces(notification.channel);
-                        match notify(&proxy, replaces, &notification.title, &body).await {
-                            Ok(id) => shown.shown(&notification, id),
-                            Err(error) => log::warn!("a notification could not be shown: {error}"),
-                        }
-                        Vec::new()
-                    }
-                    Notice::Read { channel, message } => shown.read(channel, message).into_iter().collect(),
-                    Notice::ClearAll => shown.clear(),
-                };
-                for id in close {
-                    let _ = proxy.call::<_, _, ()>("CloseNotification", &id).await;
+            biased;
+            Some(signal) = owners.next() => {
+                if let Ok(args) = signal.args() {
+                    let name = |o: &zbus::zvariant::Optional<zbus::names::UniqueName<'_>>| {
+                        o.as_ref().map(|n| n.to_string())
+                    };
+                    server.state.owner_changed(name(args.old_owner()), name(args.new_owner()));
                 }
             }
             Some(signal) = invoked.next() => {
-                if let Ok((id, action)) = signal.body().deserialize::<(u32, String)>()
+                if server.ours(&signal)
+                    && let Ok((id, action)) = signal.body().deserialize::<(u32, String)>()
                     && action == "default"
-                    && let Some(channel) = shown.clicked(id)
+                    && let Some(channel) = server.state.shown.clicked(id)
                 {
                     opened(channel);
                 }
             }
             Some(signal) = closed.next() => {
-                if let Ok((id, _reason)) = signal.body().deserialize::<(u32, u32)>() {
-                    shown.closed(id);
+                if server.ours(&signal)
+                    && let Ok((id, _reason)) = signal.body().deserialize::<(u32, u32)>()
+                {
+                    server.state.shown.closed(id);
+                }
+            }
+            notice = notices.recv(), if pending.is_empty() => {
+                let Some(first) = notice else {
+                    return Ok(());
+                };
+                let mut batch = vec![first];
+                while let Ok(more) = notices.try_recv() {
+                    batch.push(more);
+                }
+                pending = compact(batch);
+            }
+            () = std::future::ready(()), if !pending.is_empty() => {
+                if let Some(notice) = pending.pop_front() {
+                    server.take(notice).await;
                 }
             }
         }
@@ -756,9 +905,9 @@ mod tests {
             ..Ping::default()
         };
         assert!(!wanted(&model, DM, None, &fresh, &spam, away()));
-        model.blocked_or_ignored.insert(FRIEND);
+        model.ignored.insert(FRIEND);
         assert!(!wanted(&model, DM, None, &fresh, &quiet, away()));
-        model.blocked_or_ignored.clear();
+        model.ignored.clear();
         model.quiet_mode = true;
         assert!(!wanted(&model, DM, None, &fresh, &quiet, away()));
         model.quiet_mode = false;
@@ -929,6 +1078,69 @@ mod tests {
         assert!(!throttle.admit(5, false, now), "neither took a slot");
         throttle.forget(1);
         assert!(!throttle.admit(1, false, now), "read: a new one again");
+    }
+
+    fn show(channel: Id, message: Id) -> Notice {
+        Notice::Show(Notification {
+            channel,
+            message,
+            title: String::new(),
+            body: String::new(),
+        })
+    }
+
+    #[test]
+    fn stale_notices_are_dropped_before_the_server_sees_them() {
+        let read = |channel, message| Notice::Read { channel, message };
+        let queued = [
+            show(DM, 10),
+            show(TEXT, 11),
+            show(DM, 12),
+            read(TEXT, 11),
+            read(TEXT, 13),
+            show(GROUP, 14),
+        ];
+        assert_eq!(
+            compact(queued),
+            [show(DM, 12), read(TEXT, 13), show(GROUP, 14)],
+            "replaced, read at once, and older reads merged"
+        );
+        let queued = [
+            show(DM, 10),
+            read(GROUP, 1),
+            Notice::ClearAll,
+            show(TEXT, 11),
+        ];
+        assert_eq!(compact(queued), [Notice::ClearAll, show(TEXT, 11)]);
+        // However long the backlog, one notification per channel is left.
+        let backlog = (0..1000).map(|n| show(n % 3, n));
+        assert_eq!(compact(backlog).len(), 3);
+    }
+
+    #[test]
+    fn a_new_notification_server_starts_from_nothing() {
+        let mut state = ServerState {
+            owner: Some(":1.5".into()),
+            markup: Some(false),
+            ..ServerState::default()
+        };
+        assert!(state.ours(Some(":1.5")));
+        assert!(!state.ours(Some(":1.9")), "another sender");
+        assert!(!state.ours(None));
+        let Notice::Show(note) = show(DM, 10) else {
+            unreachable!()
+        };
+        state.shown.shown(&note, 7);
+        state.owner_changed(Some(":1.5".into()), Some(":1.9".into()));
+        assert_eq!(state.shown.clicked(7), None, "the old server's ids");
+        assert_eq!(state.markup, None, "asked again");
+        assert!(state.ours(Some(":1.9")));
+
+        // Activated by our first notification: what it shows stays ours.
+        let mut fresh = ServerState::default();
+        fresh.shown.shown(&note, 1);
+        fresh.owner_changed(None, Some(":1.2".into()));
+        assert_eq!(fresh.shown.clicked(1), Some(DM));
     }
 
     #[test]

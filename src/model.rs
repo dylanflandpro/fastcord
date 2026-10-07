@@ -391,8 +391,9 @@ pub struct Model {
     pub do_not_disturb: Option<Mute>,
     /// The account's quiet mode: nothing notifies while it is on.
     pub quiet_mode: bool,
-    /// People I blocked or ignored: nothing they send notifies.
-    pub blocked_or_ignored: HashSet<Id>,
+    /// People I blocked, and people I ignored: nothing they send notifies.
+    pub blocked: HashSet<Id>,
+    pub ignored: HashSet<Id>,
     /// Nicknames by guild, then user, as messages report them.
     pub nicknames: HashMap<Id, HashMap<Id, String>>,
 }
@@ -411,6 +412,11 @@ impl Model {
         let mut dms: Vec<&DmChannel> = self.dms.iter().collect();
         dms.sort_by_key(|d| std::cmp::Reverse(d.last_message_id));
         dms
+    }
+
+    /// The web client's `isBlockedOrIgnored`.
+    pub fn blocked_or_ignored(&self, user: Id) -> bool {
+        self.blocked.contains(&user) || self.ignored.contains(&user)
     }
 
     /// What a guild calls someone: their nickname there, else their name.
@@ -600,14 +606,17 @@ impl Model {
             }
             Update::DoNotDisturb(status) => self.do_not_disturb = status,
             Update::QuietMode(on) => self.quiet_mode = on,
-            Update::BlockedOrIgnored {
+            Update::Relationship {
                 user,
-                blocked_or_ignored,
+                blocked,
+                ignored,
             } => {
-                if blocked_or_ignored {
-                    self.blocked_or_ignored.insert(user);
-                } else {
-                    self.blocked_or_ignored.remove(&user);
+                for (set, value) in [(&mut self.blocked, blocked), (&mut self.ignored, ignored)] {
+                    match value {
+                        Some(true) => set.insert(user),
+                        Some(false) => set.remove(&user),
+                        None => false,
+                    };
                 }
             }
             Update::People { guild, people } => {

@@ -113,7 +113,8 @@ impl Selection {
     /// among the DMs, as if the person had picked it.
     /// Only a conversation I can still read: never a voice channel, a
     /// category, or a channel hidden from me since.
-    pub fn reveal(&mut self, model: &Model, channel: Id) {
+    /// `true` when it opened.
+    pub fn reveal(&mut self, model: &Model, channel: Id) -> bool {
         let readable = |g: &crate::model::Guild| {
             let c = g.channel(channel)?;
             let text = matches!(c.kind, ChannelKind::Text | ChannelKind::Announcement);
@@ -122,9 +123,10 @@ impl Selection {
         self.view = match model.guilds.iter().find_map(readable) {
             Some(view) => view,
             None if model.dm(channel).is_some() => View::DirectMessages,
-            None => return,
+            None => return false,
         };
         self.open_channel(channel);
+        true
     }
 
     /// Shows the DM list on the most recent conversation, which is not
@@ -352,13 +354,15 @@ impl App {
     /// Turning previews off also takes down the notifications already
     /// showing a message's text.
     pub fn set_notification_content(&mut self, show: bool) {
-        if self.notifications.show_content()
+        let was = self.notifications.show_content();
+        // Stored first: a message arriving meanwhile is not shown in full.
+        self.notifications.set_show_content(show);
+        if was
             && !show
             && let Some(backend) = &self.backend
         {
             backend.notify(notify::Notice::ClearAll);
         }
-        self.notifications.set_show_content(show);
     }
 
     /// Tells notifications what the window shows, after each frame drawn.
@@ -514,8 +518,7 @@ impl App {
                 }
                 Event::Open(channel) => {
                     if let Some(model) = &self.model {
-                        self.selection.reveal(model, channel);
-                        self.raise = true;
+                        self.raise = self.selection.reveal(model, channel);
                     }
                 }
                 Event::HistoryFailed { channel } => {
@@ -735,7 +738,7 @@ mod tests {
     fn a_clicked_notification_opens_its_conversation() {
         let model = crate::demo::model();
         let mut selection = Selection::initial(Some(&model));
-        selection.reveal(&model, 201);
+        assert!(selection.reveal(&model, 201));
         assert_eq!(
             (selection.view, selection.channel),
             (View::Guild(200), Some(201))
@@ -744,7 +747,7 @@ mod tests {
         selection.reveal(&model, 900);
         assert_eq!(selection.view, View::DirectMessages);
         assert_eq!(selection.channel, Some(900));
-        selection.reveal(&model, 121);
+        assert!(!selection.reveal(&model, 121));
         assert_eq!(selection.channel, Some(900), "a voice channel");
         selection.reveal(&model, 131);
         assert_eq!(selection.channel, Some(900), "a channel hidden from me");

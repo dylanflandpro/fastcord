@@ -238,7 +238,12 @@ async fn session(
         let ended = tokio::select! {
             ended = stay_connected(&api, &keyring, &token, &connection) => Some(ended),
             served = serve(&mut commands, &api, &token, emit, &acks, busy, send) => match served {
-                Served::Closed => return,
+                Served::Closed => {
+                    // The window is gone: so are the notifications it
+                    // would open.
+                    (alerts.notify)(Notice::ClearAll);
+                    return;
+                }
                 Served::LoggedOut => None,
                 // A history request found the token revoked.
                 Served::Revoked => Some(Ended::Revoked),
