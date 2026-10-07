@@ -929,6 +929,24 @@ fn keyed_button(
     key: impl std::hash::Hash + std::fmt::Debug,
     text: impl Into<egui::WidgetText>,
 ) -> Response {
+    keyed_text(ui, key, text, true)
+}
+
+/// A link-like text, keyed and click-only like [`keyed_button`].
+fn keyed_link(
+    ui: &mut egui::Ui,
+    key: impl std::hash::Hash + std::fmt::Debug,
+    text: impl Into<egui::WidgetText>,
+) -> Response {
+    keyed_text(ui, key, text, false).on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn keyed_text(
+    ui: &mut egui::Ui,
+    key: impl std::hash::Hash + std::fmt::Debug,
+    text: impl Into<egui::WidgetText>,
+    framed: bool,
+) -> Response {
     // Placed in the row like any widget (a child Ui would not wrap with a
     // wrapped row), then made clickable under its own id, and painted as
     // egui paints a small button.
@@ -938,22 +956,34 @@ fn keyed_button(
         f32::INFINITY,
         egui::TextStyle::Button,
     );
-    let padding = egui::vec2(ui.spacing().button_padding.x, 0.0);
+    let padding = egui::vec2(
+        if framed {
+            ui.spacing().button_padding.x
+        } else {
+            0.0
+        },
+        0.0,
+    );
     let (rect, _) = ui.allocate_exact_size(galley.size() + 2.0 * padding, Sense::hover());
     // Clicked, never focused: the keyboard must not reach a message's
     // buttons by accident (Tab, then Space).
     let response = ui.interact(rect, egui::Id::new(key), Sense::CLICK);
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact(&response);
-        let frame = rect.expand(visuals.expansion);
         let painter = ui.painter();
-        painter.rect(
-            frame,
-            visuals.corner_radius,
-            visuals.weak_bg_fill,
-            visuals.bg_stroke,
-            egui::StrokeKind::Inside,
-        );
+        if framed {
+            painter.rect(
+                rect.expand(visuals.expansion),
+                visuals.corner_radius,
+                visuals.weak_bg_fill,
+                visuals.bg_stroke,
+                egui::StrokeKind::Inside,
+            );
+        } else if response.hovered() {
+            let y = rect.bottom() - 1.0;
+            let stroke = Stroke::new(1.0, visuals.text_color());
+            painter.hline(rect.x_range(), y, stroke);
+        }
         painter.galley(
             rect.center() - galley.size() / 2.0,
             galley,
@@ -961,17 +991,6 @@ fn keyed_button(
         );
     }
     response
-}
-
-/// Any widget, keyed like [`keyed_button`] but in a child Ui of its own:
-/// only outside wrapped rows, where a child Ui would not wrap.
-fn keyed(
-    ui: &mut egui::Ui,
-    key: impl std::hash::Hash + std::fmt::Debug,
-    widget: impl egui::Widget,
-) -> Response {
-    let scope = egui::UiBuilder::new().id(egui::Id::new(key));
-    ui.scope_builder(scope, |ui| ui.add(widget)).inner
 }
 
 /// What the conversation needs of my writing: the message open for
@@ -1046,8 +1065,12 @@ fn toolbar(ui: &mut egui::Ui, palette: &Palette, row: Rect, id: Id, mine: bool) 
                 act = Some(Act::Edit);
             }
             let delete = egui::RichText::new("Delete").color(palette.danger);
-            if keyed_button(ui, ("delete", id), delete).clicked() {
-                let confirmed = ui.input(|i| i.modifiers.shift);
+            let delete = keyed_button(ui, ("delete", id), delete);
+            if delete.clicked() {
+                // Without the question only for a Shift+click: never from
+                // the keyboard.
+                let pointer = delete.clicked_by(egui::PointerButton::Primary);
+                let confirmed = pointer && ui.input(|i| i.modifiers.shift);
                 act = Some(Act::Delete { confirmed });
             }
         });
@@ -1066,12 +1089,17 @@ fn editor(ui: &mut egui::Ui, palette: &Palette, editing: &mut Editing) -> Option
     let newline = egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter);
     let id = editing.id;
     let saving = editing.saving;
+    // Tab stays in the editor and types nothing, as in the composer.
+    if ui.memory(|m| m.has_focus(egui::Id::new(("editor", id)))) {
+        ui.input_mut(|i| i.events.retain(|e| !is_tab(e)));
+    }
     let edit = field
         .show(ui, |ui| {
             ui.add(
                 egui::TextEdit::multiline(&mut editing.draft)
                     .id(egui::Id::new(("editor", id)))
                     .interactive(!saving)
+                    .lock_focus(true)
                     .font(theme::regular(TEXT_SIZE))
                     .text_color(palette.text)
                     .frame(Frame::NONE)
@@ -1093,8 +1121,13 @@ fn editor(ui: &mut egui::Ui, palette: &Palette, editing: &mut Editing) -> Option
         ui.data_mut(|d| d.insert_temp(open, id));
         edit.request_focus();
     }
+    // As in the composer: an Enter typed here, the cursor already in.
+    let held = egui::Id::new(("editor-held", id));
+    let had_focus = ui.data(|d| d.get_temp::<bool>(held)).unwrap_or(false);
+    let focused = edit.has_focus();
+    ui.data_mut(|d| d.insert_temp(held, focused));
     let mut act = None;
-    if edit.has_focus() && ui.input(|i| enter_sends(&i.events)) {
+    if had_focus && focused && ui.input(|i| enter_sends(&i.events)) {
         act = Some(Act::Save);
     }
     let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
@@ -1104,13 +1137,13 @@ fn editor(ui: &mut egui::Ui, palette: &Palette, editing: &mut Editing) -> Option
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.label(words("escape to ").color(palette.secondary));
-        let cancel = egui::Button::new(words("cancel").color(palette.accent)).frame(false);
-        if keyed(ui, ("edit-cancel", id), cancel).clicked() {
+        let cancel = words("cancel").color(palette.accent);
+        if keyed_link(ui, ("edit-cancel", id), cancel).clicked() {
             act = Some(Act::CancelEdit);
         }
         ui.label(words(" • enter to ").color(palette.secondary));
-        let save = egui::Button::new(words("save").color(palette.accent)).frame(false);
-        if keyed(ui, ("edit-save", id), save).clicked() {
+        let save = words("save").color(palette.accent);
+        if keyed_link(ui, ("edit-save", id), save).clicked() {
             act = Some(Act::Save);
         }
     });
@@ -2525,6 +2558,34 @@ mod tests {
                 assert!(request.is_none());
             });
         }
+    }
+
+    #[test]
+    fn a_held_enter_after_saving_an_edit_sends_nothing() {
+        let ctx = context();
+        let mut app = demo_app(&ctx);
+        let mine = app.model.as_ref().unwrap().messages(111)[8].id;
+        app.composer.drafts.insert(111, "à moitié".into());
+        let model = app.model.as_ref().unwrap();
+        assert!(app.composer.edit(model, 111, mine));
+        app.composer.editing.as_mut().unwrap().draft = "corrigé".into();
+        show(&ctx, &mut app, vec![]);
+        show(&ctx, &mut app, vec![]);
+        let count = |app: &App| app.model.as_ref().unwrap().messages(111).len();
+        let before = count(&app);
+        // Enter saves the edit, and stays down, repeating, as the cursor
+        // goes back to the composer.
+        for _ in 0..4 {
+            show(&ctx, &mut app, vec![held(egui::Key::Enter)]);
+        }
+        let model = app.model.as_ref().unwrap();
+        assert_eq!(model.message(111, mine).unwrap().content, "corrigé");
+        assert!(app.composer.editing.is_none());
+        assert_eq!(
+            app.composer.drafts[&111], "à moitié",
+            "the draft stays a draft"
+        );
+        assert_eq!(count(&app), before);
     }
 
     #[test]
