@@ -38,6 +38,56 @@ impl User {
     }
 }
 
+/// A permission bitfield, as Discord sends it (a decimal string on the wire).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Permissions(pub u64);
+
+impl Permissions {
+    pub const ADMINISTRATOR: Self = Self(1 << 3);
+    pub const VIEW_CHANNEL: Self = Self(1 << 10);
+    pub const ALL: Self = Self(u64::MAX);
+
+    pub fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// Denies, then allows: within one overwrite, allow wins.
+    fn overwrite(self, allow: Self, deny: Self) -> Self {
+        self.difference(deny).union(allow)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Role {
+    /// The @everyone role has the guild's id.
+    pub id: Id,
+    pub position: i32,
+    pub permissions: Permissions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverwriteKind {
+    Role,
+    Member,
+}
+
+/// A channel's exception to a role's or a member's permissions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Overwrite {
+    pub id: Id,
+    pub kind: OverwriteKind,
+    pub allow: Permissions,
+    pub deny: Permissions,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelKind {
     Text,
@@ -54,6 +104,7 @@ pub struct Channel {
     /// The category it sits under, if any.
     pub parent: Option<Id>,
     pub position: i32,
+    pub overwrites: Vec<Overwrite>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -61,6 +112,10 @@ pub struct Guild {
     pub id: Id,
     pub name: String,
     pub channels: Vec<Channel>,
+    pub owner_id: Id,
+    pub roles: Vec<Role>,
+    /// The signed-in member's roles.
+    pub my_roles: Vec<Id>,
 }
 
 /// One line of a guild's channel list.
@@ -71,11 +126,71 @@ pub enum Entry<'a> {
 }
 
 impl Guild {
-    /// The channel list as Discord draws it: channels outside any category
-    /// first, then each category followed by its channels. Within a group,
-    /// text channels come before voice ones (each kind numbers its positions
-    /// from zero), then by position, ties broken by id, as Discord does.
-    pub fn sidebar(&self) -> Vec<Entry<'_>> {
+    /// What `me` may do across the guild, before any channel overwrite: the
+    /// @everyone role and each of my roles combined. The owner and
+    /// administrators may do everything.
+    fn base_permissions(&self, me: Id) -> Permissions {
+        if self.owner_id == me {
+            return Permissions::ALL;
+        }
+        let base = self
+            .roles
+            .iter()
+            .filter(|r| r.id == self.id || self.my_roles.contains(&r.id))
+            .fold(Permissions::default(), |p, r| p.union(r.permissions));
+        if base.contains(Permissions::ADMINISTRATOR) {
+            Permissions::ALL
+        } else {
+            base
+        }
+    }
+
+    /// What `me` may do in `channel`, following Discord's documented order:
+    /// the @everyone overwrite, then all my roles' overwrites as one, then my
+    /// own member overwrite, each denying before it allows.
+    pub fn permissions(&self, channel: &Channel, me: Id) -> Permissions {
+        let base = self.base_permissions(me);
+        if base == Permissions::ALL {
+            return base;
+        }
+        let find = |kind, id| {
+            channel
+                .overwrites
+                .iter()
+                .find(|o| o.kind == kind && o.id == id)
+        };
+        let mut permissions = base;
+        if let Some(o) = find(OverwriteKind::Role, self.id) {
+            permissions = permissions.overwrite(o.allow, o.deny);
+        }
+        let (allow, deny) = channel
+            .overwrites
+            .iter()
+            .filter(|o| o.kind == OverwriteKind::Role && self.my_roles.contains(&o.id))
+            .fold(
+                (Permissions::default(), Permissions::default()),
+                |(a, d), o| (a.union(o.allow), d.union(o.deny)),
+            );
+        permissions = permissions.overwrite(allow, deny);
+        if let Some(o) = find(OverwriteKind::Member, me) {
+            permissions = permissions.overwrite(o.allow, o.deny);
+        }
+        permissions
+    }
+
+    pub fn can_view(&self, channel: &Channel, me: Id) -> bool {
+        self.permissions(channel, me)
+            .contains(Permissions::VIEW_CHANNEL)
+    }
+
+    /// The channel list as Discord draws it for `me`: channels outside any
+    /// category first, then each category followed by its channels. Within a
+    /// group, text channels come before voice ones (each kind numbers its
+    /// positions from zero), then by position, ties broken by id, as Discord
+    /// does. Channels `me` cannot view are left out, and so is a category
+    /// left without any, as the official client hides it; an empty category
+    /// still shows to whoever can view it.
+    pub fn sidebar(&self, me: Id) -> Vec<Entry<'_>> {
         let mut categories: Vec<&Channel> = self
             .channels
             .iter()
@@ -93,6 +208,7 @@ impl Guild {
                 .channels
                 .iter()
                 .filter(|c| c.kind != ChannelKind::Category && parent(c) == category)
+                .filter(|c| self.can_view(c, me))
                 .collect();
             channels.sort_by_key(|c| (c.kind == ChannelKind::Voice, c.position, c.id));
             channels
@@ -100,15 +216,20 @@ impl Guild {
 
         let mut entries: Vec<Entry<'_>> = children(None).into_iter().map(Entry::Channel).collect();
         for &category in &categories {
+            let channels = children(Some(category.id));
+            let empty = !self.channels.iter().any(|c| c.parent == Some(category.id));
+            if channels.is_empty() && !(empty && self.can_view(category, me)) {
+                continue;
+            }
             entries.push(Entry::Category(category));
-            entries.extend(children(Some(category.id)).into_iter().map(Entry::Channel));
+            entries.extend(channels.into_iter().map(Entry::Channel));
         }
         entries
     }
 
-    /// The channel to open when the guild is selected.
-    pub fn first_text_channel(&self) -> Option<Id> {
-        self.sidebar().into_iter().find_map(|entry| match entry {
+    /// The first channel `me` can open, for a guild opened afresh.
+    pub fn first_text_channel(&self, me: Id) -> Option<Id> {
+        self.sidebar(me).into_iter().find_map(|entry| match entry {
             Entry::Channel(c) if c.kind != ChannelKind::Voice => Some(c.id),
             _ => None,
         })
@@ -159,6 +280,8 @@ pub fn starts_group(previous: Option<&Message>, message: &Message) -> bool {
 
 #[derive(Debug, Default)]
 pub struct Model {
+    /// The signed-in user.
+    pub me: Id,
     pub guilds: Vec<Guild>,
     pub dms: Vec<DmChannel>,
     /// Loaded history per channel, oldest first.
@@ -197,6 +320,48 @@ mod tests {
             kind,
             parent,
             position,
+            overwrites: vec![],
+        }
+    }
+
+    const ME: Id = 1;
+    const GUILD: Id = 1000;
+
+    /// A guild where @everyone may view channels and `ME` holds no role.
+    fn guild(channels: Vec<Channel>) -> Guild {
+        Guild {
+            id: GUILD,
+            name: "g".into(),
+            channels,
+            owner_id: 2,
+            roles: vec![Role {
+                id: GUILD,
+                position: 0,
+                permissions: Permissions::VIEW_CHANNEL,
+            }],
+            my_roles: vec![],
+        }
+    }
+
+    fn overwrite(id: Id, kind: OverwriteKind, allow: bool) -> Overwrite {
+        let (allow, deny) = if allow {
+            (Permissions::VIEW_CHANNEL, Permissions::default())
+        } else {
+            (Permissions::default(), Permissions::VIEW_CHANNEL)
+        };
+        Overwrite {
+            id,
+            kind,
+            allow,
+            deny,
+        }
+    }
+
+    /// A text channel with these overwrites on viewing it.
+    fn restricted(id: Id, overwrites: Vec<Overwrite>) -> Channel {
+        Channel {
+            overwrites,
+            ..channel(id, ChannelKind::Text, None, 0)
         }
     }
 
@@ -212,77 +377,142 @@ mod tests {
 
     #[test]
     fn sidebar_puts_loose_channels_first_then_categories_in_order() {
-        let guild = Guild {
-            id: 1,
-            name: "g".into(),
-            channels: vec![
-                channel(20, ChannelKind::Category, None, 1),
-                channel(10, ChannelKind::Category, None, 0),
-                channel(21, ChannelKind::Text, Some(20), 0),
-                channel(12, ChannelKind::Voice, Some(10), 1),
-                channel(11, ChannelKind::Text, Some(10), 0),
-                channel(2, ChannelKind::Text, None, 5),
-            ],
-        };
+        let guild = guild(vec![
+            channel(20, ChannelKind::Category, None, 1),
+            channel(10, ChannelKind::Category, None, 0),
+            channel(21, ChannelKind::Text, Some(20), 0),
+            channel(12, ChannelKind::Voice, Some(10), 1),
+            channel(11, ChannelKind::Text, Some(10), 0),
+            channel(2, ChannelKind::Text, None, 5),
+        ]);
         assert_eq!(
-            ids(&guild.sidebar()),
+            ids(&guild.sidebar(ME)),
             ["2", "[10]", "11", "12", "[20]", "21"]
         );
     }
 
     #[test]
     fn sidebar_breaks_position_ties_by_id() {
-        let guild = Guild {
-            id: 1,
-            name: "g".into(),
-            channels: vec![
-                channel(9, ChannelKind::Text, None, 0),
-                channel(3, ChannelKind::Text, None, 0),
-            ],
-        };
-        assert_eq!(ids(&guild.sidebar()), ["3", "9"]);
+        let guild = guild(vec![
+            channel(9, ChannelKind::Text, None, 0),
+            channel(3, ChannelKind::Text, None, 0),
+        ]);
+        assert_eq!(ids(&guild.sidebar(ME)), ["3", "9"]);
     }
 
     #[test]
     fn sidebar_puts_text_before_voice_whatever_the_positions() {
-        let guild = Guild {
-            id: 1,
-            name: "g".into(),
-            channels: vec![
-                channel(10, ChannelKind::Category, None, 0),
-                channel(11, ChannelKind::Voice, Some(10), 0),
-                channel(12, ChannelKind::Text, Some(10), 1),
-                channel(13, ChannelKind::Announcement, Some(10), 0),
-            ],
-        };
-        assert_eq!(ids(&guild.sidebar()), ["[10]", "13", "12", "11"]);
+        let guild = guild(vec![
+            channel(10, ChannelKind::Category, None, 0),
+            channel(11, ChannelKind::Voice, Some(10), 0),
+            channel(12, ChannelKind::Text, Some(10), 1),
+            channel(13, ChannelKind::Announcement, Some(10), 0),
+        ]);
+        assert_eq!(ids(&guild.sidebar(ME)), ["[10]", "13", "12", "11"]);
     }
 
     #[test]
     fn sidebar_keeps_channels_whose_category_is_unknown() {
-        let guild = Guild {
-            id: 1,
-            name: "g".into(),
-            channels: vec![
-                channel(2, ChannelKind::Text, None, 1),
-                channel(3, ChannelKind::Text, Some(99), 0),
-            ],
-        };
-        assert_eq!(ids(&guild.sidebar()), ["3", "2"]);
-        assert_eq!(guild.first_text_channel(), Some(3));
+        let guild = guild(vec![
+            channel(2, ChannelKind::Text, None, 1),
+            channel(3, ChannelKind::Text, Some(99), 0),
+        ]);
+        assert_eq!(ids(&guild.sidebar(ME)), ["3", "2"]);
+        assert_eq!(guild.first_text_channel(ME), Some(3));
     }
 
     #[test]
     fn first_text_channel_skips_voice() {
-        let guild = Guild {
-            id: 1,
-            name: "g".into(),
-            channels: vec![
-                channel(5, ChannelKind::Voice, None, 0),
-                channel(6, ChannelKind::Text, None, 1),
-            ],
+        let guild = guild(vec![
+            channel(5, ChannelKind::Voice, None, 0),
+            channel(6, ChannelKind::Text, None, 1),
+        ]);
+        assert_eq!(guild.first_text_channel(ME), Some(6));
+    }
+
+    #[test]
+    fn everyone_deny_hides_and_a_role_allow_shows_again() {
+        let mut guild = guild(vec![
+            restricted(2, vec![overwrite(GUILD, OverwriteKind::Role, false)]),
+            restricted(
+                3,
+                vec![
+                    overwrite(GUILD, OverwriteKind::Role, false),
+                    overwrite(50, OverwriteKind::Role, true),
+                ],
+            ),
+        ]);
+        guild.my_roles = vec![50];
+        assert_eq!(ids(&guild.sidebar(ME)), ["3"]);
+    }
+
+    #[test]
+    fn member_overwrites_win_over_roles() {
+        let mut guild = guild(vec![
+            restricted(
+                2,
+                vec![
+                    overwrite(50, OverwriteKind::Role, true),
+                    overwrite(ME, OverwriteKind::Member, false),
+                ],
+            ),
+            restricted(
+                3,
+                vec![
+                    overwrite(GUILD, OverwriteKind::Role, false),
+                    overwrite(ME, OverwriteKind::Member, true),
+                ],
+            ),
+        ]);
+        guild.my_roles = vec![50];
+        assert_eq!(ids(&guild.sidebar(ME)), ["3"]);
+    }
+
+    #[test]
+    fn owner_and_administrators_see_everything() {
+        let hidden = || {
+            guild(vec![restricted(
+                2,
+                vec![
+                    overwrite(GUILD, OverwriteKind::Role, false),
+                    overwrite(ME, OverwriteKind::Member, false),
+                ],
+            )])
         };
-        assert_eq!(guild.first_text_channel(), Some(6));
+        assert!(hidden().sidebar(ME).is_empty());
+
+        let mut owned = hidden();
+        owned.owner_id = ME;
+        assert_eq!(ids(&owned.sidebar(ME)), ["2"]);
+
+        let mut administered = hidden();
+        administered.roles.push(Role {
+            id: 50,
+            position: 1,
+            permissions: Permissions::ADMINISTRATOR,
+        });
+        administered.my_roles = vec![50];
+        assert_eq!(ids(&administered.sidebar(ME)), ["2"]);
+    }
+
+    #[test]
+    fn a_category_without_a_visible_channel_is_hidden() {
+        let deny = vec![overwrite(GUILD, OverwriteKind::Role, false)];
+        let guild = guild(vec![
+            channel(10, ChannelKind::Category, None, 0),
+            Channel {
+                parent: Some(10),
+                ..restricted(11, deny.clone())
+            },
+            channel(20, ChannelKind::Category, None, 1),
+            // Nothing under it yet: it shows, as long as it is itself visible.
+            channel(30, ChannelKind::Category, None, 2),
+            Channel {
+                kind: ChannelKind::Category,
+                ..restricted(40, deny)
+            },
+        ]);
+        assert_eq!(ids(&guild.sidebar(ME)), ["[20]", "[30]"]);
     }
 
     #[test]

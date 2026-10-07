@@ -1,7 +1,10 @@
 //! Offline sample data for `--demo`: servers, channels, DMs and messages,
 //! so the interface can be built without touching a Discord account.
 
-use crate::model::{Channel, ChannelKind, DmChannel, Guild, Id, Message, Model, User, id_at};
+use crate::model::{
+    Channel, ChannelKind, DmChannel, Guild, Id, Message, Model, Overwrite, OverwriteKind,
+    Permissions, Role, User, id_at,
+};
 
 fn user(id: Id, username: &str, global_name: Option<&str>) -> User {
     User {
@@ -18,7 +21,44 @@ fn channel(id: Id, name: &str, kind: ChannelKind, parent: Option<Id>, position: 
         kind,
         parent,
         position,
+        overwrites: vec![],
     }
+}
+
+/// A guild where @everyone may view channels; `extra` lists the other roles.
+fn guild(id: Id, name: &str, owner_id: Id, extra: &[Id], my_roles: &[Id]) -> Guild {
+    let role = |id, permissions| Role {
+        id,
+        position: 0,
+        permissions,
+    };
+    let mut roles = vec![role(id, Permissions::VIEW_CHANNEL)];
+    roles.extend(extra.iter().map(|&r| role(r, Permissions::default())));
+    Guild {
+        id,
+        name: name.into(),
+        channels: vec![],
+        owner_id,
+        roles,
+        my_roles: my_roles.to_vec(),
+    }
+}
+
+/// Hides a channel from @everyone (the guild's id) but shows it to `role`,
+/// as Discord's "private channel" switch does.
+fn private(mut channel: Channel, guild: Id, role: Id) -> Channel {
+    let rule = |id, allow, deny| Overwrite {
+        id,
+        kind: OverwriteKind::Role,
+        allow,
+        deny,
+    };
+    let none = Permissions::default();
+    channel.overwrites = vec![
+        rule(guild, none, Permissions::VIEW_CHANNEL),
+        rule(role, Permissions::VIEW_CHANNEL, none),
+    ];
+    channel
 }
 
 /// Hands out message ids from one clock and one sequence for the whole demo,
@@ -54,39 +94,59 @@ pub fn model() -> Model {
     let marc = user(3, "marc", None);
     let sam = user(4, "samuel_k", Some("Sam"));
 
-    let rust = Guild {
-        id: 100,
-        name: "Rust Francophone".into(),
-        channels: vec![
-            channel(101, "annonces", ChannelKind::Announcement, None, 0),
-            channel(110, "Discussions", ChannelKind::Category, None, 0),
-            channel(111, "général", ChannelKind::Text, Some(110), 0),
-            channel(112, "aide", ChannelKind::Text, Some(110), 1),
-            channel(113, "egui", ChannelKind::Text, Some(110), 2),
-            channel(120, "Vocal", ChannelKind::Category, None, 1),
-            channel(121, "Salon vocal", ChannelKind::Voice, Some(120), 0),
-        ],
-    };
-    let omarchy = Guild {
-        id: 200,
-        name: "Omarchy".into(),
-        channels: vec![
-            channel(201, "general", ChannelKind::Text, None, 0),
-            channel(202, "themes", ChannelKind::Text, None, 1),
-            channel(203, "hyprland", ChannelKind::Text, None, 2),
-        ],
-    };
-    let bear = Guild {
-        id: 300,
-        name: "BearStudio".into(),
-        channels: vec![
-            channel(310, "Équipe", ChannelKind::Category, None, 0),
-            channel(311, "random", ChannelKind::Text, Some(310), 0),
-            channel(312, "veille", ChannelKind::Text, Some(310), 1),
-        ],
-    };
+    // Dylan is a contributor (150) but not a moderator (151): he sees
+    // #contributeurs, but neither #bureau nor the Modération category.
+    let mut rust = guild(100, "Rust Francophone", marc.id, &[150, 151], &[150]);
+    rust.channels = vec![
+        channel(101, "annonces", ChannelKind::Announcement, None, 0),
+        channel(110, "Discussions", ChannelKind::Category, None, 0),
+        channel(111, "général", ChannelKind::Text, Some(110), 0),
+        channel(112, "aide", ChannelKind::Text, Some(110), 1),
+        channel(113, "egui", ChannelKind::Text, Some(110), 2),
+        private(
+            channel(114, "bureau", ChannelKind::Text, Some(110), 3),
+            100,
+            151,
+        ),
+        private(
+            channel(115, "contributeurs", ChannelKind::Text, Some(110), 4),
+            100,
+            150,
+        ),
+        private(
+            channel(130, "Modération", ChannelKind::Category, None, 1),
+            100,
+            151,
+        ),
+        private(
+            channel(131, "mod-log", ChannelKind::Text, Some(130), 0),
+            100,
+            151,
+        ),
+        channel(120, "Vocal", ChannelKind::Category, None, 2),
+        channel(121, "Salon vocal", ChannelKind::Voice, Some(120), 0),
+    ];
+    let mut omarchy = guild(200, "Omarchy", sam.id, &[], &[]);
+    omarchy.channels = vec![
+        channel(201, "general", ChannelKind::Text, None, 0),
+        channel(202, "themes", ChannelKind::Text, None, 1),
+        channel(203, "hyprland", ChannelKind::Text, None, 2),
+    ];
+    // Dylan owns it, so he sees #direction without holding its role (350).
+    let mut bear = guild(300, "BearStudio", me.id, &[350], &[]);
+    bear.channels = vec![
+        channel(310, "Équipe", ChannelKind::Category, None, 0),
+        channel(311, "random", ChannelKind::Text, Some(310), 0),
+        channel(312, "veille", ChannelKind::Text, Some(310), 1),
+        private(
+            channel(313, "direction", ChannelKind::Text, Some(310), 2),
+            300,
+            350,
+        ),
+    ];
 
     let mut model = Model {
+        me: me.id,
         guilds: vec![rust, omarchy, bear],
         ..Model::default()
     };
@@ -186,6 +246,7 @@ pub fn model() -> Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Entry;
     use std::collections::HashSet;
 
     #[test]
@@ -194,6 +255,24 @@ mod tests {
         let ids: Vec<Id> = model.messages.values().flatten().map(|m| m.id).collect();
         let unique: HashSet<Id> = ids.iter().copied().collect();
         assert_eq!(ids.len(), unique.len());
+    }
+
+    #[test]
+    fn hides_what_the_demo_user_cannot_view() {
+        let model = model();
+        let names = |guild: Id| -> Vec<&str> {
+            let sidebar = model.guild(guild).unwrap().sidebar(model.me);
+            sidebar
+                .into_iter()
+                .map(|entry| match entry {
+                    Entry::Category(c) | Entry::Channel(c) => c.name.as_str(),
+                })
+                .collect()
+        };
+        let rust = names(100);
+        assert!(rust.contains(&"contributeurs"));
+        assert!(!rust.contains(&"bureau") && !rust.contains(&"Modération"));
+        assert!(names(300).contains(&"direction"));
     }
 
     #[test]

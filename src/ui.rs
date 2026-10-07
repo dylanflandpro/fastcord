@@ -21,7 +21,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let selection = &mut app.selection;
     rail(selection, model, &palette, ui);
     sidebar(selection, model, &palette, ui);
-    conversation(*selection, model, &palette, ui);
+    conversation(selection, model, &palette, ui);
 }
 
 /// The server rail: direct messages first, then each guild.
@@ -156,7 +156,7 @@ fn sidebar(selection: &mut Selection, model: &Model, palette: &Palette, ui: &mut
                                 )
                                 .clicked()
                                 {
-                                    selection.channel = Some(dm.id);
+                                    selection.open_channel(dm.id);
                                 }
                             }
                         }
@@ -164,7 +164,7 @@ fn sidebar(selection: &mut Selection, model: &Model, palette: &Palette, ui: &mut
                             let Some(guild) = model.guild(id) else {
                                 return;
                             };
-                            for entry in guild.sidebar() {
+                            for entry in guild.sidebar(model.me) {
                                 match entry {
                                     Entry::Category(category) => {
                                         ui.add_space(12.0);
@@ -186,7 +186,7 @@ fn sidebar(selection: &mut Selection, model: &Model, palette: &Palette, ui: &mut
                                         // Voice comes after the first version.
                                         if response.clicked() && channel.kind != ChannelKind::Voice
                                         {
-                                            selection.channel = Some(channel.id);
+                                            selection.open_channel(channel.id);
                                         }
                                     }
                                 }
@@ -247,7 +247,7 @@ fn row(
 }
 
 /// The open channel: its name, then its messages, newest at the bottom.
-fn conversation(selection: Selection, model: &Model, palette: &Palette, ui: &mut egui::Ui) {
+fn conversation(selection: &Selection, model: &Model, palette: &Palette, ui: &mut egui::Ui) {
     let Some(channel) = selection.channel else {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(palette.window))
