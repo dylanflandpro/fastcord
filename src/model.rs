@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 pub type Id = u64;
 
 /// Milliseconds between the Unix epoch and Discord's (2015-01-01).
-const DISCORD_EPOCH_MS: i64 = 1_420_070_400_000;
+pub const DISCORD_EPOCH_MS: i64 = 1_420_070_400_000;
 
 /// When a snowflake was created. Every message carries its time this way.
 pub fn created_at(id: Id) -> jiff::Timestamp {
@@ -614,6 +614,23 @@ pub struct ReadState {
     pub flags: Option<u32>,
 }
 
+/// The read state flag for a channel that belongs to a guild.
+const IS_GUILD_CHANNEL: u32 = 1 << 0;
+
+/// A read to report to Discord.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ack {
+    /// `None` for a DM.
+    pub guild: Option<Id>,
+    pub channel: Id,
+    pub message: Id,
+    /// The read state's flags, when they changed.
+    pub flags: Option<u32>,
+    /// Sent at once rather than after the usual delay: the channel had
+    /// mentions, which the web client clears without waiting.
+    pub immediate: bool,
+}
+
 /// A mute, for good or until a time Discord set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mute {
@@ -895,6 +912,43 @@ impl Model {
         } else if counts {
             state.mentions += 1;
         }
+    }
+
+    /// Marks a channel or DM read up to its newest message, when there is
+    /// something to read, and returns the ack to send: once per new
+    /// message, so calling this on every frame is free. The position only
+    /// moves forward.
+    pub fn mark_read(&mut self, channel: Id) -> Option<Ack> {
+        let (guild, last, flags) = match self.dm(channel) {
+            Some(dm) => (None, dm.last_message_id?, 0),
+            None => {
+                let (guild, c) = self
+                    .guilds
+                    .iter()
+                    .find_map(|g| g.channel(channel).map(|c| (g, c)))?;
+                (Some(guild), c.last_message_id?, IS_GUILD_CHANNEL)
+            }
+        };
+        let state = self.read_state(channel);
+        if !self.behind(guild, channel, Some(last)) && state.mentions == 0 {
+            return None;
+        }
+        let message = state.last_read.map_or(last, |read| read.max(last));
+        self.read_states.insert(
+            channel,
+            ReadState {
+                last_read: Some(message),
+                mentions: 0,
+                flags: Some(flags),
+            },
+        );
+        Some(Ack {
+            guild: guild.map(|g| g.id),
+            channel,
+            message,
+            flags: (state.flags != Some(flags)).then_some(flags),
+            immediate: state.mentions > 0,
+        })
     }
 
     /// A read reported by Discord, from this session or another. A manual
@@ -1810,5 +1864,52 @@ mod tests {
         assert_eq!(badge_count(999), "999");
         assert_eq!(badge_count(1000), "1k+");
         assert_eq!(badge_count(25_000), "9k+");
+    }
+
+    #[test]
+    fn reading_acks_once_per_new_message() {
+        let mut model = unread_model();
+        let last = newest(&model, 10);
+        read(&mut model, 10, None, 3);
+        assert_eq!(
+            model.mark_read(10),
+            Some(Ack {
+                guild: Some(GUILD),
+                channel: 10,
+                message: last,
+                flags: Some(IS_GUILD_CHANNEL),
+                immediate: true,
+            })
+        );
+        assert_eq!(
+            model.read_states[&10],
+            ReadState {
+                last_read: Some(last),
+                mentions: 0,
+                flags: Some(IS_GUILD_CHANNEL),
+            }
+        );
+        assert_eq!(model.mark_read(10), None, "nothing new");
+        model.apply(crate::events::Update::LastMessages {
+            guild: GUILD,
+            channels: vec![(10, Some(last + 1))],
+        });
+        let ack = model.mark_read(10).unwrap();
+        assert_eq!(
+            (ack.message, ack.flags, ack.immediate),
+            (last + 1, None, false)
+        );
+    }
+
+    #[test]
+    fn reading_never_moves_back() {
+        let mut model = unread_model();
+        let last = newest(&model, 10);
+        // Read further than the newest message known here, with a mention
+        // left to clear.
+        read(&mut model, 10, Some(last + 9), 1);
+        let ack = model.mark_read(10).unwrap();
+        assert_eq!(ack.message, last + 9);
+        assert_eq!(model.read_states[&10].last_read, Some(last + 9));
     }
 }

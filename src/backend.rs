@@ -7,11 +7,12 @@ use crate::api::{self, Api};
 use crate::credentials::{self, Token};
 use crate::events::{Decoder, Update};
 use crate::gateway::{self, End, Gateway};
-use crate::model::{Id, Model, User};
+use crate::model::{Ack, Id, Model, User};
 use crate::remote_auth::{self, Progress};
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -29,6 +30,10 @@ pub enum Command {
         guild: Option<Id>,
         before: Option<Id>,
     },
+    /// Tell Discord a channel was read; the model already knows.
+    Ack(Ack),
+    /// Another device marked a channel unread: drop the ack waiting for it.
+    KeepUnread(Id),
 }
 
 #[derive(Debug, PartialEq)]
@@ -311,11 +316,30 @@ async fn serve(
 ) -> Served {
     while commands.try_recv().is_ok() {}
     let mut loading = FuturesUnordered::new();
+    let mut acks = AckQueue::default();
+    let mut sending = FuturesUnordered::new();
+    // `true` when Discord says the token is no longer valid.
+    let send = |ack: Ack| {
+        let token = Token::new(token.borrow().expose().to_owned());
+        async move { matches!(api.ack(&token, &ack).await, Err(api::Error::Unauthorized)) }
+    };
     loop {
         tokio::select! {
             command = commands.recv() => match command {
-                None => return Served::Closed,
-                Some(Command::LogOut) => return Served::LoggedOut,
+                None => {
+                    flush(&mut acks, &mut sending, send).await;
+                    return Served::Closed;
+                }
+                Some(Command::LogOut) => {
+                    flush(&mut acks, &mut sending, send).await;
+                    return Served::LoggedOut;
+                }
+                Some(Command::Ack(ack)) => {
+                    if let Some(now) = acks.push(ack, tokio::time::Instant::now()) {
+                        sending.push(send(now));
+                    }
+                }
+                Some(Command::KeepUnread(channel)) => acks.cancel(channel),
                 Some(Command::LoadHistory { channel, guild, before }) => {
                     let token = Token::new(token.borrow().expose().to_owned());
                     loading.push(async move {
@@ -329,8 +353,78 @@ async fn serve(
                     return Served::Revoked;
                 }
             }
+            () = sleep_until(acks.due), if acks.due.is_some() => {
+                acks.take().into_iter().for_each(|ack| sending.push(send(ack)));
+            }
+            Some(revoked) = sending.next(), if !sending.is_empty() => {
+                if revoked {
+                    return Served::Revoked;
+                }
+            }
         }
     }
+}
+
+/// How long the web client holds an ack, so reading through a busy
+/// channel sends one request rather than one per message.
+const ACK_DELAY: Duration = Duration::from_secs(3);
+/// How long logging out or closing waits for the acks still to send.
+const ACK_FLUSH: Duration = Duration::from_secs(2);
+
+/// Acks waiting out [`ACK_DELAY`], the newest per channel, as the web
+/// client's outgoing ack timer keeps them.
+#[derive(Default)]
+struct AckQueue {
+    pending: HashMap<Id, Ack>,
+    /// When the pending acks go out: [`ACK_DELAY`] after the first.
+    due: Option<tokio::time::Instant>,
+}
+
+impl AckQueue {
+    /// Queues an ack, or returns it to send at once when it is immediate.
+    /// A flags change an earlier one carried is kept.
+    fn push(&mut self, ack: Ack, now: tokio::time::Instant) -> Option<Ack> {
+        let flags = self.pending.remove(&ack.channel).and_then(|a| a.flags);
+        let ack = Ack {
+            flags: ack.flags.or(flags),
+            ..ack
+        };
+        if ack.immediate {
+            return Some(ack);
+        }
+        self.due.get_or_insert(now + ACK_DELAY);
+        self.pending.insert(ack.channel, ack);
+        None
+    }
+
+    fn cancel(&mut self, channel: Id) {
+        self.pending.remove(&channel);
+    }
+
+    /// Everything pending, which empties the queue.
+    fn take(&mut self) -> Vec<Ack> {
+        self.due = None;
+        self.pending.drain().map(|(_, ack)| ack).collect()
+    }
+}
+
+async fn sleep_until(due: Option<tokio::time::Instant>) {
+    if let Some(due) = due {
+        tokio::time::sleep_until(due).await;
+    }
+}
+
+/// Sends what is still pending and waits, briefly, for every ack in flight.
+async fn flush<F: std::future::Future<Output = bool>>(
+    acks: &mut AckQueue,
+    sending: &mut FuturesUnordered<F>,
+    send: impl Fn(Ack) -> F,
+) {
+    acks.take()
+        .into_iter()
+        .for_each(|ack| sending.push(send(ack)));
+    let all = async { while sending.next().await.is_some() {} };
+    let _ = tokio::time::timeout(ACK_FLUSH, all).await;
 }
 
 /// Loads one page and reports it. `true` when Discord says the token is no
@@ -551,6 +645,58 @@ mod tests {
         let described = describe(&error);
         assert!(!described.contains("private"), "{described}");
         assert!(described.contains("line 1"));
+    }
+
+    fn ack(channel: Id, message: Id, flags: Option<u32>, immediate: bool) -> Ack {
+        Ack {
+            guild: None,
+            channel,
+            message,
+            flags,
+            immediate,
+        }
+    }
+
+    #[test]
+    fn acks_wait_and_keep_the_newest_per_channel() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let start = tokio::time::Instant::now();
+                let mut acks = AckQueue::default();
+                assert_eq!(acks.push(ack(1, 10, Some(1), false), start), None);
+                tokio::time::advance(Duration::from_secs(2)).await;
+                let later = tokio::time::Instant::now();
+                assert_eq!(acks.push(ack(1, 11, None, false), later), None);
+                assert_eq!(acks.push(ack(2, 20, None, false), later), None);
+                // Due three seconds after the first, not the last.
+                assert_eq!(acks.due, Some(start + ACK_DELAY));
+                let before = tokio::time::Instant::now();
+                sleep_until(acks.due).await;
+                assert_eq!(before.elapsed(), Duration::from_secs(1));
+                let mut sent = acks.take();
+                sent.sort_by_key(|a| a.channel);
+                assert_eq!(sent, [ack(1, 11, Some(1), false), ack(2, 20, None, false)]);
+                assert_eq!(acks.due, None);
+            });
+    }
+
+    #[test]
+    fn mentions_ack_at_once_and_unread_marks_cancel() {
+        let now = tokio::time::Instant::now();
+        let mut acks = AckQueue::default();
+        acks.push(ack(1, 10, Some(1), false), now);
+        // The channel got mentions: the newest ack goes now, flags kept.
+        assert_eq!(
+            acks.push(ack(1, 12, None, true), now),
+            Some(ack(1, 12, Some(1), true))
+        );
+        acks.push(ack(2, 20, None, false), now);
+        acks.cancel(2);
+        assert!(acks.take().is_empty());
     }
 
     #[test]

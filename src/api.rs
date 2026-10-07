@@ -7,7 +7,7 @@
 //! fingerprint Discord hands out before sign-in, and the page they come from.
 
 use crate::credentials::Token;
-use crate::model::{Id, User};
+use crate::model::{Ack, DISCORD_EPOCH_MS, Id, User};
 use crate::remote_auth;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -471,6 +471,38 @@ impl Api {
         }
     }
 
+    /// Tells Discord I read `ack.channel` up to `ack.message`, as the web
+    /// client's read state store does.
+    pub async fn ack(&self, token: &Token, ack: &Ack) -> Result<(), Error> {
+        let web = self.web().await;
+        let page = match ack.guild {
+            Some(guild) => format!("/channels/{guild}/{}", ack.channel),
+            None => format!("/channels/@me/{}", ack.channel),
+        };
+        let response = Self::dress(
+            self.client
+                .post(format!(
+                    "{BASE}/channels/{}/messages/{}/ack",
+                    ack.channel, ack.message
+                ))
+                .header(reqwest::header::AUTHORIZATION, token.expose())
+                .json(&ack_body(ack, jiff::Timestamp::now())),
+            &web,
+            &page,
+        )
+        .send()
+        .await
+        .map_err(|_| Error::Network)?;
+        match response.status() {
+            status if status.is_success() => Ok(()),
+            reqwest::StatusCode::UNAUTHORIZED => Err(Error::Unauthorized),
+            status => {
+                log::warn!("ack refused with HTTP {status}");
+                Err(Error::Protocol)
+            }
+        }
+    }
+
     /// Ends the session on Discord's side, so the token stops working even
     /// if a copy survived somewhere.
     pub async fn logout(&self, token: &Token) -> Result<(), Error> {
@@ -494,9 +526,48 @@ impl Api {
     }
 }
 
+/// Days since Discord's epoch, rounded up, as the web client reports when
+/// a channel was last viewed.
+fn last_viewed(now: jiff::Timestamp) -> i64 {
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    (now.as_millisecond() - DISCORD_EPOCH_MS + DAY_MS - 1).div_euclid(DAY_MS)
+}
+
+/// What the web client posts with an ack: no ack token (Discord ignores
+/// them now), the day viewed, and the flags only when they changed.
+fn ack_body(ack: &Ack, now: jiff::Timestamp) -> serde_json::Value {
+    let mut body = serde_json::json!({ "token": null, "last_viewed": last_viewed(now) });
+    if let Some(flags) = ack.flags {
+        body["flags"] = flags.into();
+    }
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ack_sends_what_the_web_client_does() {
+        let ack = Ack {
+            guild: Some(1),
+            channel: 2,
+            message: 3,
+            flags: None,
+            immediate: false,
+        };
+        // 4297.5 days after 2015-01-01, rounded up as the web client does.
+        let now: jiff::Timestamp = "2026-10-07T12:00:00Z".parse().unwrap();
+        assert_eq!(
+            ack_body(&ack, now),
+            serde_json::json!({ "token": null, "last_viewed": 4298 })
+        );
+        let flagged = Ack {
+            flags: Some(1),
+            ..ack
+        };
+        assert_eq!(ack_body(&flagged, now)["flags"], 1);
+    }
 
     #[test]
     fn reads_a_user_with_a_string_snowflake() {

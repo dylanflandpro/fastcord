@@ -27,6 +27,9 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
 - `theme.rs`: the palette, which follows Omarchy's through `fastframe-theme`.
 - `backend.rs`: the thread that talks to Discord and the keyring. The interface
   sends `Command`s and reads what it reports; it never waits on the network.
+  Acks (`Command::Ack`) write to the account: only a conversation the person opened,
+  with its history shown and the window focused, is acked, after the web client's 3 s
+  delay (at once when it had mentions).
 - `gateway.rs`: the live connection. `Gateway` is the protocol without I/O (hello,
   identify with the web client's capabilities, heartbeats, resume, close codes);
   `connect` drives one connection. The backend reconnects with doubling delays.

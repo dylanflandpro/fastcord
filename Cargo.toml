@@ -56,6 +56,10 @@ thiserror = "2.0.21"
 # proxy serves WebP, and senders post JPEG and GIF.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
+[dev-dependencies]
+# Paused time, for the ack delay's tests.
+tokio = { version = "1.53.2", features = ["test-util"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
