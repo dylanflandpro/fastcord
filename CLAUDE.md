@@ -22,6 +22,13 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
 - `theme.rs`: the palette, which follows Omarchy's through `fastframe-theme`.
 - `backend.rs`: the thread that talks to Discord and the keyring. The interface
   sends `Command`s and reads what it reports; it never waits on the network.
+- `gateway.rs`: the live connection. `Gateway` is the protocol without I/O (hello,
+  identify with the web client's capabilities, heartbeats, resume, close codes);
+  `connect` drives one connection. The backend reconnects with doubling delays.
+- `events.rs`: `Decoder` reads gateway events into `Update`s, which
+  `Model::apply` applies. Shapes follow what the web client receives (READY's
+  `users`, guild `properties`, `merged_members`); the fixture in
+  `src/fixtures/ready.json` is made up, never real account data.
 - `remote_auth.rs`: QR sign-in. `Handshake` is the protocol without I/O (test it
   there); `run` drives it over the socket.
 - `api.rs`: Discord's HTTP API. `credentials.rs`: the token in the keyring.
@@ -50,6 +57,7 @@ The guarantees in README.md § Privacy are product promises: message content
 stays in memory and stays out of logs, and the token goes only to the keyring.
 `Token` has no `Debug`/`Display` and wipes itself on drop: keep it that way, and
 never log a ticket, a QR URL (it holds the session fingerprint) or a payload.
+serde errors quote the text they failed on: log them through `backend::describe`.
 
 ## Known gaps
 

@@ -1,0 +1,57 @@
+{
+  "v": 9,
+  "session_id": "made-up-session",
+  "resume_gateway_url": "wss://gateway-us-east1-b.discord.gg",
+  "auth_token": "refreshed",
+  "analytics_token": "ignored",
+  "user_settings_proto": "ignored",
+  "user": { "id": "9000", "username": "imbu", "global_name": "Imbu", "discriminator": "0", "avatar": null, "email": "ignored@example.com" },
+  "users": [
+    { "id": "9001", "username": "marc", "global_name": null, "discriminator": "0", "avatar": null, "bot": false },
+    { "id": "9002", "username": "lea.dev", "global_name": "Léa", "discriminator": "0", "avatar": "abc", "primary_guild": { "tag": "RF" } }
+  ],
+  "private_channels": [
+    { "id": "3001", "type": 1, "recipient_ids": ["9002"], "last_message_id": "175928847299117063", "flags": 0, "is_spam": false },
+    { "id": "3002", "type": 3, "recipient_ids": ["9001", "9999"], "last_message_id": null, "owner_id": "9001", "name": null, "icon": null }
+  ],
+  "guilds": [
+    {
+      "id": "1001",
+      "data_mode": "full",
+      "version": 1,
+      "lazy": true,
+      "large": false,
+      "member_count": 42,
+      "properties": { "id": "1001", "name": "Rust Francophone", "owner_id": "9001", "icon": null, "features": [] },
+      "roles": [
+        { "id": "1001", "name": "@everyone", "position": 0, "permissions": "104324673", "color": 0 }
+      ],
+      "channels": [
+        { "id": "2001", "type": 4, "name": "Discussions", "position": 0, "parent_id": null, "permission_overwrites": [] },
+        { "id": "2002", "type": 0, "name": "général", "position": 0, "parent_id": "2001", "last_message_id": "175928847299117063", "permission_overwrites": [ { "id": "1001", "type": 0, "allow": "0", "deny": "1024" } ] },
+        { "id": "2003", "type": 2, "name": "Vocal", "position": 1, "parent_id": "2001", "bitrate": 64000, "user_limit": 0 },
+        { "id": "2004", "type": 5, "name": "annonces", "position": 0, "parent_id": null },
+        { "id": "2009", "type": 15, "name": "forum", "position": 2, "parent_id": "2001" }
+      ],
+      "threads": [],
+      "emojis": [],
+      "stickers": []
+    },
+    {
+      "id": "1002",
+      "data_mode": "full",
+      "properties": { "id": "1002", "name": "Omarchy", "owner_id": "9000" },
+      "roles": [],
+      "channels": [ { "id": "2101", "type": 0, "name": "general", "position": 0 } ]
+    },
+    { "id": "1003", "unavailable": true }
+  ],
+  "merged_members": [
+    [ { "user_id": "9000", "roles": ["1001"], "joined_at": "2024-01-01T00:00:00+00:00" } ],
+    [ { "user_id": "9000", "roles": [], "joined_at": "2024-01-01T00:00:00+00:00" } ],
+    []
+  ],
+  "read_state": { "version": 1, "partial": false, "entries": [ { "id": "2002", "last_message_id": "175928847299117063", "mention_count": 0 } ] },
+  "user_guild_settings": { "version": 1, "partial": false, "entries": [] },
+  "relationships": []
+}

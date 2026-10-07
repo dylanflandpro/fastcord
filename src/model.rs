@@ -293,7 +293,7 @@ pub fn starts_group(previous: Option<&Message>, message: &Message) -> bool {
         || created_at(message.id).duration_since(created_at(previous.id)) > GROUP_WINDOW
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Model {
     /// The signed-in user.
     pub me: Id,
@@ -321,6 +321,68 @@ impl Model {
 
     pub fn messages(&self, channel: Id) -> &[Message] {
         self.messages.get(&channel).map_or(&[], Vec::as_slice)
+    }
+    /// Applies a change the gateway reported after READY.
+    pub fn apply(&mut self, update: crate::events::Update) {
+        use crate::events::Update;
+        match update {
+            Update::GuildUpsert(guild) => match self.guilds.iter_mut().find(|g| g.id == guild.id) {
+                Some(existing) => *existing = guild,
+                None => self.guilds.push(guild),
+            },
+            Update::GuildChanged { id, name, owner_id } => {
+                if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == id) {
+                    if let Some(name) = name {
+                        guild.name = name;
+                    }
+                    if let Some(owner_id) = owner_id {
+                        guild.owner_id = owner_id;
+                    }
+                }
+            }
+            Update::GuildRemove(id) => self.guilds.retain(|g| g.id != id),
+            Update::ChannelUpsert { guild, channel } => {
+                if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
+                    match guild.channels.iter_mut().find(|c| c.id == channel.id) {
+                        Some(existing) => *existing = channel,
+                        None => guild.channels.push(channel),
+                    }
+                }
+            }
+            Update::RoleUpsert { guild, role } => {
+                if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
+                    match guild.roles.iter_mut().find(|r| r.id == role.id) {
+                        Some(existing) => *existing = role,
+                        None => guild.roles.push(role),
+                    }
+                }
+            }
+            Update::RoleRemove { guild, role } => {
+                if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
+                    guild.roles.retain(|r| r.id != role);
+                    guild.my_roles.retain(|&r| r != role);
+                }
+            }
+            Update::MyRoles { guild, roles } => {
+                if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
+                    guild.my_roles = roles;
+                }
+            }
+            Update::ChannelRemove { guild, channel } => {
+                if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
+                    guild.channels.retain(|c| c.id != channel);
+                }
+                self.messages.remove(&channel);
+            }
+            Update::DmUpsert(dm) => match self.dms.iter_mut().find(|d| d.id == dm.id) {
+                Some(existing) => *existing = dm,
+                None => self.dms.push(dm),
+            },
+            Update::DmRemove(id) => {
+                self.dms.retain(|d| d.id != id);
+                self.messages.remove(&id);
+            }
+        }
     }
 }
 
@@ -598,6 +660,107 @@ mod tests {
         assert!(!starts_group(Some(&first), &message(at(7), 1)));
         assert!(starts_group(Some(&first), &message(at(8), 1)));
         assert!(starts_group(Some(&first), &message(at(1), 2)));
+    }
+
+    #[test]
+    fn applies_guild_and_channel_changes() {
+        use crate::events::Update;
+        let mut model = Model {
+            guilds: vec![guild(vec![channel(10, ChannelKind::Text, None, 0)])],
+            ..Model::default()
+        };
+        model.apply(Update::ChannelUpsert {
+            guild: GUILD,
+            channel: Channel {
+                name: "renamed".into(),
+                ..channel(10, ChannelKind::Text, None, 0)
+            },
+        });
+        model.apply(Update::ChannelUpsert {
+            guild: GUILD,
+            channel: channel(11, ChannelKind::Voice, None, 1),
+        });
+        let g = model.guild(GUILD).unwrap();
+        assert_eq!(g.channels.len(), 2);
+        assert_eq!(g.channel(10).unwrap().name, "renamed");
+        model.apply(Update::ChannelRemove {
+            guild: GUILD,
+            channel: 10,
+        });
+        assert!(model.guild(GUILD).unwrap().channel(10).is_none());
+        model.apply(Update::GuildChanged {
+            id: GUILD,
+            name: Some("h".into()),
+            owner_id: Some(ME),
+        });
+        assert_eq!(model.guild(GUILD).unwrap().name, "h");
+        assert_eq!(model.guild(GUILD).unwrap().owner_id, ME);
+        model.apply(Update::GuildRemove(GUILD));
+        assert!(model.guilds.is_empty());
+    }
+
+    #[test]
+    fn role_changes_reach_what_i_can_see() {
+        use crate::events::Update;
+        let hidden = Channel {
+            overwrites: vec![Overwrite {
+                id: GUILD,
+                kind: OverwriteKind::Role,
+                allow: Permissions::default(),
+                deny: Permissions::VIEW_CHANNEL,
+            }],
+            ..channel(10, ChannelKind::Text, None, 0)
+        };
+        let mut model = Model {
+            me: ME,
+            guilds: vec![guild(vec![hidden])],
+            ..Model::default()
+        };
+        let visible = |model: &Model| {
+            let g = model.guild(GUILD).unwrap();
+            g.can_view(g.channel(10).unwrap(), ME)
+        };
+        assert!(!visible(&model));
+        model.apply(Update::RoleUpsert {
+            guild: GUILD,
+            role: Role {
+                id: 50,
+                position: 1,
+                permissions: Permissions::ADMINISTRATOR,
+            },
+        });
+        assert!(!visible(&model), "a role I do not have changes nothing");
+        model.apply(Update::MyRoles {
+            guild: GUILD,
+            roles: vec![50],
+        });
+        assert!(visible(&model));
+        model.apply(Update::RoleRemove {
+            guild: GUILD,
+            role: 50,
+        });
+        assert!(!visible(&model));
+        assert!(model.guild(GUILD).unwrap().my_roles.is_empty());
+    }
+
+    #[test]
+    fn applies_dm_changes() {
+        use crate::events::Update;
+        let mut model = Model::default();
+        let dm = DmChannel {
+            id: 5,
+            recipients: vec![],
+            last_message_id: None,
+        };
+        model.apply(Update::DmUpsert(dm.clone()));
+        model.apply(Update::DmUpsert(DmChannel {
+            last_message_id: Some(9),
+            ..dm
+        }));
+        assert_eq!(model.dms.len(), 1);
+        assert_eq!(model.dm(5).unwrap().last_message_id, Some(9));
+        model.apply(Update::DmRemove(5));
+        assert!(model.dms.is_empty());
     }
 
     #[test]

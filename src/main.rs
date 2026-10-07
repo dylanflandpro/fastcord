@@ -6,6 +6,8 @@ mod backend;
 mod captcha;
 mod credentials;
 mod demo;
+mod events;
+mod gateway;
 mod model;
 mod remote_auth;
 mod theme;

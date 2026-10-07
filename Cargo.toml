@@ -42,7 +42,7 @@ rsa = { version = "0.9.10", features = ["sha2", "getrandom"] }
 base64 = "0.23"
 qrcode = { version = "0.14.1", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = { version = "1.0.151", features = ["raw_value"] }
 zeroize = "1.9.1"
 keyring-core = "1.0.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
