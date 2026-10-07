@@ -23,6 +23,9 @@ pub const GATEWAY_PATH: &str = "/?v=2";
 /// The gateway only answers pages served from Discord's own origins.
 pub const ORIGIN: &str = "https://discord.com";
 
+/// How long connecting and the gateway's hello may take.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// The gateway closes a session it has kept open for its `timeout_ms`.
 const CLOSE_TIMED_OUT: u16 = 4003;
 
@@ -79,6 +82,8 @@ pub enum Error {
     Captcha(Box<crate::api::Challenge>),
     #[error("Discord asks for a captcha and {0}")]
     CaptchaUnsolved(crate::captcha::Error),
+    #[error("Discord did not accept the captcha")]
+    CaptchaRefused,
     #[error("unable to reach Discord")]
     Network,
 }
@@ -194,6 +199,11 @@ impl Handshake {
 
     pub fn on_message(&mut self, message: ServerMessage) -> Result<Vec<Step>, Error> {
         Ok(match message {
+            // A zero interval would make the heartbeat timer panic.
+            ServerMessage::Hello {
+                heartbeat_interval: 0,
+                ..
+            } => return Err(Error::Protocol),
             ServerMessage::Hello {
                 heartbeat_interval, ..
             } => vec![
@@ -255,8 +265,8 @@ pub enum Progress {
     Captcha,
 }
 
-/// How many captchas in a row before giving up: Discord asking again after a
-/// solved one means it will keep asking.
+/// How many captchas to show for one sign-in: Discord asking again after
+/// two solved ones means it will keep asking.
 const MAX_CAPTCHAS: usize = 2;
 
 /// Trades the approved ticket for the token, solving the captchas Discord
@@ -267,25 +277,43 @@ async fn exchange(
     ticket: &str,
     progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<Token, Error> {
+    let sealed = with_captchas(
+        async |answer| api.exchange_ticket(ticket, answer).await,
+        async |challenge| {
+            progress(Progress::Captcha);
+            crate::captcha::solve(challenge).await
+        },
+    )
+    .await?;
+    let token = keys.decrypt(&sealed)?;
+    let token = String::from_utf8(token.to_vec()).map_err(|_| Error::Protocol)?;
+    Ok(Token::new(token))
+}
+
+/// Makes `attempt`, solving each captcha it is refused with through
+/// `solve` and sending the answer with the next attempt, up to
+/// [`MAX_CAPTCHAS`].
+async fn with_captchas(
+    mut attempt: impl AsyncFnMut(Option<&crate::api::Answer>) -> Result<String, Error>,
+    mut solve: impl AsyncFnMut(&crate::api::Challenge) -> Result<String, crate::captcha::Error>,
+) -> Result<String, Error> {
     let mut answer = None;
-    for _ in 0..=MAX_CAPTCHAS {
-        match api.exchange_ticket(ticket, answer.as_ref()).await {
-            Ok(sealed) => {
-                let token = keys.decrypt(&sealed)?;
-                let token = String::from_utf8(token.to_vec()).map_err(|_| Error::Protocol)?;
-                return Ok(Token::new(token));
-            }
+    let mut solved = 0;
+    loop {
+        match attempt(answer.as_ref()).await {
             Err(Error::Captcha(challenge)) => {
-                progress(Progress::Captcha);
-                let key = crate::captcha::solve(&challenge)
-                    .await
-                    .map_err(Error::CaptchaUnsolved)?;
+                // Asking again after the answers it got: another one would
+                // be refused the same way, so do not show it.
+                if solved == MAX_CAPTCHAS {
+                    return Err(Error::CaptchaRefused);
+                }
+                let key = solve(&challenge).await.map_err(Error::CaptchaUnsolved)?;
                 answer = Some((*challenge).answer(key));
+                solved += 1;
             }
-            Err(error) => return Err(error),
+            result => return result,
         }
     }
-    Err(Error::Protocol)
 }
 
 /// One QR session, from connecting to the token. Returns
@@ -298,21 +326,28 @@ pub async fn run(
     let keys = keys.map_err(|_| Error::Protocol)?;
     let mut handshake = Handshake::new(keys);
 
-    let mut socket = crate::websocket::connect(
+    let connect = crate::websocket::connect(
         GATEWAY_HOST,
         GATEWAY_PATH,
         &[("Origin", ORIGIN), ("User-Agent", crate::api::USER_AGENT)],
-    )
-    .await
-    .map_err(|error| {
-        // Connection errors name hosts and statuses, nothing private.
-        log::debug!("remote auth gateway: {error}");
-        Error::Network
-    })?;
+    );
+    let mut socket = tokio::time::timeout(HELLO_TIMEOUT, connect)
+        .await
+        .map_err(|_| Error::Network)?
+        .map_err(|error| {
+            // Connection errors name hosts and statuses, nothing private.
+            log::debug!("remote auth gateway: {error}");
+            Error::Network
+        })?;
 
     // Replaced by Hello's interval; nothing is sent before it.
     let mut heartbeat = tokio::time::interval(Duration::from_secs(3600));
     heartbeat.reset();
+    // A gateway that accepts the connection but never says hello would
+    // otherwise keep the spinner turning forever.
+    let hello = tokio::time::sleep(HELLO_TIMEOUT);
+    tokio::pin!(hello);
+    let mut greeted = false;
 
     loop {
         let steps = tokio::select! {
@@ -334,6 +369,7 @@ pub async fn run(
                 handshake.on_message(message)?
             }
             _ = heartbeat.tick() => vec![Step::Send(handshake.heartbeat()?)],
+            _ = &mut hello, if !greeted => return Err(Error::NoHeartbeatAck),
         };
         for step in steps {
             match step {
@@ -345,6 +381,7 @@ pub async fn run(
                         .map_err(|_| Error::Closed)?;
                 }
                 Step::Heartbeat(every) => {
+                    greeted = true;
                     heartbeat = tokio::time::interval(every);
                     heartbeat.reset();
                 }
@@ -511,6 +548,77 @@ mod tests {
         handshake.on_message(ServerMessage::HeartbeatAck).unwrap();
         assert_eq!(handshake.heartbeat().unwrap(), ClientMessage::Heartbeat);
         assert!(matches!(handshake.heartbeat(), Err(Error::NoHeartbeatAck)));
+    }
+
+    #[test]
+    fn a_zero_heartbeat_interval_is_refused() {
+        assert!(matches!(
+            handshake().on_message(ServerMessage::Hello {
+                heartbeat_interval: 0,
+                timeout_ms: 150000
+            }),
+            Err(Error::Protocol)
+        ));
+    }
+
+    fn challenge() -> Box<crate::api::Challenge> {
+        Box::new(
+            serde_json::from_str(
+                r#"{"captcha_key":["captcha-required"],"captcha_sitekey":"key","captcha_rqtoken":"t"}"#,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn run_blocking<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
+    #[test]
+    fn a_solved_captcha_goes_with_the_next_attempt() {
+        let mut attempts = Vec::new();
+        let result = run_blocking(with_captchas(
+            async |answer| {
+                attempts.push(answer.is_some());
+                if answer.is_some() {
+                    Ok("sealed".into())
+                } else {
+                    Err(Error::Captcha(challenge()))
+                }
+            },
+            async |_| Ok("solved".into()),
+        ));
+        assert_eq!(result.unwrap(), "sealed");
+        assert_eq!(attempts, [false, true]);
+    }
+
+    #[test]
+    fn stops_before_showing_a_third_captcha() {
+        let mut shown = 0;
+        let result = run_blocking(with_captchas(
+            async |_| Err(Error::Captcha(challenge())),
+            async |_| {
+                shown += 1;
+                Ok("solved".into())
+            },
+        ));
+        assert!(matches!(result, Err(Error::CaptchaRefused)));
+        assert_eq!(shown, MAX_CAPTCHAS);
+    }
+
+    #[test]
+    fn a_closed_captcha_window_ends_the_exchange() {
+        let result = run_blocking(with_captchas(
+            async |_| Err(Error::Captcha(challenge())),
+            async |_| Err(crate::captcha::Error::Closed),
+        ));
+        assert!(matches!(
+            result,
+            Err(Error::CaptchaUnsolved(crate::captcha::Error::Closed))
+        ));
     }
 
     #[test]

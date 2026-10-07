@@ -12,10 +12,17 @@ use crate::remote_auth;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use reqwest::RequestBuilder;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::OnceCell;
 
 const SITE: &str = "https://discord.com";
 const BASE: &str = "https://discord.com/api/v9";
+
+/// Without limits a stalled network (a captive portal, a proxy that stops
+/// answering) would leave sign-in waiting forever with nothing to retry.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The Chrome release the user agent names. Keep it current: a browser a
 /// year old stands out. Bump it with [`USER_AGENT`].
@@ -40,11 +47,14 @@ struct Web {
     fingerprint: Option<String>,
     /// `X-Super-Properties`, built once.
     super_properties: String,
+    /// Whether both visits worked. An incomplete context is not kept, so a
+    /// network that comes back gets the full one.
+    complete: bool,
 }
 
 pub struct Api {
     client: reqwest::Client,
-    web: OnceCell<Web>,
+    web: OnceCell<Arc<Web>>,
 }
 
 #[derive(serde::Deserialize)]
@@ -132,7 +142,7 @@ fn locale() -> String {
     let raw = ["LC_ALL", "LC_MESSAGES", "LANG"]
         .iter()
         .filter_map(|name| std::env::var(name).ok())
-        .find(|value| !value.is_empty() && value != "C" && value != "POSIX")
+        .find(|value| !value.is_empty())
         .unwrap_or_else(|| "en_US".into());
     discord_locale(&raw)
 }
@@ -143,6 +153,8 @@ fn discord_locale(raw: &str) -> String {
     let tag = raw.split(['.', '@']).next().unwrap_or_default();
     let (language, region) = tag.split_once('_').unwrap_or((tag, ""));
     match (language, region) {
+        // The C locale (`C`, `C.UTF-8`, `POSIX`) names no language.
+        ("C" | "POSIX", _) => "en-US".into(),
         ("en", "GB") => "en-GB".into(),
         ("en", _) => "en-US".into(),
         ("es", "ES") | ("es", "") => "es-ES".into(),
@@ -198,6 +210,8 @@ impl Api {
             .default_headers(headers)
             // Discord's cookies, kept in memory for this run only.
             .cookie_store(true)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .expect("an HTTP client with the bundled TLS roots");
         Self {
@@ -206,49 +220,61 @@ impl Api {
         }
     }
 
-    /// Visits the sign-in page as a browser would, once per run. Failures
-    /// leave the parts out rather than stopping sign-in.
-    async fn web(&self) -> &Web {
-        self.web
-            .get_or_init(|| async {
-                let build_number = match self.client.get(format!("{SITE}/login")).send().await {
-                    Ok(response) => response.text().await.ok().and_then(|h| build_number(&h)),
-                    Err(_) => None,
-                };
-                let fingerprint = match self
-                    .client
-                    .get(format!("{BASE}/experiments?with_guild_experiments=false"))
-                    .header(reqwest::header::REFERER, format!("{SITE}/login"))
-                    .send()
-                    .await
-                {
-                    Ok(response) => response
-                        .json::<Experiments>()
-                        .await
-                        .ok()
-                        .and_then(|e| e.fingerprint),
-                    Err(_) => None,
-                };
-                log::debug!(
-                    "web client context: build number {}, fingerprint {}",
-                    build_number.map_or("missing".into(), |n| n.to_string()),
-                    if fingerprint.is_some() {
-                        "received"
-                    } else {
-                        "missing"
-                    },
-                );
-                Web {
-                    super_properties: super_properties(build_number, &locale()),
-                    fingerprint,
-                }
+    /// Visits the sign-in page as a browser would, once per run. A visit
+    /// that failed is tried again next time rather than kept.
+    async fn web(&self) -> Arc<Web> {
+        let kept = self
+            .web
+            .get_or_try_init(|| async {
+                let web = Arc::new(self.visit().await);
+                if web.complete { Ok(web) } else { Err(web) }
             })
+            .await;
+        match kept {
+            Ok(web) => web.clone(),
+            Err(incomplete) => incomplete,
+        }
+    }
+
+    /// What the sign-in page and the experiments tell a signed-out browser.
+    /// Failures leave the parts out rather than stopping sign-in.
+    async fn visit(&self) -> Web {
+        let build_number = match self.client.get(format!("{SITE}/login")).send().await {
+            Ok(response) => response.text().await.ok().and_then(|h| build_number(&h)),
+            Err(_) => None,
+        };
+        let fingerprint = match self
+            .client
+            .get(format!("{BASE}/experiments?with_guild_experiments=false"))
+            .header(reqwest::header::REFERER, format!("{SITE}/login"))
+            .send()
             .await
+        {
+            Ok(response) => response
+                .json::<Experiments>()
+                .await
+                .ok()
+                .and_then(|e| e.fingerprint),
+            Err(_) => None,
+        };
+        log::debug!(
+            "web client context: build number {}, fingerprint {}",
+            build_number.map_or("missing".into(), |n| n.to_string()),
+            if fingerprint.is_some() {
+                "received"
+            } else {
+                "missing"
+            },
+        );
+        Web {
+            super_properties: super_properties(build_number, &locale()),
+            complete: build_number.is_some() && fingerprint.is_some(),
+            fingerprint,
+        }
     }
 
     /// A request as the web client sends it from `page`.
-    async fn request(&self, request: RequestBuilder, page: &str) -> RequestBuilder {
-        let web = self.web().await;
+    fn dress(request: RequestBuilder, web: &Web, page: &str) -> RequestBuilder {
         request
             .header("X-Super-Properties", &web.super_properties)
             .header(reqwest::header::REFERER, format!("{SITE}{page}"))
@@ -268,15 +294,15 @@ impl Api {
         ticket: &str,
         answer: Option<&Answer>,
     ) -> Result<String, remote_auth::Error> {
-        let mut request = self
-            .request(
-                self.client
-                    .post(format!("{BASE}/users/@me/remote-auth/login"))
-                    .json(&serde_json::json!({ "ticket": ticket })),
-                "/login",
-            )
-            .await;
-        if let Some(fingerprint) = &self.web().await.fingerprint {
+        let web = self.web().await;
+        let mut request = Self::dress(
+            self.client
+                .post(format!("{BASE}/users/@me/remote-auth/login"))
+                .json(&serde_json::json!({ "ticket": ticket })),
+            &web,
+            "/login",
+        );
+        if let Some(fingerprint) = &web.fingerprint {
             request = request.header("X-Fingerprint", fingerprint);
         }
         if let Some(answer) = answer {
@@ -309,17 +335,17 @@ impl Api {
 
     /// The signed-in account. Also how a stored token is checked.
     pub async fn me(&self, token: &Token) -> Result<User, Error> {
-        let response = self
-            .request(
-                self.client
-                    .get(format!("{BASE}/users/@me"))
-                    .header(reqwest::header::AUTHORIZATION, token.expose()),
-                "/channels/@me",
-            )
-            .await
-            .send()
-            .await
-            .map_err(|_| Error::Network)?;
+        let web = self.web().await;
+        let response = Self::dress(
+            self.client
+                .get(format!("{BASE}/users/@me"))
+                .header(reqwest::header::AUTHORIZATION, token.expose()),
+            &web,
+            "/channels/@me",
+        )
+        .send()
+        .await
+        .map_err(|_| Error::Network)?;
         match response.status() {
             status if status.is_success() => {
                 let user: ApiUser = response.json().await.map_err(|_| Error::Protocol)?;
@@ -340,18 +366,18 @@ impl Api {
     /// Ends the session on Discord's side, so the token stops working even
     /// if a copy survived somewhere.
     pub async fn logout(&self, token: &Token) -> Result<(), Error> {
-        let response = self
-            .request(
-                self.client
-                    .post(format!("{BASE}/auth/logout"))
-                    .header(reqwest::header::AUTHORIZATION, token.expose())
-                    .json(&serde_json::json!({ "provider": null, "voip_provider": null })),
-                "/channels/@me",
-            )
-            .await
-            .send()
-            .await
-            .map_err(|_| Error::Network)?;
+        let web = self.web().await;
+        let response = Self::dress(
+            self.client
+                .post(format!("{BASE}/auth/logout"))
+                .header(reqwest::header::AUTHORIZATION, token.expose())
+                .json(&serde_json::json!({ "provider": null, "voip_provider": null })),
+            &web,
+            "/channels/@me",
+        )
+        .send()
+        .await
+        .map_err(|_| Error::Network)?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -433,5 +459,8 @@ mod tests {
         assert_eq!(discord_locale("pt_BR.UTF-8"), "pt-BR");
         assert_eq!(discord_locale("de_DE@euro"), "de");
         assert_eq!(discord_locale(""), "en-US");
+        assert_eq!(discord_locale("C.UTF-8"), "en-US");
+        assert_eq!(discord_locale("C"), "en-US");
+        assert_eq!(discord_locale("POSIX"), "en-US");
     }
 }

@@ -69,6 +69,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                             command = Some(Command::LogOut);
                         }
                     }
+                    Session::Stopped => {
+                        title(ui, &palette, "Something went wrong");
+                        secondary(
+                            ui,
+                            &palette,
+                            "fastcord stopped talking to Discord after an internal error. Restart it to try again.",
+                        );
+                    }
                     Session::Failed(message) => {
                         title(ui, &palette, "Something went wrong");
                         secondary(ui, &palette, message);

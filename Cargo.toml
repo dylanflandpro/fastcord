@@ -2,9 +2,13 @@
 # binary: fastcord starts it only when Discord asks for a captcha.
 [workspace]
 members = ["crates/captcha"]
+# `cargo build` and `cargo test` cover the helper too; `cargo run` only
+# builds what it runs, so build the workspace before signing in.
+default-members = [".", "crates/captcha"]
 
 [package]
 name = "fastcord"
+default-run = "fastcord"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"

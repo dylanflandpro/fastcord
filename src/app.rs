@@ -129,9 +129,13 @@ impl App {
         }
     }
 
-    pub fn send(&self, command: Command) {
+    /// Sends a button's command and shows the spinner until the backend
+    /// answers, so the button cannot be pressed twice.
+    pub fn send(&mut self, command: Command) {
         if let Some(backend) = &self.backend {
             backend.send(command);
+            self.session = Session::Checking;
+            self.qr = None;
         }
     }
 

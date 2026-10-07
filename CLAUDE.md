@@ -5,7 +5,8 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
 ## Loop
 
 - `cargo run -- --demo` shows the interface on offline sample data (`src/demo.rs`).
-- `cargo run -- -v` signs in for real (QR code). Use a secondary Discord account.
+- `cargo build --workspace && cargo run -- -v` signs in for real (QR code). Use a
+  secondary Discord account. `cargo run` alone does not build `fastcord-captcha`.
 - Done means the CI steps in `.github/workflows/ci.yml` pass locally, `--locked` and
   `--workspace` included.
 

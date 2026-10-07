@@ -2,10 +2,11 @@
 //! prints the answer.
 //!
 //! fastcord starts this only when Discord asks for a captcha, so WebKit never
-//! loads into the client itself. The protocol is one JSON object on stdin
+//! loads into the client itself. The protocol is one line of JSON on stdin
 //! (`{"sitekey": "...", "rqdata": "..."}`) and, once solved, the hCaptcha
 //! response on one line of stdout with exit status 0. Closing the window
-//! prints nothing and exits with status 1.
+//! prints nothing and exits with status 1, and so does stdin closing: that
+//! means fastcord is gone, and the window should not outlive it.
 //!
 //! hCaptcha only serves a site key on the domains it belongs to, so the page
 //! is loaded with `https://discord.com/` as its address. Nothing is kept: the
@@ -13,7 +14,7 @@
 
 use gtk::prelude::*;
 use javascriptcore::ValueExt as _;
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 use webkit2gtk::{UserContentManagerExt as _, WebViewExt as _};
 
 /// The page hCaptcha is told it runs on.
@@ -70,9 +71,17 @@ fn page(challenge: &Challenge) -> String {
 
 fn main() {
     let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
+    let mut stdin = std::io::stdin().lock();
+    if stdin.read_line(&mut input).is_err() {
         std::process::exit(2);
     }
+    drop(stdin);
+    std::thread::spawn(|| {
+        // Nothing more is sent: reading returns only once fastcord has
+        // closed its end, by exiting or by giving up on the captcha.
+        let _ = std::io::stdin().read_to_end(&mut Vec::new());
+        std::process::exit(1);
+    });
     let Ok(challenge) = serde_json::from_str::<Challenge>(&input) else {
         eprintln!("fastcord-captcha: expected {{\"sitekey\": ..., \"rqdata\": ...}} on stdin");
         std::process::exit(2);

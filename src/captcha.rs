@@ -5,7 +5,8 @@
 //! itself (see `crates/captcha`).
 
 use crate::api::Challenge;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt as _;
 
@@ -13,7 +14,7 @@ const HELPER: &str = "fastcord-captcha";
 
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum Error {
-    #[error("fastcord-captcha is not installed")]
+    #[error("fastcord-captcha is not installed (from the sources: cargo build --workspace)")]
     Missing,
     #[error("the captcha window was closed")]
     Closed,
@@ -25,16 +26,21 @@ pub enum Error {
 /// else the one on `PATH` (a package).
 fn helper() -> Option<PathBuf> {
     let beside = std::env::current_exe()
-        .ok()?
-        .parent()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    find(beside, std::env::var_os("PATH"))
+}
+
+fn find(beside: Option<PathBuf>, path: Option<OsString>) -> Option<PathBuf> {
+    let beside = beside.map(|dir| dir.join(HELPER));
+    let on_path = path
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
         .map(|dir| dir.join(HELPER));
-    beside.filter(|path| path.is_file()).or_else(|| {
-        std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths)
-                .map(|dir| dir.join(HELPER))
-                .find(|path| path.is_file())
-        })
-    })
+    beside
+        .into_iter()
+        .chain(on_path)
+        .find(|file| file.is_file())
 }
 
 /// The helper's input: what hCaptcha needs, nothing else.
@@ -56,12 +62,17 @@ pub async fn solve(challenge: &Challenge) -> Result<String, Error> {
         .spawn()
         .map_err(|_| Error::Failed)?;
     let mut stdin = child.stdin.take().ok_or(Error::Failed)?;
+    let mut line = request(challenge);
+    line.push('\n');
     stdin
-        .write_all(request(challenge).as_bytes())
+        .write_all(line.as_bytes())
         .await
         .map_err(|_| Error::Failed)?;
-    drop(stdin);
+    // stdin stays open while the helper runs: when fastcord exits, even
+    // without dropping this future, the pipe closes and the helper closes its
+    // window instead of lingering.
     let output = child.wait_with_output().await.map_err(|_| Error::Failed)?;
+    drop(stdin);
     match output.status.code() {
         Some(0) => {
             let answer = String::from_utf8(output.stdout).map_err(|_| Error::Failed)?;
@@ -80,6 +91,33 @@ pub async fn solve(challenge: &Challenge) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory holding a file named like the helper.
+    fn directory_with_helper(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fastcord-test-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(HELPER), b"").unwrap();
+        dir
+    }
+
+    #[test]
+    fn prefers_the_helper_beside_fastcord() {
+        let beside = directory_with_helper("beside");
+        let on_path = directory_with_helper("path");
+        let path = std::env::join_paths([&on_path]).unwrap();
+        assert_eq!(
+            find(Some(beside.clone()), Some(path)),
+            Some(beside.join(HELPER))
+        );
+    }
+
+    #[test]
+    fn finds_the_helper_on_path_without_knowing_where_fastcord_is() {
+        let on_path = directory_with_helper("only-path");
+        let path = std::env::join_paths([PathBuf::from("/nonexistent"), on_path.clone()]).unwrap();
+        assert_eq!(find(None, Some(path)), Some(on_path.join(HELPER)));
+        assert_eq!(find(None, None), None);
+    }
 
     #[test]
     fn sends_the_helper_only_what_hcaptcha_needs() {

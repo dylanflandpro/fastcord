@@ -30,6 +30,8 @@ pub enum Session {
     /// Discord asked for a captcha; its window is open.
     Captcha,
     SignedIn(User),
+    /// The backend stopped after an internal error; only a restart helps.
+    Stopped,
     /// Something went wrong; [`Command::Retry`] starts over.
     Failed(String),
 }
@@ -55,7 +57,14 @@ impl Backend {
                     .enable_all()
                     .build()
                     .expect("the backend's async runtime");
-                runtime.block_on(session(receiver, &emit));
+                let session = std::panic::AssertUnwindSafe(|| {
+                    runtime.block_on(session(receiver, &emit));
+                });
+                // The panic itself is in the panic log; the window must not
+                // keep waiting on a backend that is gone.
+                if std::panic::catch_unwind(session).is_err() {
+                    emit(Session::Stopped);
+                }
             })
             .expect("the backend thread");
         Self { commands, events }
@@ -96,7 +105,9 @@ async fn session(mut commands: UnboundedReceiver<Command>, emit: Emit<'_>) {
         if !wait_for(&mut commands, |c| matches!(c, Command::LogOut)).await {
             return;
         }
-        if let Err(error) = log_out(&api, token).await {
+        // Until the token is gone, trying again means logging out again,
+        // never signing back in with what is left in the keyring.
+        while let Err(error) = log_out(&api, &token).await {
             emit(Session::Failed(error));
             if !wait_for(&mut commands, |c| matches!(c, Command::Retry)).await {
                 return;
@@ -111,6 +122,10 @@ async fn wait_for(
     commands: &mut UnboundedReceiver<Command>,
     wanted: impl Fn(&Command) -> bool,
 ) -> bool {
+    // Commands sent while the backend was busy answered an earlier screen (a
+    // second click on Log out, say): acting on them now would log out the
+    // next session.
+    while commands.try_recv().is_ok() {}
     while let Some(command) = commands.recv().await {
         if wanted(&command) {
             return true;
@@ -198,15 +213,33 @@ async fn sign_in(api: &Api, emit: Emit<'_>) -> Option<(Token, User)> {
 
 /// Ends the session on Discord's side, then forgets the token. A failed
 /// remote logout still removes it locally.
-async fn log_out(api: &Api, token: Token) -> Result<(), String> {
-    if let Err(error) = api.logout(&token).await {
+async fn log_out(api: &Api, token: &Token) -> Result<(), String> {
+    if let Err(error) = api.logout(token).await {
         log::warn!("remote logout failed: {error}");
     }
-    drop(token);
     blocking(credentials::delete).await.map_err(|error| {
         format!(
             "The session could not be removed: {}",
             keyring_message(error)
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_from_an_earlier_screen_are_ignored() {
+        let (commands, mut receiver) = unbounded_channel();
+        commands.send(Command::LogOut).unwrap();
+        commands.send(Command::Retry).unwrap();
+        drop(commands);
+        let waited = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(wait_for(&mut receiver, |c| matches!(c, Command::LogOut)));
+        // The queued LogOut was stale; the channel then closed.
+        assert!(!waited);
+    }
 }
