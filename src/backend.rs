@@ -27,6 +27,8 @@ pub enum Session {
     Scanned {
         username: String,
     },
+    /// Discord asked for a captcha; its window is open.
+    Captcha,
     SignedIn(User),
     /// Something went wrong; [`Command::Retry`] starts over.
     Failed(String),
@@ -161,6 +163,7 @@ async fn sign_in(api: &Api, emit: Emit<'_>) -> Option<(Token, User)> {
         Progress::Scanned(user) => emit(Session::Scanned {
             username: user.username,
         }),
+        Progress::Captcha => emit(Session::Captcha),
     };
     let token = loop {
         match remote_auth::run(api, &progress).await {

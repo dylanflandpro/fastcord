@@ -45,6 +45,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                             &format!("Log in on your phone to continue as {username}."),
                         );
                     }
+                    Session::Captcha => {
+                        title(ui, &palette, "Are you human?");
+                        secondary(
+                            ui,
+                            &palette,
+                            "Discord asks for a captcha. Complete it in the window that just opened.",
+                        );
+                    }
                     Session::SignedIn(user) => {
                         title(
                             ui,

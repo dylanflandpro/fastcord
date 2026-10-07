@@ -3,6 +3,7 @@
 mod api;
 mod app;
 mod backend;
+mod captcha;
 mod credentials;
 mod demo;
 mod model;

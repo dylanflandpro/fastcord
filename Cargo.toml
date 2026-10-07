@@ -1,3 +1,8 @@
+# The captcha helper is its own package so WebKit never reaches the main
+# binary: fastcord starts it only when Discord asks for a captcha.
+[workspace]
+members = ["crates/captcha"]
+
 [package]
 name = "fastcord"
 version = "0.1.0"
@@ -27,7 +32,7 @@ fastframe-emoji = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
 fastframe-icons = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
 fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
 fastframe-log = { git = "https://github.com/crmne/fastframe", tag = "v0.4.1" }
-tokio = { version = "1.53.2", features = ["rt", "macros", "time", "sync", "net"] }
+tokio = { version = "1.53.2", features = ["rt", "macros", "time", "sync", "net", "process", "io-util"] }
 tokio-websockets = { version = "0.13.3", default-features = false, features = ["client", "rustls-native-roots", "ring", "rand"] }
 rsa = { version = "0.9.10", features = ["sha2", "getrandom"] }
 base64 = "0.23"
@@ -38,7 +43,7 @@ zeroize = "1.9.1"
 keyring-core = "1.0.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
 http = "1.5.0"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
 thiserror = "2.0.21"
 
 [profile.release]

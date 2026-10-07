@@ -74,8 +74,11 @@ pub enum Error {
     NoHeartbeatAck,
     #[error("the connection closed unexpectedly")]
     Closed,
-    #[error("Discord asks for a captcha, which fastcord cannot show yet")]
-    Captcha,
+    /// Discord wants a captcha before handing over the token.
+    #[error("Discord asks for a captcha")]
+    Captcha(Box<crate::api::Challenge>),
+    #[error("Discord asks for a captcha and {0}")]
+    CaptchaUnsolved(crate::captcha::Error),
     #[error("unable to reach Discord")]
     Network,
 }
@@ -248,6 +251,41 @@ impl Handshake {
 pub enum Progress {
     Qr(String),
     Scanned(ScannedUser),
+    /// The captcha window is open.
+    Captcha,
+}
+
+/// How many captchas in a row before giving up: Discord asking again after a
+/// solved one means it will keep asking.
+const MAX_CAPTCHAS: usize = 2;
+
+/// Trades the approved ticket for the token, solving the captchas Discord
+/// asks for on the way.
+async fn exchange(
+    api: &crate::api::Api,
+    keys: &Keys,
+    ticket: &str,
+    progress: &(dyn Fn(Progress) + Send + Sync),
+) -> Result<Token, Error> {
+    let mut answer = None;
+    for _ in 0..=MAX_CAPTCHAS {
+        match api.exchange_ticket(ticket, answer.as_ref()).await {
+            Ok(sealed) => {
+                let token = keys.decrypt(&sealed)?;
+                let token = String::from_utf8(token.to_vec()).map_err(|_| Error::Protocol)?;
+                return Ok(Token::new(token));
+            }
+            Err(Error::Captcha(challenge)) => {
+                progress(Progress::Captcha);
+                let key = crate::captcha::solve(&challenge)
+                    .await
+                    .map_err(Error::CaptchaUnsolved)?;
+                answer = Some((*challenge).answer(key));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(Error::Protocol)
 }
 
 /// One QR session, from connecting to the token. Returns
@@ -256,9 +294,8 @@ pub async fn run(
     api: &crate::api::Api,
     progress: &(dyn Fn(Progress) + Send + Sync),
 ) -> Result<Token, Error> {
-    let keys = tokio::task::spawn_blocking(Keys::generate)
-        .await
-        .map_err(|_| Error::Protocol)?;
+    let (keys, ()) = tokio::join!(tokio::task::spawn_blocking(Keys::generate), api.prepare());
+    let keys = keys.map_err(|_| Error::Protocol)?;
     let mut handshake = Handshake::new(keys);
 
     let mut socket = crate::websocket::connect(
@@ -314,11 +351,10 @@ pub async fn run(
                 Step::ShowQr(url) => progress(Progress::Qr(url)),
                 Step::Scanned(user) => progress(Progress::Scanned(user)),
                 Step::Ticket(ticket) => {
-                    let sealed = api.exchange_ticket(&ticket).await?;
-                    let token = handshake.keys().decrypt(&sealed)?;
-                    let token = String::from_utf8(token.to_vec()).map_err(|_| Error::Protocol)?;
+                    // The gateway's part is done; a captcha can take longer
+                    // than its heartbeats allow.
                     let _ = socket.close().await;
-                    return Ok(Token::new(token));
+                    return exchange(api, handshake.keys(), &ticket, progress).await;
                 }
                 Step::Nothing => {}
             }

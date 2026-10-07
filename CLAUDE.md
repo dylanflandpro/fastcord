@@ -6,7 +6,8 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
 
 - `cargo run -- --demo` shows the interface on offline sample data (`src/demo.rs`).
 - `cargo run -- -v` signs in for real (QR code). Use a secondary Discord account.
-- Done means the CI steps in `.github/workflows/ci.yml` pass locally, `--locked` included.
+- Done means the CI steps in `.github/workflows/ci.yml` pass locally, `--locked` and
+  `--workspace` included.
 
 ## Layout
 
@@ -23,6 +24,9 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
 - `remote_auth.rs`: QR sign-in. `Handshake` is the protocol without I/O (test it
   there); `run` drives it over the socket.
 - `api.rs`: Discord's HTTP API. `credentials.rs`: the token in the keyring.
+- `captcha.rs`: runs `crates/captcha` (`fastcord-captcha`), a separate WebKitGTK
+  program that shows Discord's hCaptcha. It is its own package so WebKit never
+  links into `fastcord`: check with `ldd target/debug/fastcord | grep -i webkit`.
 - `websocket.rs`: WebSocket upgrade written by hand, because Discord's remote auth
   gateway refuses a lowercase `origin` header (403) and the `http` crate
   lowercases every header name.
