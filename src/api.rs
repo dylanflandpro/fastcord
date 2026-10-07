@@ -6,8 +6,9 @@
 //! client properties with the live build number, the cookies and the
 //! fingerprint Discord hands out before sign-in, and the page they come from.
 
+use crate::acks::{Delivery, MAX_RETRY_WAIT};
 use crate::credentials::Token;
-use crate::model::{Id, User};
+use crate::model::{Ack, DISCORD_EPOCH_MS, Id, User};
 use crate::remote_auth;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -471,6 +472,47 @@ impl Api {
         }
     }
 
+    /// Tells Discord I read `ack.channel` up to `ack.message`, as the web
+    /// client's read state store does. Never fails: what went wrong says
+    /// whether to try again.
+    pub async fn ack(&self, token: &Token, ack: &Ack) -> Delivery {
+        let web = self.web().await;
+        let page = match ack.guild {
+            Some(guild) => format!("/channels/{guild}/{}", ack.channel),
+            None => format!("/channels/@me/{}", ack.channel),
+        };
+        let sent = Self::dress(
+            self.client
+                .post(format!(
+                    "{BASE}/channels/{}/messages/{}/ack",
+                    ack.channel, ack.message
+                ))
+                .header(reqwest::header::AUTHORIZATION, token.expose())
+                .json(&ack_body(ack, jiff::Timestamp::now())),
+            &web,
+            &page,
+        )
+        .send()
+        .await;
+        let Ok(response) = sent else {
+            return Delivery::Retry(None);
+        };
+        let status = response.status();
+        let wait = match status {
+            reqwest::StatusCode::TOO_MANY_REQUESTS => response
+                .json::<RateLimited>()
+                .await
+                .ok()
+                .map(|limited| limited.retry_after),
+            _ => None,
+        };
+        let delivery = delivery(status.as_u16(), wait);
+        if matches!(delivery, Delivery::Dropped | Delivery::Retry(_)) && status.is_client_error() {
+            log::info!("ack answered HTTP {status}");
+        }
+        delivery
+    }
+
     /// Ends the session on Discord's side, so the token stops working even
     /// if a copy survived somewhere.
     pub async fn logout(&self, token: &Token) -> Result<(), Error> {
@@ -494,9 +536,83 @@ impl Api {
     }
 }
 
+/// What an ack's answer means: 401 ends the session; 403 and 404 (no
+/// longer mine to read, or gone) and other refusals drop it; rate limits
+/// (after Discord's wait, capped), server errors and the rest come back.
+fn delivery(status: u16, retry_after: Option<f64>) -> Delivery {
+    match status {
+        200..=299 => Delivery::Saved,
+        401 => Delivery::Unauthorized,
+        429 => Delivery::Retry(Some(
+            retry_after
+                .filter(|s| s.is_finite() && *s > 0.0)
+                .map_or(Duration::from_secs(1), Duration::from_secs_f64)
+                .min(MAX_RETRY_WAIT),
+        )),
+        400..=499 => Delivery::Dropped,
+        _ => Delivery::Retry(None),
+    }
+}
+
+/// Days since Discord's epoch, rounded up, as the web client reports when
+/// a channel was last viewed.
+fn last_viewed(now: jiff::Timestamp) -> i64 {
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    (now.as_millisecond() - DISCORD_EPOCH_MS + DAY_MS - 1).div_euclid(DAY_MS)
+}
+
+/// What the web client posts with an ack: no ack token (Discord ignores
+/// them now), the day viewed, and the flags only when they changed.
+fn ack_body(ack: &Ack, now: jiff::Timestamp) -> serde_json::Value {
+    let mut body = serde_json::json!({ "token": null, "last_viewed": last_viewed(now) });
+    if let Some(flags) = ack.flags {
+        body["flags"] = flags.into();
+    }
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ack_answers_say_what_comes_next() {
+        assert_eq!(delivery(204, None), Delivery::Saved);
+        assert_eq!(delivery(401, None), Delivery::Unauthorized);
+        assert_eq!(delivery(404, None), Delivery::Dropped);
+        assert_eq!(delivery(403, None), Delivery::Dropped);
+        assert_eq!(
+            delivery(429, Some(2.5)),
+            Delivery::Retry(Some(Duration::from_millis(2500)))
+        );
+        assert_eq!(
+            delivery(429, Some(3600.0)),
+            Delivery::Retry(Some(MAX_RETRY_WAIT))
+        );
+        assert_eq!(delivery(502, None), Delivery::Retry(None));
+    }
+
+    #[test]
+    fn an_ack_sends_what_the_web_client_does() {
+        let ack = Ack {
+            guild: Some(1),
+            channel: 2,
+            message: 3,
+            flags: None,
+            immediate: false,
+        };
+        // 4297.5 days after 2015-01-01, rounded up as the web client does.
+        let now: jiff::Timestamp = "2026-10-07T12:00:00Z".parse().unwrap();
+        assert_eq!(
+            ack_body(&ack, now),
+            serde_json::json!({ "token": null, "last_viewed": 4298 })
+        );
+        let flagged = Ack {
+            flags: Some(1),
+            ..ack
+        };
+        assert_eq!(ack_body(&flagged, now)["flags"], 1);
+    }
 
     #[test]
     fn reads_a_user_with_a_string_snowflake() {

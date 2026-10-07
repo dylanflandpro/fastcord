@@ -1,5 +1,6 @@
 //! fastcord: Discord, native and fast.
 
+mod acks;
 mod api;
 mod app;
 mod backend;

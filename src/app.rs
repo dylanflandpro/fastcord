@@ -3,10 +3,11 @@
 use crate::backend::{Backend, Command, Event, Link, Session};
 use crate::events::Update;
 use crate::media::{self, Media};
-use crate::model::{Id, Model};
+use crate::model::{Ack, Id, Model};
 use crate::theme::{self, Catalog, Palette};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// Which list the middle column shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -25,6 +26,9 @@ pub struct Selection {
     /// The channel last opened in each guild during this session, which
     /// opening the guild again brings back, as the official client does.
     last_channels: HashMap<Id, Id>,
+    /// Whether the person opened the conversation themselves (a channel or
+    /// a guild), rather than the window picking one: only then is it read.
+    chosen: bool,
 }
 
 impl Selection {
@@ -34,6 +38,7 @@ impl Selection {
             view: View::DirectMessages,
             channel: None,
             last_channels: HashMap::new(),
+            chosen: false,
         };
         if let Some(model) = model {
             match model.guilds.first() {
@@ -41,6 +46,7 @@ impl Selection {
                 None => selection.open_direct_messages(model),
             }
         }
+        selection.chosen = false;
         selection
     }
 
@@ -63,11 +69,13 @@ impl Selection {
         if let Some(channel) = self.channel {
             self.last_channels.insert(id, channel);
         }
+        self.chosen = true;
     }
 
     /// Opens a conversation from the list in the middle column.
     pub fn open_channel(&mut self, id: Id) {
         self.channel = Some(id);
+        self.chosen = true;
         if let View::Guild(guild) = self.view {
             self.last_channels.insert(guild, id);
         }
@@ -87,6 +95,7 @@ impl Selection {
                         .is_some_and(|c| guild.can_view(c, model.me));
                     if !open {
                         self.open_guild(model, id);
+                        self.chosen = false;
                     }
                 }
             },
@@ -98,10 +107,93 @@ impl Selection {
         }
     }
 
+    /// Shows the DM list on the most recent conversation, which is not
+    /// read until the person opens it.
     pub fn open_direct_messages(&mut self, model: &Model) {
         self.view = View::DirectMessages;
         self.channel = model.dms_by_recency().first().map(|d| d.id);
+        self.chosen = false;
     }
+}
+
+/// How long without a key press or pointer movement before the person
+/// counts as away: the web client's idle store uses ten minutes, and its
+/// `shouldAutomaticallyAck` refuses to ack while idle.
+const IDLE_AFTER: Duration = Duration::from_secs(10 * 60);
+
+/// How close to the end of the conversation counts as at the bottom.
+const BOTTOM_SLACK: f32 = 4.0;
+
+/// Whether a conversation scrolled to `offset` shows its last message: the
+/// web client acks new messages only then.
+pub fn at_bottom(offset: f32, content: f32, viewport: f32) -> bool {
+    offset + viewport >= content - BOTTOM_SLACK
+}
+
+/// What decides whether the open conversation is read, kept from frame to
+/// frame.
+struct Reading {
+    /// The open channel, when another device marked it unread while open:
+    /// the web client leaves it unread until it is left.
+    kept_unread: Option<Id>,
+    /// The channel whose conversation showed its last message last frame.
+    at_bottom: Option<Id>,
+    last_input: Instant,
+    /// Channels with an ack sent and not yet settled.
+    outstanding: HashSet<Id>,
+}
+
+impl Reading {
+    fn new(now: Instant) -> Self {
+        Self {
+            kept_unread: None,
+            at_bottom: None,
+            last_input: now,
+            outstanding: HashSet::new(),
+        }
+    }
+
+    /// Another device marked `channel` unread.
+    fn marked_unread(&mut self, channel: Id, open: Option<Id>) {
+        if open == Some(channel) {
+            self.kept_unread = Some(channel);
+        }
+    }
+
+    /// Forgets a kept channel once it is no longer open.
+    fn follow(&mut self, open: Option<Id>) {
+        if self.kept_unread != open {
+            self.kept_unread = None;
+        }
+    }
+
+    fn idle(&self, now: Instant) -> bool {
+        now.duration_since(self.last_input) >= IDLE_AFTER
+    }
+}
+
+/// The read to report for what is on screen, as the official client acks:
+/// a conversation the person opened, whose history is shown down to its
+/// last message, in a focused window, with someone at it. Not one kept
+/// unread.
+fn acknowledge(
+    model: &mut Model,
+    selection: &Selection,
+    reading: &Reading,
+    focused: bool,
+    now: Instant,
+) -> Option<Ack> {
+    let channel = selection.channel?;
+    if !focused
+        || reading.idle(now)
+        || !selection.chosen
+        || reading.kept_unread == Some(channel)
+        || reading.at_bottom != Some(channel)
+        || !model.messages.contains_key(&channel)
+    {
+        return None;
+    }
+    model.mark_read(channel)
 }
 
 pub struct App {
@@ -134,6 +226,7 @@ pub struct App {
     failed_history: HashSet<Id>,
     /// Messages that arrived while their channel's first page was loading.
     early_messages: HashMap<Id, Vec<Update>>,
+    reading: Reading,
 }
 
 /// What the conversation shows above or instead of its messages.
@@ -218,6 +311,7 @@ impl App {
             loading_history: HashSet::new(),
             failed_history: HashSet::new(),
             early_messages: HashMap::new(),
+            reading: Reading::new(Instant::now()),
         }
     }
 
@@ -281,6 +375,8 @@ impl App {
     /// flight die with the session, so nothing would ever clear them.
     fn forget_account(&mut self) {
         self.model = None;
+        self.reading.outstanding.clear();
+        self.reading.kept_unread = None;
         self.loading_history.clear();
         self.failed_history.clear();
         self.early_messages.clear();
@@ -356,6 +452,12 @@ impl App {
                     }
                     self.model = Some(model);
                 }
+                Event::AckDone { channel, flags } => {
+                    self.reading.outstanding.remove(&channel);
+                    if let (Some(model), Some(flags)) = (&mut self.model, flags) {
+                        model.save_flags(channel, flags);
+                    }
+                }
                 Event::HistoryFailed { channel } => {
                     self.loading_history.remove(&channel);
                     self.failed_history.insert(channel);
@@ -381,6 +483,14 @@ impl App {
                     if let Some(channel) = landed {
                         self.loading_history.remove(&channel);
                     }
+                    if let Update::Acked {
+                        channel,
+                        manual: true,
+                        ..
+                    } = update
+                    {
+                        self.reading.marked_unread(channel, self.selection.channel);
+                    }
                     if let Some(model) = &mut self.model {
                         model.apply(update);
                         if let Some(early) = landed.and_then(|c| self.early_messages.remove(&c)) {
@@ -393,24 +503,88 @@ impl App {
         }
     }
 
+    /// The conversation drawn this frame showed its last message.
+    pub fn report_bottom(&mut self, channel: Option<Id>) {
+        self.reading.at_bottom = channel;
+    }
+
+    /// Marks what is on screen read and tells Discord. Run after drawing,
+    /// which is when a conversation opens or reaches its end, with a
+    /// repaint to show it read.
+    fn read_open_conversation(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        if ctx.input(|i| i.events.iter().any(is_input)) {
+            self.reading.last_input = now;
+        }
+        self.reading.follow(self.selection.channel);
+        let Some(model) = &mut self.model else {
+            return;
+        };
+        let focused = ctx.input(|i| i.focused);
+        let Some(ack) = acknowledge(model, &self.selection, &self.reading, focused, now) else {
+            return;
+        };
+        ctx.request_repaint();
+        if let Some(backend) = &self.backend {
+            backend.send(Command::Ack(ack));
+            self.reading.outstanding.insert(ack.channel);
+        }
+    }
+
+    /// Drops the acks waiting for channels no longer mine to read (deleted,
+    /// or hidden by a role change).
+    fn drop_unreadable_acks(&mut self) {
+        let (Some(model), Some(backend)) = (&self.model, &self.backend) else {
+            return;
+        };
+        self.reading.outstanding.retain(|&channel| {
+            let readable = model.can_read(channel);
+            if !readable {
+                backend.send(Command::DropAck(channel));
+            }
+            readable
+        });
+    }
+
     fn set_palette(&mut self, ctx: &egui::Context, palette: Palette) {
         self.palette = palette;
         theme::apply(ctx, &palette);
     }
 }
 
+/// Something the person did in the window, which shows they are at it.
+fn is_input(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::PointerMoved(_)
+            | egui::Event::PointerButton { .. }
+            | egui::Event::MouseWheel { .. }
+            | egui::Event::Key { .. }
+            | egui::Event::Text(_)
+            | egui::Event::Touch { .. }
+    )
+}
+
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.follow_theme(ctx);
         self.follow_backend();
+        self.drop_unreadable_acks();
         if let Some(channel) = self.selection.channel {
             self.request_history(channel, false);
         }
         self.media.poll(ctx);
     }
 
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(backend) = self.backend.take() {
+            backend.close();
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         crate::ui::show(self, ui);
+        self.read_open_conversation(ui.ctx());
         self.transition.paint(ui.ctx());
     }
 }
@@ -567,5 +741,115 @@ mod tests {
         let selection = Selection::initial(None);
         assert_eq!(selection.view, View::DirectMessages);
         assert_eq!(selection.channel, None);
+    }
+
+    /// Someone at the window, scrolled to the end of `channel`.
+    fn watching(channel: Id, now: Instant) -> Reading {
+        Reading {
+            at_bottom: Some(channel),
+            ..Reading::new(now)
+        }
+    }
+
+    #[test]
+    fn only_what_the_person_opened_and_sees_is_read() {
+        let now = Instant::now();
+        let mut model = crate::demo::model();
+        let mut selection = Selection::initial(Some(&model));
+        let reading = watching(101, now);
+        // The window opened on Rust Francophone by itself.
+        assert_eq!(
+            acknowledge(&mut model, &selection, &reading, true, now),
+            None
+        );
+        // #général is unread.
+        selection.open_channel(111);
+        let mut reading = watching(111, now);
+        let ack = |model: &mut Model, reading: &Reading, focused, now| {
+            acknowledge(model, &selection, reading, focused, now)
+        };
+        assert_eq!(ack(&mut model, &reading, false, now), None, "unfocused");
+        let later = now + IDLE_AFTER;
+        assert_eq!(ack(&mut model, &reading, true, later), None, "idle");
+        let history = model.messages.remove(&111).unwrap();
+        assert_eq!(ack(&mut model, &reading, true, now), None, "not shown");
+        model.messages.insert(111, history);
+        reading.at_bottom = None;
+        assert_eq!(ack(&mut model, &reading, true, now), None, "scrolled up");
+        reading.at_bottom = Some(111);
+        reading.kept_unread = Some(111);
+        assert_eq!(ack(&mut model, &reading, true, now), None, "kept unread");
+        reading.kept_unread = None;
+        let read = ack(&mut model, &reading, true, now).unwrap();
+        assert_eq!((read.channel, read.immediate), (111, true));
+        assert_eq!(ack(&mut model, &reading, true, now), None, "once");
+    }
+
+    #[test]
+    fn the_window_picking_a_conversation_does_not_read_it() {
+        let now = Instant::now();
+        let mut model = crate::demo::model();
+        let mut selection = Selection::initial(Some(&model));
+        selection.open_direct_messages(&model);
+        selection.channel = Some(901);
+        let reading = watching(901, now);
+        assert_eq!(
+            acknowledge(&mut model, &selection, &reading, true, now),
+            None
+        );
+        selection.open_channel(901);
+        assert!(acknowledge(&mut model, &selection, &reading, true, now).is_some());
+        // A repair falling back to another channel is the window's pick.
+        selection.open_guild(&model, 200);
+        assert!(selection.chosen);
+        model.apply(Update::ChannelRemove {
+            guild: 200,
+            channel: 201,
+        });
+        selection.repair(&model);
+        assert_eq!(selection.channel, Some(202));
+        assert!(!selection.chosen);
+    }
+
+    #[test]
+    fn marked_unread_elsewhere_stays_unread_until_left() {
+        let now = Instant::now();
+        let mut model = crate::demo::model();
+        let mut selection = Selection::initial(Some(&model));
+        selection.open_channel(111);
+        let mut reading = watching(111, now);
+        let read = acknowledge(&mut model, &selection, &reading, true, now).unwrap();
+        // Another device marks it unread from an older message.
+        model.apply(Update::Acked {
+            channel: 111,
+            message: read.message - 1,
+            manual: true,
+            mentions: Some(0),
+            flags: None,
+        });
+        reading.marked_unread(111, selection.channel);
+        reading.follow(selection.channel);
+        assert_eq!(
+            acknowledge(&mut model, &selection, &reading, true, now),
+            None
+        );
+        // Left, then opened again: read.
+        selection.open_channel(112);
+        reading.follow(selection.channel);
+        assert_eq!(reading.kept_unread, None);
+        selection.open_channel(111);
+        assert!(acknowledge(&mut model, &selection, &reading, true, now).is_some());
+        // Marked unread while another channel is open: nothing to keep.
+        reading.marked_unread(113, selection.channel);
+        assert_eq!(reading.kept_unread, None);
+    }
+
+    #[test]
+    fn the_bottom_allows_a_few_pixels() {
+        assert!(at_bottom(600.0, 1000.0, 400.0));
+        assert!(at_bottom(597.0, 1000.0, 400.0));
+        assert!(!at_bottom(500.0, 1000.0, 400.0));
+        // Too short to scroll.
+        assert!(at_bottom(0.0, 300.0, 400.0));
     }
 }

@@ -32,7 +32,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
     status_bar(app, ui);
     let status = app.selection.channel.map(|c| app.history_status(c));
-    let request = {
+    let (request, bottom) = {
         let Some(model) = &app.model else {
             return;
         };
@@ -41,6 +41,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         sidebar(selection, model, &palette, ui);
         conversation(selection, model, &palette, status, &mut app.media, ui)
     };
+    app.report_bottom(bottom);
     viewer(&mut app.media, &palette, ui);
     match request {
         Some(HistoryRequest::Older(channel)) => app.request_history(channel, true),
@@ -431,15 +432,17 @@ fn conversation(
     status: Option<HistoryStatus>,
     media: &mut Media,
     ui: &mut egui::Ui,
-) -> Option<HistoryRequest> {
+) -> (Option<HistoryRequest>, Option<Id>) {
     let Some(channel) = selection.channel else {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(palette.window))
             .show(ui, |_| {});
-        return None;
+        return (None, None);
     };
     let status = status.unwrap_or(HistoryStatus::Idle);
     let mut request = None;
+    // The channel, when its last message is on screen.
+    let mut bottom = None;
     egui::Panel::top("conversation-header")
         .exact_size(48.0)
         .show_separator_line(true)
@@ -541,6 +544,10 @@ fn conversation(
             });
             let height = output.content_size.y;
             let at_top = output.state.offset.y <= 1.0;
+            let viewport = output.inner_rect.height();
+            if app::at_bottom(output.state.offset.y, height, viewport) {
+                bottom = Some(channel);
+            }
             if let Some(before) = ui.data(|d| d.get_temp::<ScrollAnchor>(anchor))
                 && let Some(offset) = app::anchored_offset(before, first, height)
             {
@@ -563,7 +570,7 @@ fn conversation(
                 request = Some(HistoryRequest::Older(channel));
             }
         });
-    request
+    (request, bottom)
 }
 
 /// The height of the row above the messages: the beginning, a spinner or a
