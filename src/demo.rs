@@ -2,9 +2,11 @@
 //! so the interface can be built without touching a Discord account.
 
 use crate::model::{
-    Attachment, Channel, ChannelKind, DmChannel, Embed, EmbedField, EmbedImage, Guild, Id, Message,
-    Model, Overwrite, OverwriteKind, Permissions, Role, User, id_at,
+    Attachment, Channel, ChannelKind, ChannelSettings, DmChannel, Embed, EmbedField, EmbedImage,
+    Guild, GuildSettings, Id, Message, Model, Mute, Notify, Overwrite, OverwriteKind, Permissions,
+    ReadState, Role, User, id_at,
 };
+use std::collections::HashMap;
 
 fn user(id: Id, username: &str, global_name: Option<&str>) -> User {
     User {
@@ -22,6 +24,7 @@ fn channel(id: Id, name: &str, kind: ChannelKind, parent: Option<Id>, position: 
         parent,
         position,
         overwrites: vec![],
+        last_message_id: None,
     }
 }
 
@@ -47,6 +50,8 @@ fn guild(id: Id, name: &str, owner_id: Id, extra: &[Id], my_roles: &[Id]) -> Gui
         owner_id,
         roles,
         my_roles: my_roles.to_vec(),
+        joined_at: None,
+        default_notify: Notify::All,
     }
 }
 
@@ -301,7 +306,7 @@ pub fn model() -> Model {
             (
                 2,
                 &lea,
-                "> Objectif : ouvrir en moins d'une seconde 🚀\nJ'ai testé : ||0,4 s à froid, pari tenu||",
+                "> Objectif : ouvrir en moins d'une seconde 🚀\n<@1> j'ai testé : ||0,4 s à froid, pari tenu||",
             ),
         ]),
     );
@@ -363,7 +368,55 @@ pub fn model() -> Model {
         .collect();
     // The demo's histories are whole: nothing older to load.
     model.complete = model.messages.keys().copied().collect();
+    read_states(&mut model, timeline.now);
     model
+}
+
+/// What the demo user has read. Writing a message marks a channel read,
+/// so #général is read up to his last message, and Léa's ping after it is
+/// unread. #aide is unread but muted for a few hours, #themes (never opened)
+/// makes Omarchy unread, and the group DM waits with one message.
+fn read_states(model: &mut Model, now: jiff::Timestamp) {
+    let messages = &model.messages;
+    let last = |channel: Id| messages.get(&channel).and_then(|m| m.last()).map(|m| m.id);
+    for guild in &mut model.guilds {
+        guild.joined_at = Some(now - jiff::SignedDuration::from_hours(24 * 30));
+        for channel in &mut guild.channels {
+            channel.last_message_id = last(channel.id);
+        }
+    }
+    let read = |last_read, mentions| ReadState {
+        last_read,
+        mentions,
+        flags: None,
+    };
+    let mine = |channel: Id| {
+        let messages = model.messages(channel);
+        messages
+            .iter()
+            .rev()
+            .find(|m| m.author.id == model.me)
+            .map(|m| m.id)
+    };
+    let help = model.messages(112).first().map(|m| m.id);
+    model.read_states = HashMap::from([
+        (101, read(last(101), 0)),
+        (111, read(mine(111), 1)),
+        (112, read(help, 0)),
+        (900, read(last(900), 0)),
+        (901, read(None, 1)),
+    ]);
+    let muted = ChannelSettings {
+        muted: Some(Mute {
+            until: Some(now + jiff::SignedDuration::from_hours(8)),
+        }),
+        ..ChannelSettings::default()
+    };
+    let rust = GuildSettings {
+        channels: HashMap::from([(112, muted)]),
+        ..GuildSettings::default()
+    };
+    model.guild_settings = HashMap::from([(Some(100), rust)]);
 }
 
 #[cfg(test)]
@@ -410,6 +463,22 @@ mod tests {
             let source = picture.as_ref().unwrap().proxy_url.as_deref().unwrap();
             assert!(image(source).is_some());
         }
+    }
+
+    #[test]
+    fn shows_each_kind_of_badge() {
+        let model = model();
+        let now = jiff::Timestamp::now();
+        let rust = model.guild(100).unwrap();
+        let badge = |id| model.channel_badge(rust, rust.channel(id).unwrap(), now);
+        assert!(!badge(101).unread);
+        assert!(badge(111).unread && badge(111).mentions == 1);
+        assert!(badge(112).muted && !badge(112).unread);
+        let omarchy = model.guild(200).unwrap();
+        assert!(model.guild_badge(omarchy, now).unread);
+        assert!(model.dm_badge(model.dm(901).unwrap(), now).unread);
+        assert!(!model.dm_badge(model.dm(900).unwrap(), now).unread);
+        assert_eq!(model.dm_mentions(), 1);
     }
 
     #[test]

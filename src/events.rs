@@ -8,8 +8,9 @@
 
 use crate::api::{ApiUser, optional_snowflake, snowflake};
 use crate::model::{
-    Attachment, Channel, ChannelKind, DmChannel, Embed, EmbedField, EmbedImage, Guild, Id, Message,
-    Model, Overwrite, OverwriteKind, Permissions, Role, User,
+    Attachment, Channel, ChannelKind, ChannelSettings, DmChannel, Embed, EmbedField, EmbedImage,
+    Guild, GuildSettings, Id, Message, Model, Mute, Notify, Overwrite, OverwriteKind, Permissions,
+    Ping, ReadState, Role, Unreads, User,
 };
 use serde_json::value::RawValue;
 use std::collections::HashMap;
@@ -63,7 +64,10 @@ pub enum Update {
     },
     MessageCreate {
         channel: Id,
+        /// `None` in a DM.
+        guild: Option<Id>,
         message: Message,
+        ping: Ping,
     },
     /// An edit. Each part is `None` when the edit left it alone: a link
     /// preview resolving after the message sends `embeds` only.
@@ -77,6 +81,26 @@ pub enum Update {
     MessageDelete {
         channel: Id,
         ids: Vec<Id>,
+    },
+    /// A channel read up to `message`, here or on another device.
+    Acked {
+        channel: Id,
+        message: Id,
+        /// Marked unread, which may move the position back.
+        manual: bool,
+        mentions: Option<u32>,
+        flags: Option<u32>,
+    },
+    /// My notification settings for a guild (`None`: DMs), in full.
+    GuildSettings {
+        guild: Option<Id>,
+        settings: GuildSettings,
+    },
+    /// The newest message of some channels, which Discord reports for
+    /// guilds whose messages it does not stream.
+    LastMessages {
+        guild: Id,
+        channels: Vec<(Id, Option<Id>)>,
     },
 }
 
@@ -98,6 +122,15 @@ struct WireMessage {
     attachments: Vec<WireAttachment>,
     #[serde(default, deserialize_with = "lenient")]
     embeds: Vec<WireEmbed>,
+    #[serde(default, deserialize_with = "optional_snowflake")]
+    guild_id: Option<Id>,
+    #[serde(default, deserialize_with = "lenient")]
+    mentions: Vec<WireMemberUser>,
+    /// Set only when the author was allowed to ping everyone.
+    #[serde(default)]
+    mention_everyone: bool,
+    #[serde(default)]
+    mention_roles: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -220,6 +253,20 @@ impl From<WireEmbed> for Embed {
     }
 }
 
+impl WireMessage {
+    fn ping(&self, me: Id) -> Ping {
+        Ping {
+            me: self.mentions.iter().any(|user| user.id == me),
+            everyone: self.mention_everyone,
+            roles: self
+                .mention_roles
+                .iter()
+                .filter_map(|r| r.parse().ok())
+                .collect(),
+        }
+    }
+}
+
 /// The message types shown as conversation: regular messages, replies and
 /// command invocations. Joins, pins, boosts and the other system messages
 /// come later.
@@ -312,6 +359,280 @@ struct Ready {
     private_channels: Vec<WireChannel>,
     /// A refreshed token, when Discord rotates it.
     auth_token: Option<String>,
+    /// The next three are read on their own: a shape this version does
+    /// not know costs badges, never the session.
+    read_state: Option<Box<RawValue>>,
+    user_guild_settings: Option<Box<RawValue>>,
+    notification_settings: Option<Box<RawValue>>,
+}
+
+/// The account's notification settings: only the flag that separates
+/// unreads from notifications matters here.
+#[derive(serde::Deserialize)]
+struct NotificationSettings {
+    #[serde(default)]
+    flags: u64,
+}
+
+const USE_NEW_NOTIFICATIONS: u64 = 1 << 4;
+
+/// A list Discord versions so clients can cache it, as the capabilities ask.
+#[derive(serde::Deserialize)]
+#[serde(bound = "T: serde::de::DeserializeOwned")]
+struct Versioned<T> {
+    #[serde(default, deserialize_with = "lenient")]
+    entries: Vec<T>,
+}
+
+#[derive(serde::Deserialize)]
+struct WireReadState {
+    #[serde(deserialize_with = "snowflake")]
+    id: Id,
+    /// Absent for channels. Guild events, the notification centre and
+    /// other features have read states too; fastcord shows none of them.
+    #[serde(default)]
+    read_state_type: u8,
+    #[serde(default, deserialize_with = "loose_snowflake")]
+    last_message_id: Option<Id>,
+    #[serde(default)]
+    mention_count: i64,
+    flags: Option<u32>,
+}
+
+/// A read state too odd to read but still naming its channel.
+#[derive(serde::Deserialize)]
+struct ReadStateId {
+    #[serde(deserialize_with = "snowflake")]
+    id: Id,
+    #[serde(default)]
+    read_state_type: u8,
+}
+
+#[derive(serde::Deserialize)]
+struct WireGuildSettings {
+    /// Null for the DMs' settings.
+    #[serde(default, deserialize_with = "loose_snowflake")]
+    guild_id: Option<Id>,
+    #[serde(default)]
+    muted: bool,
+    mute_config: Option<MuteConfig>,
+    message_notifications: Option<u8>,
+    #[serde(default)]
+    flags: u32,
+    #[serde(default)]
+    suppress_everyone: bool,
+    #[serde(default)]
+    suppress_roles: bool,
+    #[serde(default, deserialize_with = "lenient")]
+    channel_overrides: Vec<WireChannelOverride>,
+}
+
+#[derive(serde::Deserialize)]
+struct WireChannelOverride {
+    #[serde(deserialize_with = "snowflake")]
+    channel_id: Id,
+    #[serde(default)]
+    muted: bool,
+    mute_config: Option<MuteConfig>,
+    message_notifications: Option<u8>,
+    #[serde(default)]
+    flags: u32,
+}
+
+/// Discord's notification levels; 3 (and anything else) inherits.
+fn notify(level: Option<u8>) -> Option<Notify> {
+    match level? {
+        0 => Some(Notify::All),
+        1 => Some(Notify::Mentions),
+        2 => Some(Notify::Nothing),
+        _ => None,
+    }
+}
+
+/// The unread setting in a settings `flags` field, whose bits differ
+/// between guilds and channels.
+fn unreads(flags: u32, all: u32, mentions: u32) -> Option<Unreads> {
+    if flags & all != 0 {
+        Some(Unreads::All)
+    } else if flags & mentions != 0 {
+        Some(Unreads::Mentions)
+    } else {
+        None
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MuteConfig {
+    /// When a temporary mute ends; null for good.
+    end_time: Option<String>,
+}
+
+/// A mute, when `muted`. Discord keeps a temporary mute's `muted` set once
+/// it has ended: only its end time says it is over.
+fn mute(muted: bool, config: Option<MuteConfig>) -> Option<Mute> {
+    muted.then(|| Mute {
+        until: config
+            .and_then(|c| c.end_time)
+            .and_then(|end| end.parse().ok()),
+    })
+}
+
+impl WireGuildSettings {
+    fn settings(self) -> (Option<Id>, GuildSettings) {
+        let channels = self
+            .channel_overrides
+            .into_iter()
+            .map(|o| {
+                let settings = ChannelSettings {
+                    muted: mute(o.muted, o.mute_config),
+                    notify: notify(o.message_notifications),
+                    unreads: unreads(o.flags, 1 << 10, 1 << 9),
+                };
+                (o.channel_id, settings)
+            })
+            .collect();
+        let settings = GuildSettings {
+            muted: mute(self.muted, self.mute_config),
+            notify: notify(self.message_notifications),
+            unreads: unreads(self.flags, 1 << 11, 1 << 12),
+            suppress_everyone: self.suppress_everyone,
+            suppress_roles: self.suppress_roles,
+            channels,
+        };
+        (self.guild_id, settings)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct MessageAck {
+    #[serde(deserialize_with = "snowflake")]
+    channel_id: Id,
+    #[serde(deserialize_with = "snowflake")]
+    message_id: Id,
+    /// Absent for channels, as in read states.
+    #[serde(default)]
+    ack_type: u8,
+    #[serde(default)]
+    manual: bool,
+    mention_count: Option<i64>,
+    flags: Option<u32>,
+}
+
+/// PASSIVE_UPDATE_V1/V2 and CHANNEL_UNREAD_UPDATE: one shape under three
+/// names.
+#[derive(serde::Deserialize)]
+struct ChannelUnreads {
+    #[serde(deserialize_with = "snowflake")]
+    guild_id: Id,
+    #[serde(
+        default,
+        alias = "channels",
+        alias = "channel_unread_updates",
+        deserialize_with = "lenient"
+    )]
+    updated_channels: Vec<ChannelUnread>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChannelUnread {
+    #[serde(deserialize_with = "snowflake")]
+    id: Id,
+    #[serde(default, deserialize_with = "optional_snowflake")]
+    last_message_id: Option<Id>,
+}
+
+/// A versioned list's entries, or `None` (logged) when the list itself is
+/// in a shape this version does not know.
+fn versioned<T: serde::de::DeserializeOwned>(raw: Option<&RawValue>) -> Option<Vec<T>> {
+    match serde_json::from_str::<Versioned<T>>(raw?.get()) {
+        Ok(list) => Some(list.entries),
+        Err(error) => {
+            log::warn!(
+                "unreadable {}: {}",
+                std::any::type_name::<T>(),
+                crate::backend::describe(&error)
+            );
+            None
+        }
+    }
+}
+
+/// READY's channel read states. A channel whose read state is missing
+/// because its entry, or the whole list, could not be read counts as read
+/// up to its newest message: a lost badge beats marking every channel
+/// unread since I joined.
+fn read_states(raw: Option<&RawValue>, model: &Model) -> HashMap<Id, ReadState> {
+    let read_to_newest = |id: Id| {
+        let newest = match model.dm(id) {
+            Some(dm) => dm.last_message_id,
+            None => {
+                model
+                    .guilds
+                    .iter()
+                    .find_map(|g| g.channel(id))?
+                    .last_message_id
+            }
+        };
+        Some((
+            id,
+            ReadState {
+                last_read: newest,
+                ..ReadState::default()
+            },
+        ))
+    };
+    let Some(entries) = versioned::<Box<RawValue>>(raw) else {
+        let channels = model
+            .guilds
+            .iter()
+            .flat_map(|g| g.channels.iter().map(|c| c.id));
+        return channels
+            .chain(model.dms.iter().map(|d| d.id))
+            .filter_map(read_to_newest)
+            .collect();
+    };
+    entries
+        .iter()
+        .filter_map(
+            |raw| match serde_json::from_str::<WireReadState>(raw.get()) {
+                Ok(r) => (r.read_state_type == CHANNEL_READ_STATE).then(|| {
+                    let state = ReadState {
+                        last_read: r.last_message_id,
+                        mentions: count(r.mention_count),
+                        flags: r.flags,
+                    };
+                    (r.id, state)
+                }),
+                Err(_) => serde_json::from_str::<ReadStateId>(raw.get())
+                    .ok()
+                    .filter(|r| r.read_state_type == CHANNEL_READ_STATE)
+                    .and_then(|r| read_to_newest(r.id)),
+            },
+        )
+        .collect()
+}
+
+/// A snowflake read states send as a string, or as the number 0 for none.
+fn loose_snowflake<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Id>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Loose {
+        Text(String),
+        Number(u64),
+    }
+    let id = match serde::Deserialize::deserialize(deserializer)? {
+        Some(Loose::Text(text)) => text.parse().map_err(serde::de::Error::custom)?,
+        Some(Loose::Number(number)) => number,
+        None => 0,
+    };
+    Ok(Some(id).filter(|&id| id != 0))
+}
+
+/// Discord's counts are never negative; a bad one counts as none.
+fn count(count: i64) -> u32 {
+    count.clamp(0, u32::MAX.into()) as u32
 }
 
 #[derive(serde::Deserialize)]
@@ -335,6 +656,8 @@ struct WireGuild {
     /// GUILD_CREATE's members: the signed-in one is there.
     #[serde(default, deserialize_with = "lenient")]
     members: Vec<WireMember>,
+    /// When I joined.
+    joined_at: Option<String>,
 }
 
 /// GUILD_UPDATE: the fields that changed, top level or under `properties`.
@@ -414,6 +737,8 @@ struct GuildProperties {
     name: String,
     #[serde(deserialize_with = "snowflake")]
     owner_id: Id,
+    #[serde(default)]
+    default_message_notifications: u8,
 }
 
 #[derive(serde::Deserialize)]
@@ -574,6 +899,9 @@ fn channel_kind(kind: u8) -> Option<ChannelKind> {
 const DM: u8 = 1;
 const GROUP_DM: u8 = 3;
 
+/// The read state type of a channel's messages.
+const CHANNEL_READ_STATE: u8 = 0;
+
 /// Reads events into [`Update`]s, remembering the users READY listed so
 /// later events can name people by id.
 #[derive(Default)]
@@ -599,6 +927,7 @@ impl Decoder {
             id: wire.id,
             parent: wire.parent_id,
             position: wire.position,
+            last_message_id: wire.last_message_id,
             overwrites: wire
                 .permission_overwrites
                 .into_iter()
@@ -652,6 +981,9 @@ impl Decoder {
             owner_id: properties.owner_id,
             roles: wire.roles.into_iter().map(Role::from).collect(),
             my_roles,
+            joined_at: wire.joined_at.and_then(|at| at.parse().ok()),
+            default_notify: notify(Some(properties.default_message_notifications))
+                .unwrap_or(Notify::All),
             channels: wire
                 .channels
                 .into_iter()
@@ -699,7 +1031,7 @@ impl Decoder {
         if unreadable > 0 {
             log::warn!("skipped {unreadable} unreadable guilds in READY");
         }
-        let model = Model {
+        let mut model = Model {
             me,
             guilds,
             users: self.users.clone(),
@@ -708,8 +1040,18 @@ impl Decoder {
                 .into_iter()
                 .filter_map(|wire| self.dm(wire))
                 .collect(),
+            guild_settings: versioned::<WireGuildSettings>(ready.user_guild_settings.as_deref())
+                .unwrap_or_default()
+                .into_iter()
+                .map(WireGuildSettings::settings)
+                .collect(),
+            separate_unreads: ready
+                .notification_settings
+                .and_then(|raw| serde_json::from_str::<NotificationSettings>(raw.get()).ok())
+                .is_some_and(|s| s.flags & USE_NEW_NOTIFICATIONS != 0),
             ..Model::default()
         };
+        model.read_states = read_states(ready.read_state.as_deref(), &model);
         Ok((model, ready.auth_token))
     }
 
@@ -792,10 +1134,16 @@ impl Decoder {
                 if !shown(wire.kind) {
                     return Ok(Vec::new());
                 }
-                let channel = wire.channel_id;
+                let (channel, guild) = (wire.channel_id, wire.guild_id);
+                let ping = wire.ping(self.me);
                 let message = Message::from(wire);
                 self.users.insert(message.author.id, message.author.clone());
-                vec![Update::MessageCreate { channel, message }]
+                vec![Update::MessageCreate {
+                    channel,
+                    guild,
+                    message,
+                    ping,
+                }]
             }
             "MESSAGE_UPDATE" => {
                 let change: MessageChange = serde_json::from_str(data)?;
@@ -832,6 +1180,35 @@ impl Decoder {
                     }],
                     None => vec![Update::DmRemove(wire.id)],
                 }
+            }
+            "MESSAGE_ACK" => {
+                let ack: MessageAck = serde_json::from_str(data)?;
+                if ack.ack_type != CHANNEL_READ_STATE {
+                    return Ok(Vec::new());
+                }
+                vec![Update::Acked {
+                    channel: ack.channel_id,
+                    message: ack.message_id,
+                    manual: ack.manual,
+                    mentions: ack.mention_count.map(count),
+                    flags: ack.flags,
+                }]
+            }
+            "USER_GUILD_SETTINGS_UPDATE" => {
+                let wire: WireGuildSettings = serde_json::from_str(data)?;
+                let (guild, settings) = wire.settings();
+                vec![Update::GuildSettings { guild, settings }]
+            }
+            "PASSIVE_UPDATE_V1" | "PASSIVE_UPDATE_V2" | "CHANNEL_UNREAD_UPDATE" => {
+                let unreads: ChannelUnreads = serde_json::from_str(data)?;
+                vec![Update::LastMessages {
+                    guild: unreads.guild_id,
+                    channels: unreads
+                        .updated_channels
+                        .into_iter()
+                        .map(|c| (c.id, c.last_message_id))
+                        .collect(),
+                }]
             }
             _ => Vec::new(),
         })
@@ -1266,7 +1643,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             &created[..],
-            [Update::MessageCreate { channel: 7, message }] if message.content == "salut"
+            [Update::MessageCreate { channel: 7, guild: Some(1), message, .. }] if message.content == "salut"
         ));
         assert_eq!(decoder.user(5).display_name(), "Sam");
         assert_eq!(
@@ -1295,6 +1672,202 @@ mod tests {
                 channel: 7,
                 ids: vec![40, 41]
             }]
+        );
+    }
+
+    #[test]
+    fn reads_channel_read_states_and_mutes() {
+        let (_, model, _) = ready();
+        let guild = model.guild(1001).unwrap();
+        assert_eq!(
+            guild.joined_at,
+            Some("2024-01-01T00:00:00Z".parse().unwrap())
+        );
+        assert_eq!(
+            guild.channel(2002).unwrap().last_message_id,
+            Some(175928847299117063)
+        );
+        // Guild events and the notification centre are not channels.
+        let mut ids: Vec<Id> = model.read_states.keys().copied().collect();
+        ids.sort();
+        assert_eq!(ids, [2002, 2004, 3001]);
+        assert_eq!(
+            model.read_states[&2002],
+            ReadState {
+                last_read: Some(175928847299117063),
+                mentions: 2,
+                flags: Some(1),
+            }
+        );
+        assert_eq!(model.read_states[&2004].last_read, None, "0 is none");
+        let settings = &model.guild_settings[&Some(1001)];
+        assert_eq!(
+            settings.muted,
+            Some(Mute {
+                until: Some("2026-10-08T09:00:00Z".parse().unwrap())
+            })
+        );
+        assert_eq!(settings.notify, Some(Notify::Mentions));
+        assert_eq!(
+            settings.channels[&2001],
+            ChannelSettings {
+                muted: Some(Mute { until: None }),
+                notify: None,
+                unreads: Some(Unreads::All),
+            }
+        );
+        assert_eq!(settings.channels[&2004].notify, Some(Notify::Mentions));
+        assert!(model.guild_settings[&None].channels[&3002].muted.is_some());
+        assert!(model.separate_unreads);
+        assert_eq!(guild.default_notify, Notify::Mentions);
+    }
+
+    #[test]
+    fn unreadable_read_states_count_as_read() {
+        let ready = |read_state: &str| {
+            format!(
+                r#"{{"user":{{"id":"9000","username":"imbu"}},
+                "guilds":[{{"id":"1","joined_at":"2024-01-01T00:00:00+00:00","properties":{{"name":"G","owner_id":"9"}},
+                    "channels":[{{"id":"5","type":0,"last_message_id":"900000000000000000"}},{{"id":"6","type":0,"last_message_id":"900000000000000001"}}]}}],
+                "read_state":{read_state}}}"#
+            )
+        };
+        let read = |text: &str| {
+            Decoder::default()
+                .ready(&ready(text))
+                .unwrap()
+                .0
+                .read_states
+        };
+        // An entry in an odd shape: its channel is read up to its newest.
+        let states = read(
+            r#"{"entries":[{"id":"5","mention_count":"many"},{"id":"6","last_message_id":"1","mention_count":1}]}"#,
+        );
+        assert_eq!(states[&5].last_read, Some(900000000000000000));
+        assert_eq!(states[&6].mentions, 1);
+        // The whole list in an odd shape: every channel is.
+        let states = read(r#"[1, 2]"#);
+        assert_eq!(states[&6].last_read, Some(900000000000000001));
+    }
+
+    #[test]
+    fn acks_and_settings_from_other_devices() {
+        let mut decoder = Decoder::default();
+        assert_eq!(
+            decoder
+                .event(
+                    "MESSAGE_ACK",
+                    r#"{"channel_id":"2002","message_id":"175928847299117070","version":12,"last_viewed":4200,"flags":null}"#,
+                )
+                .unwrap(),
+            [Update::Acked {
+                channel: 2002,
+                message: 175928847299117070,
+                manual: false,
+                mentions: None,
+                flags: None,
+            }]
+        );
+        assert_eq!(
+            decoder
+                .event(
+                    "MESSAGE_ACK",
+                    r#"{"channel_id":"2002","message_id":"175928847299117000","manual":true,"mention_count":3,"version":13}"#,
+                )
+                .unwrap(),
+            [Update::Acked {
+                channel: 2002,
+                message: 175928847299117000,
+                manual: true,
+                mentions: Some(3),
+                flags: None,
+            }]
+        );
+        // Another feature's read state.
+        assert_eq!(
+            decoder
+                .event(
+                    "MESSAGE_ACK",
+                    r#"{"ack_type":1,"channel_id":"1001","message_id":"1","version":14}"#
+                )
+                .unwrap(),
+            []
+        );
+        let updated = decoder
+            .event(
+                "USER_GUILD_SETTINGS_UPDATE",
+                r#"{"guild_id":"1001","muted":false,"mute_config":null,"suppress_everyone":true,"channel_overrides":[{"channel_id":"2002","muted":true,"mute_config":{"end_time":null,"selected_time_window":-1}}],"version":4}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            updated,
+            [Update::GuildSettings {
+                guild: Some(1001),
+                settings: GuildSettings {
+                    channels: HashMap::from([(
+                        2002,
+                        ChannelSettings {
+                            muted: Some(Mute { until: None }),
+                            ..ChannelSettings::default()
+                        }
+                    )]),
+                    suppress_everyone: true,
+                    ..GuildSettings::default()
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn newest_messages_of_guilds_not_streamed() {
+        let mut decoder = Decoder::default();
+        let expected = [Update::LastMessages {
+            guild: 1001,
+            channels: vec![(2002, Some(175928847299117070)), (2004, None)],
+        }];
+        let channels = r#"[{"id":"2002","last_message_id":"175928847299117070","last_pin_timestamp":null},{"id":"2004","last_message_id":null}]"#;
+        assert_eq!(
+            decoder
+                .event(
+                    "PASSIVE_UPDATE_V2",
+                    &format!(
+                        r#"{{"guild_id":"1001","updated_channels":{channels},"updated_voice_states":[],"removed_voice_states":[],"updated_members":[]}}"#
+                    ),
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            decoder
+                .event(
+                    "CHANNEL_UNREAD_UPDATE",
+                    &format!(r#"{{"guild_id":"1001","channel_unread_updates":{channels}}}"#),
+                )
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn messages_say_whom_they_ping() {
+        let (mut decoder, _, _) = ready();
+        let created = decoder
+            .event(
+                "MESSAGE_CREATE",
+                r#"{"id":"50","channel_id":"2002","guild_id":"1001","type":19,"content":"<@9000> @everyone <@&1050>","author":{"id":"9001","username":"marc"},"mentions":[{"id":"9000","username":"imbu"}],"mention_everyone":true,"mention_roles":["1050"]}"#,
+            )
+            .unwrap();
+        let [Update::MessageCreate { guild, ping, .. }] = &created[..] else {
+            panic!("expected a message");
+        };
+        assert_eq!(*guild, Some(1001));
+        assert_eq!(
+            *ping,
+            Ping {
+                me: true,
+                everyone: true,
+                roles: vec![1050],
+            }
         );
     }
 

@@ -213,7 +213,7 @@ fn next_delay(delay: Duration, established: bool) -> Duration {
 
 /// A serde error without the text it quotes: a message's content can be in
 /// it, and logs never hold message content.
-fn describe(error: &serde_json::Error) -> String {
+pub fn describe(error: &serde_json::Error) -> String {
     format!(
         "{:?} error at line {} column {}",
         error.classify(),

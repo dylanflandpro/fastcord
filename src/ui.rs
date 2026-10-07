@@ -6,7 +6,9 @@ use crate::app::{self, App, HistoryStatus, ScrollAnchor, Selection, View};
 use crate::backend::{Command, Link};
 use crate::markdown::{self, Action, Block, Content, Directory, Span, Style};
 use crate::media::{self, Media, Picture, Shown};
-use crate::model::{self, Attachment, ChannelKind, Embed, EmbedField, Entry, Id, Message, Model};
+use crate::model::{
+    self, Attachment, Badge, ChannelKind, Embed, EmbedField, Entry, Id, Message, Model,
+};
 use crate::theme::{self, Icon, Palette};
 use egui::cache::{ComputerMut, FrameCache};
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -113,10 +115,21 @@ fn rail(selection: &mut Selection, model: &Model, palette: &Palette, ui: &mut eg
         )
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
+            let now = jiff::Timestamp::now();
             let dms = selection.view == View::DirectMessages;
-            if guild_button(ui, palette, GuildMark::Icon(Icon::MessageCircle), dms)
-                .on_hover_text("Direct messages")
-                .clicked()
+            let dm_badge = Badge {
+                mentions: model.dm_mentions(),
+                ..Badge::default()
+            };
+            if guild_button(
+                ui,
+                palette,
+                GuildMark::Icon(Icon::MessageCircle),
+                dms,
+                dm_badge,
+            )
+            .on_hover_text("Direct messages")
+            .clicked()
             {
                 selection.open_direct_messages(model);
             }
@@ -129,6 +142,7 @@ fn rail(selection: &mut Selection, model: &Model, palette: &Palette, ui: &mut eg
                         palette,
                         GuildMark::Initials(&initials(&guild.name)),
                         selected,
+                        model.guild_badge(guild, now),
                     )
                     .on_hover_text(&guild.name)
                     .clicked()
@@ -150,8 +164,21 @@ fn guild_button(
     palette: &Palette,
     mark: GuildMark<'_>,
     selected: bool,
+    badge: Badge,
 ) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(GUILD_SIZE), Sense::click());
+    // Discord's pill on the rail's edge: tall when selected, half that on
+    // hover, a dot when unread.
+    let pill = if selected {
+        Some(40.0)
+    } else if response.hovered() {
+        Some(20.0)
+    } else {
+        badge.unread.then_some(8.0)
+    };
+    if let Some(height) = pill {
+        edge_pill(ui, palette, rect, rect.left() - 12.0, height);
+    }
     let active = selected || response.hovered();
     // A circle that squares off when selected or hovered, as Discord's does.
     let radius = if active { 14 } else { (GUILD_SIZE / 2.0) as u8 };
@@ -177,7 +204,54 @@ fn guild_button(
             );
         }
     }
+    if badge.mentions > 0 {
+        mention_pill(ui, palette, rect.right_bottom(), badge.mentions, true);
+    }
     response
+}
+
+/// The white mark that sits on a list's left `edge`, half hidden, beside
+/// `row`.
+fn edge_pill(ui: &egui::Ui, palette: &Palette, row: Rect, edge: f32, height: f32) {
+    let clip = ui.clip_rect();
+    let mut painter = ui.painter().clone();
+    painter.set_clip_rect(Rect::from_x_y_ranges(
+        edge..=row.right(),
+        row.top().max(clip.top())..=row.bottom().min(clip.bottom()),
+    ));
+    let pill = Rect::from_center_size(egui::pos2(edge, row.center().y), Vec2::new(8.0, height));
+    painter.rect_filled(pill, CornerRadius::same(4), palette.text);
+}
+
+/// Discord's red count of unread mentions, its bottom-right corner at
+/// `corner`. `ring` circles it in the panel's colour, which cuts it out of
+/// a server icon. Returns the pill's rectangle.
+fn mention_pill(
+    ui: &egui::Ui,
+    palette: &Palette,
+    corner: egui::Pos2,
+    count: u32,
+    ring: bool,
+) -> Rect {
+    let galley = ui.painter().layout_no_wrap(
+        model::badge_count(count),
+        theme::bold(12.0),
+        palette.on_accent,
+    );
+    let size = Vec2::new((galley.size().x + 10.0).max(16.0), 16.0);
+    let pill = Rect::from_min_max(corner - size, corner);
+    if ring {
+        ui.painter()
+            .rect_filled(pill.expand(3.0), CornerRadius::same(11), palette.panel);
+    }
+    ui.painter()
+        .rect_filled(pill, CornerRadius::same(8), palette.danger);
+    ui.painter().galley(
+        pill.center() - galley.size() / 2.0,
+        galley,
+        palette.on_accent,
+    );
+    pill
 }
 
 /// Up to three initials, as Discord shows a server without an icon.
@@ -219,6 +293,7 @@ fn sidebar(selection: &mut Selection, model: &Model, palette: &Palette, ui: &mut
                 .auto_shrink(false)
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
+                    let now = jiff::Timestamp::now();
                     match selection.view {
                         View::DirectMessages => {
                             for dm in model.dms_by_recency() {
@@ -229,6 +304,7 @@ fn sidebar(selection: &mut Selection, model: &Model, palette: &Palette, ui: &mut
                                     Some(Icon::MessageCircle),
                                     &dm.title(),
                                     selected,
+                                    model.dm_badge(dm, now),
                                 )
                                 .clicked()
                                 {
@@ -257,8 +333,15 @@ fn sidebar(selection: &mut Selection, model: &Model, palette: &Palette, ui: &mut
                                             ChannelKind::Text | ChannelKind::Category => Icon::Hash,
                                         };
                                         let selected = selection.channel == Some(channel.id);
-                                        let response =
-                                            row(ui, palette, Some(icon), &channel.name, selected);
+                                        let badge = model.channel_badge(guild, channel, now);
+                                        let response = row(
+                                            ui,
+                                            palette,
+                                            Some(icon),
+                                            &channel.name,
+                                            selected,
+                                            badge,
+                                        );
                                         // Voice comes after the first version.
                                         if response.clicked() && channel.kind != ChannelKind::Voice
                                         {
@@ -279,9 +362,15 @@ fn row(
     icon: Option<Icon>,
     text: &str,
     selected: bool,
+    badge: Badge,
 ) -> Response {
     let (rect, mut response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), ROW_HEIGHT), Sense::click());
+    // Unread: a white mark on the sidebar's edge and a bright, bolder name.
+    // Muted: a dimmed name. As the official client draws them.
+    if badge.unread && !selected {
+        edge_pill(ui, palette, rect, rect.left() - 8.0, 8.0);
+    }
     let fill = if selected {
         Some(palette.surface_active)
     } else if response.hovered() {
@@ -292,11 +381,18 @@ fn row(
     if let Some(fill) = fill {
         ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
     }
-    let ink = if selected {
+    let ink = if selected || badge.unread {
         palette.text
+    } else if badge.muted {
+        palette.dim
     } else {
         palette.secondary
     };
+    let mut right = rect.right() - 8.0;
+    if badge.mentions > 0 {
+        let corner = egui::pos2(right, rect.center().y + 8.0);
+        right = mention_pill(ui, palette, corner, badge.mentions, false).left() - 6.0;
+    }
     let mut x = rect.left() + 8.0;
     if let Some(icon) = icon {
         let size = 18.0;
@@ -310,8 +406,13 @@ fn row(
         x += size + 8.0;
     }
     // One line, cut with "…" at the row's edge; the full text shows on hover.
-    let mut job = LayoutJob::simple_singleline(text.to_owned(), theme::regular(14.0), ink);
-    job.wrap = TextWrapping::truncate_at_width(rect.right() - 8.0 - x);
+    let font = if badge.unread {
+        theme::semibold(14.0)
+    } else {
+        theme::regular(14.0)
+    };
+    let mut job = LayoutJob::simple_singleline(text.to_owned(), font, ink);
+    job.wrap = TextWrapping::truncate_at_width(right - x);
     let galley = ui.painter().layout_job(job);
     let elided = galley.elided;
     let top = rect.center().y - galley.size().y / 2.0;

@@ -22,7 +22,8 @@
       "lazy": true,
       "large": false,
       "member_count": 42,
-      "properties": { "id": "1001", "name": "Rust Francophone", "owner_id": "9001", "icon": null, "features": [] },
+      "joined_at": "2024-01-01T00:00:00.000000+00:00",
+      "properties": { "id": "1001", "name": "Rust Francophone", "owner_id": "9001", "icon": null, "features": [], "default_message_notifications": 1 },
       "roles": [
         { "id": "1001", "name": "@everyone", "position": 0, "permissions": "104324673", "color": 0 }
       ],
@@ -51,7 +52,22 @@
     [ { "user_id": "9000", "roles": [], "joined_at": "2024-01-01T00:00:00+00:00" } ],
     []
   ],
-  "read_state": { "version": 1, "partial": false, "entries": [ { "id": "2002", "last_message_id": "175928847299117063", "mention_count": 0 } ] },
-  "user_guild_settings": { "version": 1, "partial": false, "entries": [] },
+  "read_state": { "version": 1, "partial": false, "entries": [
+    { "id": "2002", "last_message_id": "175928847299117063", "mention_count": 2, "last_pin_timestamp": "1970-01-01T00:00:00+00:00", "flags": 1, "last_viewed": 4200 },
+    { "id": "2004", "last_message_id": 0, "mention_count": 0 },
+    { "id": "3001", "last_message_id": "175928847299117000", "mention_count": 1, "flags": 0 },
+    { "id": "1001", "read_state_type": 1, "last_acked_id": "175928847299117063", "badge_count": 3 },
+    { "id": "9000", "read_state_type": 2, "last_acked_id": "175928847299117063", "badge_count": 1 }
+  ] },
+  "user_guild_settings": { "version": 7, "partial": false, "entries": [
+    { "guild_id": "1001", "muted": true, "mute_config": { "end_time": "2026-10-08T09:00:00.000000+00:00", "selected_time_window": 28800 }, "message_notifications": 1, "suppress_everyone": false, "suppress_roles": false, "flags": 0, "version": 3,
+      "channel_overrides": [
+        { "channel_id": "2001", "muted": true, "mute_config": { "end_time": null, "selected_time_window": -1 }, "message_notifications": 3, "flags": 5120, "collapsed": false },
+        { "channel_id": "2004", "muted": false, "mute_config": null, "message_notifications": 1, "collapsed": false }
+      ] },
+    { "guild_id": null, "muted": false, "mute_config": null, "message_notifications": 0, "version": 1,
+      "channel_overrides": [ { "channel_id": "3002", "muted": true, "mute_config": null, "message_notifications": 3, "collapsed": false } ] }
+  ] },
+  "notification_settings": { "flags": 16 },
   "relationships": []
 }
