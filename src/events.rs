@@ -56,6 +56,9 @@ pub enum Update {
     History {
         channel: Id,
         messages: Vec<Message>,
+        /// The oldest message the page held, shown or not: where the next
+        /// page starts.
+        oldest: Option<Id>,
         complete: bool,
     },
     MessageCreate {
@@ -109,18 +112,35 @@ impl From<WireMessage> for Message {
 }
 
 /// A page of history as the API returns it (newest first), oldest first.
+///
+/// Completeness and where the next page starts count every entry Discord
+/// sent: system messages and entries this version cannot read are left
+/// out of `messages` but still move the cursor, or a run of joins would
+/// ask for the same page forever.
 pub fn history(channel: Id, body: &str) -> serde_json::Result<Update> {
-    let wires: Vec<WireMessage> = lenient(&mut serde_json::Deserializer::from_str(body))?;
-    let complete = wires.len() < PAGE;
-    let mut messages: Vec<Message> = wires
-        .into_iter()
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        #[serde(deserialize_with = "snowflake")]
+        id: Id,
+    }
+    let raw: Vec<Box<RawValue>> = serde_json::from_str(body)?;
+    let complete = raw.len() < PAGE;
+    let oldest = raw
+        .iter()
+        .filter_map(|entry| serde_json::from_str::<Entry>(entry.get()).ok())
+        .map(|entry| entry.id)
+        .min();
+    let mut messages: Vec<Message> = raw
+        .iter()
+        .filter_map(|entry| serde_json::from_str::<WireMessage>(entry.get()).ok())
         .filter(|wire| shown(wire.kind))
         .map(Message::from)
         .collect();
-    messages.reverse();
+    messages.sort_by_key(|m| m.id);
     Ok(Update::History {
         channel,
         messages,
+        oldest,
         complete,
     })
 }
@@ -940,6 +960,7 @@ mod tests {
         let Update::History {
             channel,
             messages,
+            oldest,
             complete,
         } = history(7, body).unwrap()
         else {
@@ -951,6 +972,31 @@ mod tests {
         assert_eq!(ids, [10, 30]);
         assert_eq!(messages[1].author.display_name(), "Léa");
         assert!(complete, "fewer than a page means the start is reached");
+        assert_eq!(oldest, Some(5), "the cursor counts what is not shown");
+    }
+
+    #[test]
+    fn a_full_page_with_unreadable_entries_is_not_the_start() {
+        let entry = |id: usize| {
+            format!(
+                r#"{{"id":"{id}","channel_id":"7","type":7,"content":"","author":{{"id":"3","username":"m"}}}}"#
+            )
+        };
+        let mut entries: Vec<String> = (100..100 + PAGE - 1).map(entry).collect();
+        entries.push(r#"{"id":"99","odd":true}"#.into());
+        let body = format!("[{}]", entries.join(","));
+        let Update::History {
+            messages,
+            oldest,
+            complete,
+            ..
+        } = history(7, &body).unwrap()
+        else {
+            panic!("expected history");
+        };
+        assert!(messages.is_empty(), "joins only");
+        assert!(!complete, "a full page, readable or not");
+        assert_eq!(oldest, Some(99));
     }
 
     #[test]

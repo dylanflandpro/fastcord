@@ -118,6 +118,26 @@ struct Experiments {
     fingerprint: Option<String>,
 }
 
+/// How many times a rate-limited request is retried, and the longest wait
+/// accepted between tries.
+const RATE_LIMIT_RETRIES: u32 = 2;
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
+
+#[derive(serde::Deserialize)]
+struct RateLimited {
+    /// Seconds, fractional.
+    retry_after: f64,
+}
+
+/// The wait Discord asked for, within reason.
+fn retry_after(seconds: f64) -> Duration {
+    if seconds.is_finite() && seconds > 0.0 {
+        Duration::from_secs_f64(seconds).min(MAX_RETRY_AFTER)
+    } else {
+        Duration::from_millis(500)
+    }
+}
+
 /// A user as Discord sends one.
 #[derive(serde::Deserialize)]
 pub struct ApiUser {
@@ -392,10 +412,14 @@ impl Api {
 
     /// A page of a channel's history, newest first as Discord sends it:
     /// the latest messages, or those just before `before`.
+    ///
+    /// Rate limits are waited out, up to [`RATE_LIMIT_RETRIES`] times and
+    /// [`MAX_RETRY_AFTER`] each, as Discord's `retry_after` asks.
     pub async fn messages(
         &self,
         token: &Token,
         channel: Id,
+        guild: Option<Id>,
         before: Option<Id>,
     ) -> Result<String, Error> {
         let mut url = format!(
@@ -406,16 +430,36 @@ impl Api {
             url.push_str(&format!("&before={before}"));
         }
         let web = self.web().await;
-        let response = Self::dress(
-            self.client
-                .get(url)
-                .header(reqwest::header::AUTHORIZATION, token.expose()),
-            &web,
-            &format!("/channels/@me/{channel}"),
-        )
-        .send()
-        .await
-        .map_err(|_| Error::Network)?;
+        // The page the web client would be on.
+        let page = match guild {
+            Some(guild) => format!("/channels/{guild}/{channel}"),
+            None => format!("/channels/@me/{channel}"),
+        };
+        let mut retries = 0;
+        let response = loop {
+            let response = Self::dress(
+                self.client
+                    .get(&url)
+                    .header(reqwest::header::AUTHORIZATION, token.expose()),
+                &web,
+                &page,
+            )
+            .send()
+            .await
+            .map_err(|_| Error::Network)?;
+            if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS
+                || retries == RATE_LIMIT_RETRIES
+            {
+                break response;
+            }
+            retries += 1;
+            let wait = response
+                .json::<RateLimited>()
+                .await
+                .map_or(MAX_RETRY_AFTER, |limited| retry_after(limited.retry_after));
+            log::info!("rate limited; retrying in {} ms", wait.as_millis());
+            tokio::time::sleep(wait).await;
+        };
         match response.status() {
             status if status.is_success() => response.text().await.map_err(|_| Error::Network),
             reqwest::StatusCode::UNAUTHORIZED => Err(Error::Unauthorized),
@@ -489,6 +533,14 @@ mod tests {
         assert_eq!(header("X-Captcha-Key"), "solved");
         assert_eq!(header("X-Captcha-Rqtoken"), "t");
         assert_eq!(header("X-Captcha-Session-Id"), "s");
+    }
+
+    #[test]
+    fn rate_limit_waits_stay_reasonable() {
+        assert_eq!(retry_after(1.5), Duration::from_millis(1500));
+        assert_eq!(retry_after(3600.0), MAX_RETRY_AFTER);
+        assert_eq!(retry_after(-1.0), Duration::from_millis(500));
+        assert_eq!(retry_after(f64::NAN), Duration::from_millis(500));
     }
 
     #[test]

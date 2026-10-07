@@ -2,7 +2,7 @@
 
 mod sign_in;
 
-use crate::app::{App, HistoryStatus, Selection, View};
+use crate::app::{self, App, HistoryStatus, ScrollAnchor, Selection, View};
 use crate::backend::{Command, Link};
 use crate::markdown::{self, Action, Block, Content, Directory, Span, Style};
 use crate::model::{self, ChannelKind, Entry, Id, Message, Model};
@@ -397,23 +397,35 @@ fn conversation(
             if let Some(offset) = ui.data_mut(|d| d.remove_temp::<f32>(anchor.with("offset"))) {
                 area = area.vertical_scroll_offset(offset);
             }
+            let first = messages.first().map(|m| m.id);
             // One scroll position per channel, so each opens where it was left.
             let output = area.show(ui, |ui| {
-                if complete {
-                    beginning(ui, palette, &channel_title(model, selection.view, channel));
-                } else {
-                    match status {
-                        HistoryStatus::Loading => {
-                            ui.vertical_centered(|ui| ui.spinner());
-                        }
-                        HistoryStatus::Failed => {
-                            if failed(ui, palette, "Couldn't load older messages.") {
-                                request = Some(HistoryRequest::Retry(channel));
+                // One row of fixed height for the beginning, the spinner or
+                // a failure, so they never change the height the anchor
+                // compares.
+                let row = egui::vec2(ui.available_width(), TOP_ROW);
+                ui.allocate_ui_with_layout(
+                    row,
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_size(row);
+                        if complete {
+                            beginning(ui, palette, &channel_title(model, selection.view, channel));
+                        } else {
+                            match status {
+                                HistoryStatus::Loading => {
+                                    ui.spinner();
+                                }
+                                HistoryStatus::Failed => {
+                                    if failed(ui, palette, "Couldn't load older messages.") {
+                                        request = Some(HistoryRequest::Retry(channel));
+                                    }
+                                }
+                                HistoryStatus::Idle => {}
                             }
                         }
-                        HistoryStatus::Idle => {}
-                    }
-                }
+                    },
+                );
                 if messages.is_empty() && complete {
                     return;
                 }
@@ -425,14 +437,21 @@ fn conversation(
             });
             let height = output.content_size.y;
             let at_top = output.state.offset.y <= 1.0;
-            let was = ui.data(|d| d.get_temp::<f32>(anchor));
-            if let Some(was) = was
-                && height > was
-                && at_top
+            if let Some(before) = ui.data(|d| d.get_temp::<ScrollAnchor>(anchor))
+                && let Some(offset) = app::anchored_offset(before, first, height)
             {
-                ui.data_mut(|d| d.insert_temp(anchor.with("offset"), height - was));
+                ui.data_mut(|d| d.insert_temp(anchor.with("offset"), offset));
             }
-            ui.data_mut(|d| d.insert_temp(anchor, height));
+            ui.data_mut(|d| {
+                d.insert_temp(
+                    anchor,
+                    ScrollAnchor {
+                        first,
+                        height,
+                        offset: output.state.offset.y,
+                    },
+                )
+            });
             // At the top, or a first page too short to scroll: the page
             // before, until the channel's first message is in.
             let fills = height > output.inner_rect.height();
@@ -442,6 +461,10 @@ fn conversation(
         });
     request
 }
+
+/// The height of the row above the messages: the beginning, a spinner or a
+/// failure with its button.
+const TOP_ROW: f32 = 56.0;
 
 /// Where a channel's history begins, as the official client marks it.
 fn beginning(ui: &mut egui::Ui, palette: &Palette, title: &str) {

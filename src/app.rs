@@ -129,6 +129,8 @@ pub struct App {
     loading_history: HashSet<Id>,
     /// Channels whose last page failed; they wait for Try again.
     failed_history: HashSet<Id>,
+    /// Messages that arrived while their channel's first page was loading.
+    early_messages: HashMap<Id, Vec<Update>>,
 }
 
 /// What the conversation shows above or instead of its messages.
@@ -146,8 +148,32 @@ pub fn history_wanted(model: &Model, channel: Id, older: bool) -> Option<Option<
     match model.messages.get(&channel) {
         None => Some(None),
         Some(_) if !older || model.complete.contains(&channel) => None,
-        Some(loaded) => loaded.first().map(|oldest| Some(oldest.id)),
+        Some(loaded) => model
+            .cursors
+            .get(&channel)
+            .copied()
+            .or(loaded.first().map(|m| m.id))
+            .map(Some),
     }
+}
+
+/// Where the conversation stood after a frame, to keep it in place when an
+/// older page lands above what is on screen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollAnchor {
+    /// The oldest message loaded then.
+    pub first: Option<Id>,
+    pub height: f32,
+    pub offset: f32,
+}
+
+/// The offset that keeps what was on screen in place, as the official
+/// client does: only when the oldest loaded message changed (an older page
+/// landed above) does the offset grow by the height added. A message at the
+/// bottom, a re-wrap or the first page leave it alone.
+pub fn anchored_offset(before: ScrollAnchor, first: Option<Id>, height: f32) -> Option<f32> {
+    let older_page = before.first.is_some() && first < before.first;
+    (older_page && height > before.height).then_some(before.offset + height - before.height)
 }
 
 impl App {
@@ -183,6 +209,7 @@ impl App {
             first_palette: true,
             loading_history: HashSet::new(),
             failed_history: HashSet::new(),
+            early_messages: HashMap::new(),
         }
     }
 
@@ -224,16 +251,31 @@ impl App {
     /// spinner until the backend answers, so the button cannot be pressed
     /// twice.
     pub fn send(&mut self, command: Command) {
+        if self.backend.is_none() {
+            return;
+        }
+        // Logging out takes the account off screen at once, not once
+        // Discord and the keyring have answered.
+        if matches!(command, Command::LogOut) {
+            self.forget_account();
+        }
+        let session = matches!(command, Command::Retry | Command::LogOut);
         if let Some(backend) = &self.backend {
-            // Logging out takes the account off screen at once, not once
-            // Discord and the keyring have answered.
-            if matches!(command, Command::LogOut) {
-                self.model = None;
-            }
             backend.send(command);
+        }
+        if session {
             self.session = Session::Checking;
             self.qr = None;
         }
+    }
+
+    /// Drops the account's model and what was on its way for it: requests in
+    /// flight die with the session, so nothing would ever clear them.
+    fn forget_account(&mut self) {
+        self.model = None;
+        self.loading_history.clear();
+        self.failed_history.clear();
+        self.early_messages.clear();
     }
 
     /// Where the open channel's history stands.
@@ -260,7 +302,12 @@ impl App {
             return;
         }
         if let Some(before) = history_wanted(model, channel, older) {
-            backend.send(Command::LoadHistory { channel, before });
+            let guild = model.guild_of(channel);
+            backend.send(Command::LoadHistory {
+                channel,
+                guild,
+                before,
+            });
             self.loading_history.insert(channel);
         }
     }
@@ -274,7 +321,8 @@ impl App {
         let Some(backend) = &self.backend else {
             return;
         };
-        for event in backend.events() {
+        let events: Vec<Event> = backend.events().collect();
+        for event in events {
             match event {
                 Event::Session(session) => {
                     self.qr = match &session {
@@ -284,20 +332,18 @@ impl App {
                     // Signed out, or signing in again: nothing of the last
                     // account stays on screen.
                     if !matches!(session, Session::SignedIn(_)) {
-                        self.model = None;
+                        self.forget_account();
                     }
                     self.session = session;
                 }
                 Event::Link(link) => self.link = link,
-                Event::Ready(mut model) => {
-                    // A new session after a reconnect keeps what was open,
-                    // and the history already loaded, when it still exists.
-                    match self.model.take() {
-                        Some(old) => {
-                            model.messages = old.messages;
-                            self.selection.repair(&model);
-                        }
-                        None => self.selection = Selection::initial(Some(&model)),
+                Event::Ready(model) => {
+                    // A new session after a reconnect missed what happened
+                    // meanwhile: histories load again rather than stay
+                    // silently incomplete. What was open stays open.
+                    match self.model.is_some() {
+                        true => self.selection.repair(&model),
+                        false => self.selection = Selection::initial(Some(&model)),
                     }
                     self.model = Some(model);
                 }
@@ -306,11 +352,31 @@ impl App {
                     self.failed_history.insert(channel);
                 }
                 Event::Update(update) => {
-                    if let Update::History { channel, .. } = &update {
-                        self.loading_history.remove(channel);
+                    // A message arriving while its channel's first page loads
+                    // may be newer than the page: keep it for after.
+                    if let Update::MessageCreate { channel, .. } = &update
+                        && self.loading_history.contains(channel)
+                        && self
+                            .model
+                            .as_ref()
+                            .is_some_and(|m| !m.messages.contains_key(channel))
+                    {
+                        let channel = *channel;
+                        self.early_messages.entry(channel).or_default().push(update);
+                        continue;
+                    }
+                    let landed = match &update {
+                        Update::History { channel, .. } => Some(*channel),
+                        _ => None,
+                    };
+                    if let Some(channel) = landed {
+                        self.loading_history.remove(&channel);
                     }
                     if let Some(model) = &mut self.model {
                         model.apply(update);
+                        if let Some(early) = landed.and_then(|c| self.early_messages.remove(&c)) {
+                            early.into_iter().for_each(|update| model.apply(update));
+                        }
                         self.selection.repair(model);
                     }
                 }
@@ -345,25 +411,54 @@ mod tests {
 
     #[test]
     fn history_is_asked_for_once_then_page_by_page_to_the_start() {
-        let mut model = Model::default();
-        assert_eq!(history_wanted(&model, 7, false), Some(None));
+        let mut model = crate::demo::model();
+        let messages = model.messages.remove(&111).unwrap();
+        model.complete.clear();
+        assert_eq!(history_wanted(&model, 111, false), Some(None));
+        let oldest = messages[0].id;
         model.apply(Update::History {
-            channel: 7,
-            messages: crate::demo::model().messages[&111].clone(),
+            channel: 111,
+            messages,
+            oldest: Some(oldest - 5),
             complete: false,
         });
-        assert_eq!(history_wanted(&model, 7, false), None);
-        let oldest = model.messages(7)[0].id;
-        assert_eq!(history_wanted(&model, 7, true), Some(Some(oldest)));
-        model.complete.insert(7);
-        assert_eq!(history_wanted(&model, 7, true), None);
-        // An empty channel, once loaded, has nothing older either.
+        assert_eq!(history_wanted(&model, 111, false), None);
+        // The page before starts below the oldest fetched entry, shown or not.
+        assert_eq!(history_wanted(&model, 111, true), Some(Some(oldest - 5)));
+        model.complete.insert(111);
+        assert_eq!(history_wanted(&model, 111, true), None);
+    }
+
+    #[test]
+    fn an_older_page_keeps_the_view_in_place() {
+        let before = ScrollAnchor {
+            first: Some(100),
+            height: 1000.0,
+            offset: 12.0,
+        };
+        assert_eq!(anchored_offset(before, Some(40), 1600.0), Some(612.0));
+        // A message at the bottom, a re-wrap: nothing moves.
+        assert_eq!(anchored_offset(before, Some(100), 1100.0), None);
+        // The first page.
+        let empty = ScrollAnchor {
+            first: None,
+            ..before
+        };
+        assert_eq!(anchored_offset(empty, Some(40), 1600.0), None);
+    }
+
+    #[test]
+    fn a_page_of_system_messages_still_moves_on() {
+        let mut model = crate::demo::model();
+        model.messages.remove(&112);
+        model.complete.clear();
         model.apply(Update::History {
-            channel: 8,
+            channel: 112,
             messages: vec![],
+            oldest: Some(500),
             complete: false,
         });
-        assert_eq!(history_wanted(&model, 8, true), None);
+        assert_eq!(history_wanted(&model, 112, true), Some(Some(500)));
     }
 
     #[test]

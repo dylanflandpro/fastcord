@@ -309,6 +309,9 @@ pub struct Model {
     pub messages: HashMap<Id, Vec<Message>>,
     /// Channels whose history is loaded back to the first message.
     pub complete: HashSet<Id>,
+    /// Per channel, the oldest message fetched, shown or not: where the next
+    /// page of history starts.
+    pub cursors: HashMap<Id, Id>,
 }
 
 impl Model {
@@ -330,6 +333,25 @@ impl Model {
     pub fn messages(&self, channel: Id) -> &[Message] {
         self.messages.get(&channel).map_or(&[], Vec::as_slice)
     }
+
+    /// The guild a channel belongs to; `None` for DMs and unknown channels.
+    pub fn guild_of(&self, channel: Id) -> Option<Id> {
+        self.guilds
+            .iter()
+            .find(|g| g.channel(channel).is_some())
+            .map(|g| g.id)
+    }
+
+    fn knows_channel(&self, channel: Id) -> bool {
+        self.guild_of(channel).is_some() || self.dm(channel).is_some()
+    }
+
+    /// Drops what was loaded for a channel that went away.
+    fn forget_history(&mut self, channel: Id) {
+        self.messages.remove(&channel);
+        self.complete.remove(&channel);
+        self.cursors.remove(&channel);
+    }
     /// Applies a change the gateway reported after READY.
     pub fn apply(&mut self, update: crate::events::Update) {
         use crate::events::Update;
@@ -348,7 +370,13 @@ impl Model {
                     }
                 }
             }
-            Update::GuildRemove(id) => self.guilds.retain(|g| g.id != id),
+            Update::GuildRemove(id) => {
+                if let Some(guild) = self.guild(id) {
+                    let channels: Vec<Id> = guild.channels.iter().map(|c| c.id).collect();
+                    channels.into_iter().for_each(|c| self.forget_history(c));
+                }
+                self.guilds.retain(|g| g.id != id);
+            }
             Update::ChannelUpsert { guild, channel } => {
                 if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
                     match guild.channels.iter_mut().find(|c| c.id == channel.id) {
@@ -380,7 +408,7 @@ impl Model {
                 if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
                     guild.channels.retain(|c| c.id != channel);
                 }
-                self.messages.remove(&channel);
+                self.forget_history(channel);
             }
             Update::DmUpsert(dm) => match self.dms.iter_mut().find(|d| d.id == dm.id) {
                 Some(existing) => *existing = dm,
@@ -389,8 +417,17 @@ impl Model {
             Update::History {
                 channel,
                 messages,
+                oldest,
                 complete,
             } => {
+                // A page for a channel deleted while it loaded.
+                if !self.knows_channel(channel) {
+                    return;
+                }
+                if let Some(oldest) = oldest {
+                    let cursor = self.cursors.entry(channel).or_insert(oldest);
+                    *cursor = (*cursor).min(oldest);
+                }
                 for message in &messages {
                     self.users.insert(message.author.id, message.author.clone());
                 }
@@ -437,7 +474,7 @@ impl Model {
             }
             Update::DmRemove(id) => {
                 self.dms.retain(|d| d.id != id);
-                self.messages.remove(&id);
+                self.forget_history(id);
             }
         }
     }
@@ -813,22 +850,42 @@ mod tests {
     #[test]
     fn history_pages_merge_in_order() {
         use crate::events::Update;
-        let mut model = Model::default();
+        let mut model = Model {
+            dms: vec![DmChannel {
+                id: 7,
+                recipients: vec![],
+                last_message_id: None,
+            }],
+            ..Model::default()
+        };
         assert!(!model.messages.contains_key(&7));
         model.apply(Update::History {
             channel: 7,
             messages: vec![said(30, 1, "c"), said(40, 2, "d")],
+            oldest: Some(30),
             complete: false,
         });
         // An older page, overlapping by one message.
         model.apply(Update::History {
             channel: 7,
             messages: vec![said(10, 1, "a"), said(30, 1, "c")],
+            oldest: Some(10),
             complete: true,
         });
         let ids: Vec<Id> = model.messages(7).iter().map(|m| m.id).collect();
         assert_eq!(ids, [10, 30, 40]);
         assert!(model.complete.contains(&7));
+        assert_eq!(model.cursors[&7], 10);
+        model.apply(Update::DmRemove(7));
+        assert!(!model.complete.contains(&7) && !model.cursors.contains_key(&7));
+        // A page landing after its channel went away is dropped.
+        model.apply(Update::History {
+            channel: 7,
+            messages: vec![said(1, 1, "late")],
+            oldest: Some(1),
+            complete: true,
+        });
+        assert!(!model.messages.contains_key(&7));
         assert!(model.users.contains_key(&2), "authors become known users");
     }
 
@@ -851,6 +908,7 @@ mod tests {
         model.apply(Update::History {
             channel: 8,
             messages: vec![said(5, 1, "old")],
+            oldest: Some(5),
             complete: true,
         });
         model.apply(Update::MessageCreate {

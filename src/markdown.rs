@@ -8,7 +8,7 @@
 //! (`***a***` is italic around bold); and the same wording for mentions it
 //! cannot resolve and for timestamps.
 
-use crate::model::{Id, Model};
+use crate::model::{Id, Model, User};
 use std::collections::HashMap;
 
 /// A message's text, block by block.
@@ -192,10 +192,12 @@ impl<'a> Directory<'a> {
     /// recipients, authors seen so far), DM recipients and the channel's
     /// authors. The official client also reads each message's `mentions`.
     pub fn new(model: &'a Model, channel: Id) -> Self {
+        // The model's users are looked up in place; only the few people
+        // the model may not list yet are gathered here.
         let users = model
-            .users
-            .values()
-            .chain(model.dms.iter().flat_map(|dm| &dm.recipients))
+            .dms
+            .iter()
+            .flat_map(|dm| &dm.recipients)
             .chain(model.messages(channel).iter().map(|m| &m.author))
             .map(|user| (user.id, user.display_name()))
             .collect();
@@ -205,7 +207,11 @@ impl<'a> Directory<'a> {
 
 impl Names for Directory<'_> {
     fn user(&self, id: Id) -> Option<&str> {
-        self.users.get(&id).copied()
+        self.model
+            .users
+            .get(&id)
+            .map(User::display_name)
+            .or_else(|| self.users.get(&id).copied())
     }
 
     fn channel(&self, id: Id) -> Option<&str> {
