@@ -17,6 +17,7 @@ mod notify;
 mod outbox;
 mod remote_auth;
 mod theme;
+mod typing;
 mod ui;
 mod websocket;
 

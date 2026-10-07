@@ -41,9 +41,13 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         rail(selection, model, &palette, ui);
         sidebar(selection, model, &palette, ui);
         let state = &mut app.composer;
-        let composed = selection
-            .channel
-            .map(|channel| (channel, composer(channel, model, state, &palette, ui)));
+        let composed = selection.channel.map(|channel| {
+            let typing = typing_line(model, &app.typing, channel);
+            (
+                channel,
+                composer(channel, model, state, typing, &palette, ui),
+            )
+        });
         let writing = Writing {
             editing: &mut app.composer.editing,
             notes: &app.notes,
@@ -68,6 +72,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     viewer(&mut app.media, &palette, ui);
     confirm_delete(app, &palette, ui);
     if let Some((channel, composed)) = composed {
+        if composed.typed {
+            app.typed(channel);
+        }
         if composed.send {
             app.send_draft(channel);
         }
@@ -228,11 +235,24 @@ fn reply_bar(
     }
 }
 
+/// Who is typing in `channel`, worded for the line under the composer.
+fn typing_line(model: &Model, typing: &crate::typing::Others, channel: Id) -> Option<String> {
+    let ids = typing.who(channel, std::time::Instant::now());
+    let names: Vec<&str> = ids
+        .iter()
+        .filter_map(|id| model.users.get(id))
+        .map(model::User::display_name)
+        .collect();
+    crate::typing::line(&names)
+}
+
 /// What the composer was asked this frame.
 #[derive(Debug, Default, PartialEq)]
 struct Composed {
     /// Enter.
     send: bool,
+    /// The draft changed.
+    typed: bool,
     /// Up in an empty draft: edit my last message.
     edit_last: bool,
 }
@@ -251,6 +271,7 @@ fn composer(
     channel: Id,
     model: &Model,
     state: &mut Composer,
+    typing: Option<String>,
     palette: &Palette,
     ui: &mut egui::Ui,
 ) -> Composed {
@@ -259,7 +280,7 @@ fn composer(
         left: 16,
         right: 16,
         top: 0,
-        bottom: 20,
+        bottom: 2,
     };
     egui::Panel::bottom("composer")
         .show_separator_line(false)
@@ -341,6 +362,7 @@ fn composer(
                 }
                 if edit.changed() {
                     state.notice = None;
+                    composed.typed = true;
                 }
                 if let Some(left) = crate::compose::counter(draft) {
                     let color = if left < 0 {
@@ -355,6 +377,16 @@ fn composer(
                                 .color(color),
                         );
                     });
+                }
+            });
+            // Kept even when empty, so the conversation does not jump.
+            let row = egui::vec2(ui.available_width(), 20.0);
+            let layout = egui::Layout::left_to_right(egui::Align::Center);
+            ui.allocate_ui_with_layout(row, layout, |ui| {
+                ui.set_min_size(row);
+                if let Some(typing) = typing {
+                    let text = egui::RichText::new(typing).font(theme::regular(12.0));
+                    ui.label(text.color(palette.secondary));
                 }
             });
         });
@@ -2436,7 +2468,7 @@ mod tests {
     ) -> Composed {
         let mut composed = Composed::default();
         frame(ctx, events, |ui| {
-            composed = composer(channel, model, state, &Palette::dark(), ui);
+            composed = composer(channel, model, state, None, &Palette::dark(), ui);
         });
         composed
     }
@@ -2450,7 +2482,7 @@ mod tests {
         // Opening the channel focuses the composer: typing goes there.
         assert!(!compose(&ctx, &model, &mut state, 111, vec![]));
         let typed = vec![egui::Event::Text("salut".into())];
-        assert!(!compose(&ctx, &model, &mut state, 111, typed));
+        assert!(compose_all(&ctx, &model, &mut state, 111, typed).typed);
         let shift = key(egui::Key::Enter, egui::Modifiers::SHIFT);
         assert!(!compose(&ctx, &model, &mut state, 111, vec![shift]));
         assert_eq!(state.drafts[&111], "salut\n");

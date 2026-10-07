@@ -88,6 +88,11 @@ pub enum Update {
         channel: Id,
         ids: Vec<Id>,
     },
+    /// Someone started typing, or still is.
+    TypingStart {
+        channel: Id,
+        user: User,
+    },
     /// A channel read up to `message`, here or on another device.
     Acked {
         channel: Id,
@@ -532,6 +537,22 @@ impl From<MessageChange> for Update {
             edited: change.edited_timestamp.is_some(),
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+struct TypingStart {
+    #[serde(deserialize_with = "snowflake")]
+    channel_id: Id,
+    #[serde(deserialize_with = "snowflake")]
+    user_id: Id,
+    /// In guilds: the member, with the user in full.
+    #[serde(default, deserialize_with = "lenient_one")]
+    member: Option<TypingMember>,
+}
+
+#[derive(serde::Deserialize)]
+struct TypingMember {
+    user: ApiUser,
 }
 
 /// The API's answer to an edit of mine: the message as Discord stored it.
@@ -1511,6 +1532,17 @@ impl Decoder {
             "MESSAGE_UPDATE" => {
                 let change: MessageChange = serde_json::from_str(data)?;
                 vec![change.into()]
+            }
+            "TYPING_START" => {
+                let typing: TypingStart = serde_json::from_str(data)?;
+                let user = match typing.member {
+                    Some(member) => User::from(member.user),
+                    None => self.user(typing.user_id),
+                };
+                vec![Update::TypingStart {
+                    channel: typing.channel_id,
+                    user,
+                }]
             }
             "MESSAGE_DELETE" | "MESSAGE_DELETE_BULK" => {
                 let deleted: MessageDelete = serde_json::from_str(data)?;
@@ -2882,6 +2914,32 @@ mod tests {
         // A crosspost or a forward carries a reference too, but is no reply.
         let crosspost = reply(&original).replace(r#""type":19"#, r#""type":0"#);
         assert_eq!(read(&mut decoder, &crosspost), None);
+    }
+
+    #[test]
+    fn typing_names_its_typist() {
+        let (mut decoder, _, _) = ready();
+        let typing = decoder
+            .event(
+                "TYPING_START",
+                r#"{"channel_id":"7","guild_id":"1","user_id":"6","timestamp":1,"member":{"user":{"id":"6","username":"lea","global_name":"Léa"},"roles":[]}}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            &typing[..],
+            [Update::TypingStart { channel: 7, user }] if user.display_name() == "Léa"
+        ));
+        // In a DM, the user is known by id, from READY's users.
+        let typing = decoder
+            .event(
+                "TYPING_START",
+                r#"{"channel_id":"8","user_id":"9002","timestamp":1}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            &typing[..],
+            [Update::TypingStart { channel: 8, user }] if user.display_name() == "Léa"
+        ));
     }
 
     #[test]

@@ -625,6 +625,9 @@ pub struct App {
     /// Why an edit or a deletion of mine did not go through, under the
     /// message, by channel and id, until the next try on it.
     pub notes: HashMap<(Id, Id), String>,
+    /// Who is typing where, and when to say that I am.
+    pub typing: crate::typing::Others,
+    my_typing: crate::typing::Mine,
     /// Messages whose answer was lost, as channel and nonce, since when.
     unsure: HashMap<(Id, Id), Instant>,
     /// When the gateway last showed it was alive (connected, or answered a
@@ -726,6 +729,8 @@ impl App {
             alive_at: None,
             confirm_delete: None,
             notes: HashMap::new(),
+            typing: Default::default(),
+            my_typing: Default::default(),
         }
     }
 
@@ -849,6 +854,8 @@ impl App {
         self.unsure.clear();
         self.confirm_delete = None;
         self.notes.clear();
+        self.typing = Default::default();
+        self.my_typing.stop();
     }
 
     /// Enter in the composer.
@@ -857,7 +864,64 @@ impl App {
             return;
         };
         if let Some(outgoing) = self.composer.send(model, channel, jiff::Timestamp::now()) {
+            self.my_typing.stop();
             self.post(outgoing);
+        }
+    }
+
+    /// The draft changed: typing goes on, or stops once it is empty.
+    pub fn typed(&mut self, channel: Id) {
+        let empty = self
+            .composer
+            .drafts
+            .get(&channel)
+            .is_none_or(String::is_empty);
+        match empty {
+            true => self.my_typing.stop(),
+            false => self.my_typing.keystroke(channel, Instant::now()),
+        }
+    }
+
+    /// Tells Discord I am typing when it is due (not in a crowd, as the web
+    /// client), and wakes up for the next change in who is typing.
+    fn follow_typing(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        self.my_typing.follow(self.selection.channel);
+        self.typing.prune(now);
+        if let Some(channel) = self.my_typing.due(now)
+            && let (Some(model), Some(backend)) = (&self.model, &self.backend)
+            && self.typing.who(channel, now).len() <= crate::typing::CROWD
+        {
+            backend.send(Command::Typing(place(model, channel)));
+        }
+        let next = [self.typing.next_change(now), self.my_typing.next_change()];
+        if let Some(next) = next.into_iter().flatten().min() {
+            ctx.request_repaint_after(next.saturating_duration_since(now));
+        }
+    }
+
+    /// Keeps who is typing: someone starts (never me), or their message
+    /// arrives. `true` when the update was only about typing.
+    fn follow_typists(&mut self, update: &Update) -> bool {
+        let now = Instant::now();
+        match update {
+            Update::TypingStart { channel, user } => {
+                if let Some(model) = &mut self.model
+                    && user.id != model.me
+                {
+                    self.typing.start(*channel, user.id, now);
+                    // Someone who has not written yet still gets a name.
+                    model.users.entry(user.id).or_insert_with(|| user.clone());
+                }
+                true
+            }
+            Update::MessageCreate {
+                channel, message, ..
+            } => {
+                self.typing.stop(*channel, message.author.id);
+                false
+            }
+            _ => false,
         }
     }
 
@@ -1192,6 +1256,9 @@ impl App {
                 }
             }
             Event::Update(update) => {
+                if self.follow_typists(&update) {
+                    return;
+                }
                 self.confirm(&update);
                 // A message arriving while its channel's first page loads
                 // may be newer than the page: keep it for after.
@@ -1309,6 +1376,7 @@ impl eframe::App for App {
         self.drop_unreadable_acks();
         self.deliver_demo(ctx);
         self.settle_unsure();
+        self.follow_typing(ctx);
         if let Some(channel) = self.selection.channel {
             self.request_history(channel, false);
         }
@@ -1841,6 +1909,43 @@ mod tests {
             .unwrap();
         reply.original = Original::Unknown;
         assert!(edited(&mut composer, &model));
+    }
+
+    #[test]
+    fn others_typing_show_until_their_message_never_me() {
+        let mut app = demo_app();
+        let user = |id| crate::model::User {
+            id,
+            ..Default::default()
+        };
+        let start = |id| Update::TypingStart {
+            channel: 111,
+            user: user(id),
+        };
+        assert!(app.follow_typists(&start(1)), "me");
+        assert!(app.follow_typists(&start(2)));
+        assert!(app.follow_typists(&start(77)));
+        let model = app.model.as_ref().unwrap();
+        assert!(
+            model.users.contains_key(&77),
+            "a typist not met yet gets a name"
+        );
+        let now = Instant::now();
+        assert_eq!(app.typing.who(111, now), [2, 77]);
+        let message = model.messages(111)[2].clone();
+        assert_eq!(message.author.id, 2);
+        let created = Update::MessageCreate {
+            channel: 111,
+            guild: Some(100),
+            message,
+            ping: crate::model::Ping::default(),
+            nonce: None,
+        };
+        assert!(
+            !app.follow_typists(&created),
+            "the message itself still applies"
+        );
+        assert_eq!(app.typing.who(111, now), [77]);
     }
 
     #[test]
