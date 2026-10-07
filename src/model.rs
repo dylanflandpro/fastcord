@@ -293,7 +293,7 @@ pub fn starts_group(previous: Option<&Message>, message: &Message) -> bool {
         || created_at(message.id).duration_since(created_at(previous.id)) > GROUP_WINDOW
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub struct Model {
     /// The signed-in user.
     pub me: Id,
@@ -321,6 +321,45 @@ impl Model {
 
     pub fn messages(&self, channel: Id) -> &[Message] {
         self.messages.get(&channel).map_or(&[], Vec::as_slice)
+    }
+    /// Applies a change the gateway reported after READY.
+    pub fn apply(&mut self, update: crate::events::Update) {
+        use crate::events::Update;
+        match update {
+            Update::Ready(model) => *self = model,
+            Update::GuildUpsert(guild) => match self.guilds.iter_mut().find(|g| g.id == guild.id) {
+                Some(existing) => *existing = guild,
+                None => self.guilds.push(guild),
+            },
+            Update::GuildRename { id, name } => {
+                if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == id) {
+                    guild.name = name;
+                }
+            }
+            Update::GuildRemove(id) => self.guilds.retain(|g| g.id != id),
+            Update::ChannelUpsert { guild, channel } => {
+                if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
+                    match guild.channels.iter_mut().find(|c| c.id == channel.id) {
+                        Some(existing) => *existing = channel,
+                        None => guild.channels.push(channel),
+                    }
+                }
+            }
+            Update::ChannelRemove { guild, channel } => {
+                if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
+                    guild.channels.retain(|c| c.id != channel);
+                }
+                self.messages.remove(&channel);
+            }
+            Update::DmUpsert(dm) => match self.dms.iter_mut().find(|d| d.id == dm.id) {
+                Some(existing) => *existing = dm,
+                None => self.dms.push(dm),
+            },
+            Update::DmRemove(id) => {
+                self.dms.retain(|d| d.id != id);
+                self.messages.remove(&id);
+            }
+        }
     }
 }
 
@@ -598,6 +637,64 @@ mod tests {
         assert!(!starts_group(Some(&first), &message(at(7), 1)));
         assert!(starts_group(Some(&first), &message(at(8), 1)));
         assert!(starts_group(Some(&first), &message(at(1), 2)));
+    }
+
+    #[test]
+    fn applies_guild_and_channel_changes() {
+        use crate::events::Update;
+        let mut model = Model {
+            guilds: vec![Guild {
+                id: 1,
+                name: "g".into(),
+                channels: vec![channel(10, ChannelKind::Text, None, 0)],
+            }],
+            ..Model::default()
+        };
+        model.apply(Update::ChannelUpsert {
+            guild: 1,
+            channel: Channel {
+                name: "renamed".into(),
+                ..channel(10, ChannelKind::Text, None, 0)
+            },
+        });
+        model.apply(Update::ChannelUpsert {
+            guild: 1,
+            channel: channel(11, ChannelKind::Voice, None, 1),
+        });
+        assert_eq!(model.guild(1).unwrap().channels.len(), 2);
+        assert_eq!(model.guild(1).unwrap().channel(10).unwrap().name, "renamed");
+        model.apply(Update::ChannelRemove {
+            guild: 1,
+            channel: 10,
+        });
+        assert!(model.guild(1).unwrap().channel(10).is_none());
+        model.apply(Update::GuildRename {
+            id: 1,
+            name: "h".into(),
+        });
+        assert_eq!(model.guild(1).unwrap().name, "h");
+        model.apply(Update::GuildRemove(1));
+        assert!(model.guilds.is_empty());
+    }
+
+    #[test]
+    fn applies_dm_changes() {
+        use crate::events::Update;
+        let mut model = Model::default();
+        let dm = DmChannel {
+            id: 5,
+            recipients: vec![],
+            last_message_id: None,
+        };
+        model.apply(Update::DmUpsert(dm.clone()));
+        model.apply(Update::DmUpsert(DmChannel {
+            last_message_id: Some(9),
+            ..dm
+        }));
+        assert_eq!(model.dms.len(), 1);
+        assert_eq!(model.dm(5).unwrap().last_message_id, Some(9));
+        model.apply(Update::DmRemove(5));
+        assert!(model.dms.is_empty());
     }
 
     #[test]

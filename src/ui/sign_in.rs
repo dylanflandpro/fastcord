@@ -54,15 +54,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         );
                     }
                     Session::SignedIn(user) => {
-                        title(
-                            ui,
-                            &palette,
-                            &format!("Signed in as {}", user.display_name()),
-                        );
+                        ui.spinner();
+                        ui.add_space(12.0);
                         secondary(
                             ui,
                             &palette,
-                            "Servers and messages arrive with the next version.",
+                            &format!("Loading {}'s servers…", user.display_name()),
                         );
                         ui.add_space(20.0);
                         if ui.button("Log out").clicked() {

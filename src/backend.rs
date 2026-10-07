@@ -1,13 +1,16 @@
 //! Everything that talks to Discord or the keyring, on its own thread.
 //!
-//! The interface sends [`Command`]s and reads the [`Session`] it reports; it never waits on
-//! the network. Each change asks the window for a repaint.
+//! The interface sends [`Command`]s and reads the [`Event`]s it reports; it
+//! never waits on the network. Each event asks the window for a repaint.
 
 use crate::api::{self, Api};
 use crate::credentials::{self, Token};
+use crate::events::{Decoder, Update};
+use crate::gateway::{self, End, Gateway};
 use crate::model::User;
 use crate::remote_auth::{self, Progress};
 use std::sync::mpsc;
+use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 #[derive(Debug)]
@@ -36,16 +39,32 @@ pub enum Session {
     Failed(String),
 }
 
+/// The live connection's state, shown while signed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    Connecting,
+    Connected,
+    /// Lost; the next attempt is on its way.
+    Reconnecting,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Event {
+    Session(Session),
+    Link(Link),
+    Update(Update),
+}
+
 pub struct Backend {
     commands: UnboundedSender<Command>,
-    events: mpsc::Receiver<Session>,
+    events: mpsc::Receiver<Event>,
 }
 
 impl Backend {
     pub fn start(ctx: egui::Context) -> Self {
         let (commands, receiver) = unbounded_channel();
         let (sender, events) = mpsc::channel();
-        let emit = move |event: Session| {
+        let emit = move |event: Event| {
             if sender.send(event).is_ok() {
                 ctx.request_repaint();
             }
@@ -63,7 +82,7 @@ impl Backend {
                 // The panic itself is in the panic log; the window must not
                 // keep waiting on a backend that is gone.
                 if std::panic::catch_unwind(session).is_err() {
-                    emit(Session::Stopped);
+                    emit(Event::Session(Session::Stopped));
                 }
             })
             .expect("the backend thread");
@@ -74,24 +93,24 @@ impl Backend {
         let _ = self.commands.send(command);
     }
 
-    pub fn events(&self) -> impl Iterator<Item = Session> + '_ {
+    pub fn events(&self) -> impl Iterator<Item = Event> + '_ {
         self.events.try_iter()
     }
 }
 
-type Emit<'a> = &'a (dyn Fn(Session) + Send + Sync);
+type Emit<'a> = &'a (dyn Fn(Event) + Send + Sync);
 
 /// Restore or sign in, stay signed in until logged out, then start over.
 /// Returns when the window is gone.
 async fn session(mut commands: UnboundedReceiver<Command>, emit: Emit<'_>) {
     let api = Api::new();
     loop {
-        emit(Session::Checking);
+        emit(Event::Session(Session::Checking));
         let signed_in = match restore(&api).await {
             Ok(Some(signed_in)) => Some(signed_in),
             Ok(None) => sign_in(&api, emit).await,
             Err(message) => {
-                emit(Session::Failed(message));
+                emit(Event::Session(Session::Failed(message)));
                 None
             }
         };
@@ -101,18 +120,142 @@ async fn session(mut commands: UnboundedReceiver<Command>, emit: Emit<'_>) {
             }
             continue;
         };
-        emit(Session::SignedIn(user));
-        if !wait_for(&mut commands, |c| matches!(c, Command::LogOut)).await {
-            return;
+        emit(Event::Session(Session::SignedIn(user)));
+        let mut token = token;
+        let ended = tokio::select! {
+            ended = stay_connected(&api, &mut token, emit) => Some(ended),
+            logged_out = wait_for(&mut commands, |c| matches!(c, Command::LogOut)) => {
+                if !logged_out {
+                    return;
+                }
+                None
+            }
+        };
+        match ended {
+            Some(Ended::Revoked) => {
+                log::info!("Discord no longer accepts the session; signing in again");
+                if let Err(error) = blocking(credentials::delete).await {
+                    emit(Event::Session(Session::Failed(keyring_message(error))));
+                    if !wait_for(&mut commands, |c| matches!(c, Command::Retry)).await {
+                        return;
+                    }
+                }
+                continue;
+            }
+            Some(Ended::Refused(code)) => {
+                emit(Event::Session(Session::Failed(format!(
+                    "Discord refused the connection (code {code})."
+                ))));
+                if !wait_for(&mut commands, |c| matches!(c, Command::Retry)).await {
+                    return;
+                }
+                continue;
+            }
+            None => {}
         }
         // Until the token is gone, trying again means logging out again,
         // never signing back in with what is left in the keyring.
         while let Err(error) = log_out(&api, &token).await {
-            emit(Session::Failed(error));
+            emit(Event::Session(Session::Failed(error)));
             if !wait_for(&mut commands, |c| matches!(c, Command::Retry)).await {
                 return;
             }
         }
+    }
+}
+
+/// Why the live connection stopped for good.
+#[derive(Debug, PartialEq)]
+enum Ended {
+    /// Discord no longer accepts the token.
+    Revoked,
+    /// Discord refuses this client (a close code retrying cannot fix).
+    Refused(u16),
+}
+
+/// The first delay before reconnecting, and the longest: doubled after each
+/// connection that failed before it was established.
+const MIN_DELAY: Duration = Duration::from_secs(1);
+const MAX_DELAY: Duration = Duration::from_secs(60);
+
+fn next_delay(delay: Duration, established: bool) -> Duration {
+    if established {
+        MIN_DELAY
+    } else {
+        (delay * 2).min(MAX_DELAY)
+    }
+}
+
+/// A serde error without the text it quotes: a message's content can be in
+/// it, and logs never hold message content.
+fn describe(error: &serde_json::Error) -> String {
+    format!(
+        "{:?} error at line {} column {}",
+        error.classify(),
+        error.line(),
+        error.column()
+    )
+}
+
+/// Keeps the gateway connected and reports what it delivers, reconnecting
+/// with growing delays, until Discord ends the session for good. A token
+/// Discord rotates replaces `token`, in the keyring too.
+async fn stay_connected(api: &Api, token: &mut Token, emit: Emit<'_>) -> Ended {
+    let properties = api.client_properties().await;
+    let mut gateway = Gateway::default();
+    let mut decoder = Decoder::default();
+    let mut delay = MIN_DELAY;
+    emit(Event::Link(Link::Connecting));
+    loop {
+        let mut established = false;
+        let mut refreshed = None;
+        let end = gateway::connect(
+            &mut gateway,
+            token,
+            &properties,
+            &mut |name, data| {
+                let data = data.get();
+                if name == "READY" {
+                    match decoder.ready(data) {
+                        Ok((model, auth_token)) => {
+                            refreshed = auth_token;
+                            emit(Event::Update(Update::Ready(model)));
+                        }
+                        Err(error) => log::warn!("unreadable READY: {}", describe(&error)),
+                    }
+                    return;
+                }
+                match decoder.event(name, data) {
+                    Ok(updates) => updates
+                        .into_iter()
+                        .for_each(|update| emit(Event::Update(update))),
+                    Err(error) => log::warn!("unreadable {name}: {}", describe(&error)),
+                }
+            },
+            &mut || {
+                established = true;
+                emit(Event::Link(Link::Connected));
+            },
+        )
+        .await;
+        if let Some(fresh) = refreshed.take() {
+            log::info!("Discord rotated the session token");
+            *token = Token::new(fresh);
+            let saved = Token::new(token.expose().to_owned());
+            if let Err(error) = blocking(move || credentials::save(&saved)).await {
+                log::warn!("the rotated token could not be saved: {error}");
+            }
+        }
+        match end {
+            End::AuthenticationFailed => return Ended::Revoked,
+            End::Refused(code) => return Ended::Refused(code),
+            End::Identify => gateway.forget(),
+            End::Resume => {}
+        }
+        delay = next_delay(delay, established);
+        emit(Event::Link(Link::Reconnecting));
+        log::info!("gateway reconnecting in {}s", delay.as_secs());
+        tokio::time::sleep(delay).await;
     }
 }
 
@@ -174,11 +317,11 @@ async fn restore(api: &Api) -> Result<Option<(Token, User)>, String> {
 /// is replaced at once, as the official client does.
 async fn sign_in(api: &Api, emit: Emit<'_>) -> Option<(Token, User)> {
     let progress = |progress: Progress| match progress {
-        Progress::Qr(url) => emit(Session::Qr(url)),
-        Progress::Scanned(user) => emit(Session::Scanned {
+        Progress::Qr(url) => emit(Event::Session(Session::Qr(url))),
+        Progress::Scanned(user) => emit(Event::Session(Session::Scanned {
             username: user.username,
-        }),
-        Progress::Captcha => emit(Session::Captcha),
+        })),
+        Progress::Captcha => emit(Event::Session(Session::Captcha)),
     };
     let token = loop {
         match remote_auth::run(api, &progress).await {
@@ -188,7 +331,9 @@ async fn sign_in(api: &Api, emit: Emit<'_>) -> Option<(Token, User)> {
             }
             Err(error) => {
                 log::warn!("QR sign-in failed: {error}");
-                emit(Session::Failed(format!("Sign-in failed: {error}.")));
+                emit(Event::Session(Session::Failed(format!(
+                    "Sign-in failed: {error}."
+                ))));
                 return None;
             }
         }
@@ -196,16 +341,16 @@ async fn sign_in(api: &Api, emit: Emit<'_>) -> Option<(Token, User)> {
     let token = match blocking(move || credentials::save(&token).map(|()| token)).await {
         Ok(token) => token,
         Err(error) => {
-            emit(Session::Failed(keyring_message(error)));
+            emit(Event::Session(Session::Failed(keyring_message(error))));
             return None;
         }
     };
     match api.me(&token).await {
         Ok(user) => Some((token, user)),
         Err(error) => {
-            emit(Session::Failed(format!(
+            emit(Event::Session(Session::Failed(format!(
                 "Unable to read the account: {error}."
-            )));
+            ))));
             None
         }
     }
@@ -228,6 +373,24 @@ async fn log_out(api: &Api, token: &Token) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_delays_double_until_a_connection_holds() {
+        let mut delay = MIN_DELAY;
+        for expected in [2, 4, 8, 16, 32, 60, 60] {
+            delay = next_delay(delay, false);
+            assert_eq!(delay, Duration::from_secs(expected));
+        }
+        assert_eq!(next_delay(delay, true), MIN_DELAY);
+    }
+
+    #[test]
+    fn parse_errors_are_described_without_their_text() {
+        let error = serde_json::from_str::<u64>(r#""a private message""#).unwrap_err();
+        let described = describe(&error);
+        assert!(!described.contains("private"), "{described}");
+        assert!(described.contains("line 1"));
+    }
 
     #[test]
     fn commands_from_an_earlier_screen_are_ignored() {

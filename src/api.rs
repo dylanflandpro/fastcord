@@ -45,7 +45,8 @@ pub enum Error {
 struct Web {
     /// Discord's identifier for a signed-out browser, sent until sign-in.
     fingerprint: Option<String>,
-    /// `X-Super-Properties`, built once.
+    /// The client properties, and `X-Super-Properties` built from them.
+    properties: serde_json::Value,
     super_properties: String,
     /// Whether both visits worked. An incomplete context is not kept, so a
     /// network that comes back gets the full one.
@@ -115,18 +116,38 @@ struct Experiments {
     fingerprint: Option<String>,
 }
 
+/// A user as Discord sends one.
 #[derive(serde::Deserialize)]
-struct ApiUser {
+pub struct ApiUser {
     #[serde(deserialize_with = "snowflake")]
     id: u64,
     username: String,
     global_name: Option<String>,
 }
 
+impl From<ApiUser> for User {
+    fn from(user: ApiUser) -> Self {
+        User {
+            id: user.id,
+            username: user.username,
+            global_name: user.global_name,
+        }
+    }
+}
+
 /// Discord sends snowflakes as strings so JavaScript keeps every digit.
-fn snowflake<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+pub fn snowflake<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
     let text: String = serde::Deserialize::deserialize(deserializer)?;
     text.parse().map_err(serde::de::Error::custom)
+}
+
+/// A snowflake that may be missing or null.
+pub fn optional_snowflake<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    let text: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+    text.map(|text| text.parse().map_err(serde::de::Error::custom))
+        .transpose()
 }
 
 /// The build number in the site's `GLOBAL_ENV` (`"BUILD_NUMBER":"630444"`).
@@ -169,8 +190,10 @@ fn discord_locale(raw: &str) -> String {
 }
 
 /// The client properties the web client sends, base64-encoded JSON.
-fn super_properties(build_number: Option<u64>, locale: &str) -> String {
-    let properties = serde_json::json!({
+/// The client properties the web client sends: as an object in the
+/// gateway's IDENTIFY, base64-encoded in `X-Super-Properties`.
+fn client_properties(build_number: Option<u64>, locale: &str) -> serde_json::Value {
+    serde_json::json!({
         "os": "Linux",
         "browser": "Chrome",
         "device": "",
@@ -186,8 +209,7 @@ fn super_properties(build_number: Option<u64>, locale: &str) -> String {
         "release_channel": "stable",
         "client_build_number": build_number,
         "client_event_source": null,
-    });
-    STANDARD.encode(properties.to_string())
+    })
 }
 
 impl Api {
@@ -257,6 +279,7 @@ impl Api {
                 .and_then(|e| e.fingerprint),
             Err(_) => None,
         };
+        let properties = client_properties(build_number, &locale());
         log::debug!(
             "web client context: build number {}, fingerprint {}",
             build_number.map_or("missing".into(), |n| n.to_string()),
@@ -267,7 +290,8 @@ impl Api {
             },
         );
         Web {
-            super_properties: super_properties(build_number, &locale()),
+            super_properties: STANDARD.encode(properties.to_string()),
+            properties,
             complete: build_number.is_some() && fingerprint.is_some(),
             fingerprint,
         }
@@ -284,6 +308,11 @@ impl Api {
     /// does not wait for it after the phone approves.
     pub async fn prepare(&self) {
         self.web().await;
+    }
+
+    /// The client properties for the gateway's IDENTIFY.
+    pub async fn client_properties(&self) -> serde_json::Value {
+        self.web().await.properties.clone()
     }
 
     /// Trades the ticket the phone approved for the token, still sealed with
@@ -349,11 +378,7 @@ impl Api {
         match response.status() {
             status if status.is_success() => {
                 let user: ApiUser = response.json().await.map_err(|_| Error::Protocol)?;
-                Ok(User {
-                    id: user.id,
-                    username: user.username,
-                    global_name: user.global_name,
-                })
+                Ok(User::from(user))
             }
             reqwest::StatusCode::UNAUTHORIZED => Err(Error::Unauthorized),
             status => {
@@ -441,10 +466,8 @@ mod tests {
     }
 
     #[test]
-    fn super_properties_decode_to_the_web_client() {
-        let encoded = super_properties(Some(630444), "fr");
-        let json: serde_json::Value =
-            serde_json::from_slice(&STANDARD.decode(encoded).unwrap()).unwrap();
+    fn client_properties_match_the_web_client() {
+        let json = client_properties(Some(630444), "fr");
         assert_eq!(json["client_build_number"], 630444);
         assert_eq!(json["browser"], "Chrome");
         assert_eq!(json["system_locale"], "fr");

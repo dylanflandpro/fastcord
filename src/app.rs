@@ -1,6 +1,7 @@
 //! The window: the model, what is open, and the palette it is drawn in.
 
-use crate::backend::{Backend, Command, Session};
+use crate::backend::{Backend, Command, Event, Link, Session};
+use crate::events::Update;
 use crate::model::{Id, Model};
 use crate::theme::{self, Catalog, Palette};
 use std::collections::HashMap;
@@ -71,6 +72,31 @@ impl Selection {
         }
     }
 
+    /// Keeps the selection pointing at something that still exists after a
+    /// change: a guild that went away gives way to the first one, a deleted
+    /// or newly hidden channel to its list's first channel.
+    pub fn repair(&mut self, model: &Model) {
+        match self.view {
+            View::Guild(id) => match model.guild(id) {
+                None => *self = Self::initial(Some(model)),
+                Some(guild) => {
+                    let open = self
+                        .channel
+                        .and_then(|c| guild.channel(c))
+                        .is_some_and(|c| guild.can_view(c, model.me));
+                    if !open {
+                        self.open_guild(model, id);
+                    }
+                }
+            },
+            View::DirectMessages => {
+                if self.channel.and_then(|c| model.dm(c)).is_none() {
+                    self.open_direct_messages(model);
+                }
+            }
+        }
+    }
+
     pub fn open_direct_messages(&mut self, model: &Model) {
         self.view = View::DirectMessages;
         self.channel = model.dms_by_recency().first().map(|d| d.id);
@@ -86,6 +112,8 @@ pub struct App {
     /// The QR code for [`Session::Qr`], built once per code.
     pub qr: Option<qrcode::QrCode>,
     backend: Option<Backend>,
+    /// The live connection, while signed in.
+    pub link: Link,
     pub selection: Selection,
     pub palette: Palette,
     themes: Catalog,
@@ -120,6 +148,7 @@ impl App {
             selection: Selection::initial(model.as_ref()),
             model,
             session: Session::Checking,
+            link: Link::Connecting,
             qr: None,
             backend,
             palette,
@@ -158,6 +187,14 @@ impl App {
         }
     }
 
+    /// The signed-in account, when there is one (never in demo runs).
+    pub fn account(&self) -> Option<&crate::model::User> {
+        match &self.session {
+            Session::SignedIn(user) if self.backend.is_some() => Some(user),
+            _ => None,
+        }
+    }
+
     /// Sends a button's command and shows the spinner until the backend
     /// answers, so the button cannot be pressed twice.
     pub fn send(&mut self, command: Command) {
@@ -168,16 +205,41 @@ impl App {
         }
     }
 
-    fn follow_session(&mut self) {
+    fn follow_backend(&mut self) {
         let Some(backend) = &self.backend else {
             return;
         };
-        for session in backend.events() {
-            self.qr = match &session {
-                Session::Qr(url) => qrcode::QrCode::new(url.as_bytes()).ok(),
-                _ => None,
-            };
-            self.session = session;
+        for event in backend.events() {
+            match event {
+                Event::Session(session) => {
+                    self.qr = match &session {
+                        Session::Qr(url) => qrcode::QrCode::new(url.as_bytes()).ok(),
+                        _ => None,
+                    };
+                    // Signed out, or signing in again: nothing of the last
+                    // account stays on screen.
+                    if !matches!(session, Session::SignedIn(_)) {
+                        self.model = None;
+                    }
+                    self.session = session;
+                }
+                Event::Link(link) => self.link = link,
+                Event::Update(Update::Ready(model)) => {
+                    // A new session after a reconnect keeps what was open
+                    // when it still exists.
+                    match self.model.is_some() {
+                        true => self.selection.repair(&model),
+                        false => self.selection = Selection::initial(Some(&model)),
+                    }
+                    self.model = Some(model);
+                }
+                Event::Update(update) => {
+                    if let Some(model) = &mut self.model {
+                        model.apply(update);
+                        self.selection.repair(model);
+                    }
+                }
+            }
         }
     }
 
@@ -190,7 +252,7 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.follow_theme(ctx);
-        self.follow_session();
+        self.follow_backend();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -272,6 +334,26 @@ mod tests {
         model.guilds[0].channels.push(new);
         selection.open_guild(&model, 100);
         assert_eq!(selection.channel, Some(101));
+    }
+
+    #[test]
+    fn repair_follows_removed_guilds_and_channels() {
+        let mut model = crate::demo::model();
+        let mut selection = Selection::initial(Some(&model));
+        selection.open_guild(&model, 200);
+        model.apply(Update::ChannelRemove {
+            guild: 200,
+            channel: 201,
+        });
+        selection.repair(&model);
+        assert_eq!(selection.channel, Some(202));
+        model.apply(Update::GuildRemove(200));
+        selection.repair(&model);
+        assert_eq!(selection, Selection::initial(Some(&model)));
+        selection.open_direct_messages(&model);
+        model.apply(Update::DmRemove(900));
+        selection.repair(&model);
+        assert_eq!(selection.channel, Some(901));
     }
 
     #[test]

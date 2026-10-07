@@ -3,6 +3,7 @@
 mod sign_in;
 
 use crate::app::{App, Selection, View};
+use crate::backend::{Command, Link};
 use crate::model::{self, ChannelKind, Entry, Id, Message, Model};
 use crate::theme::{self, Icon, Palette};
 use egui::text::{LayoutJob, TextWrapping};
@@ -14,14 +15,64 @@ const ROW_HEIGHT: f32 = 32.0;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
-    let Some(model) = &app.model else {
+    if app.model.is_none() {
         sign_in::show(app, ui);
+        return;
+    }
+    status_bar(app, ui);
+    let Some(model) = &app.model else {
         return;
     };
     let selection = &mut app.selection;
     rail(selection, model, &palette, ui);
     sidebar(selection, model, &palette, ui);
     conversation(selection, model, &palette, ui);
+}
+
+/// The connection's state and the account, along the bottom of the window.
+/// Demo runs have no account and no bar.
+fn status_bar(app: &mut App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    let Some(user) = app.account() else {
+        return;
+    };
+    let name = user.display_name().to_owned();
+    let link = match app.link {
+        Link::Connected => None,
+        Link::Connecting => Some("Connecting…"),
+        Link::Reconnecting => Some("Connection lost. Reconnecting…"),
+    };
+    let mut log_out = false;
+    egui::Panel::bottom("status")
+        .exact_size(28.0)
+        .show_separator_line(false)
+        .frame(
+            Frame::new()
+                .fill(palette.panel)
+                .inner_margin(Margin::symmetric(12, 0)),
+        )
+        .show(ui, |ui| {
+            ui.horizontal_centered(|ui| {
+                if let Some(link) = link {
+                    ui.label(
+                        egui::RichText::new(link)
+                            .font(theme::regular(12.0))
+                            .color(palette.warning),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    log_out = ui.small_button("Log out").clicked();
+                    ui.label(
+                        egui::RichText::new(name)
+                            .font(theme::regular(12.0))
+                            .color(palette.secondary),
+                    );
+                });
+            });
+        });
+    if log_out {
+        app.send(Command::LogOut);
+    }
 }
 
 /// The server rail: direct messages first, then each guild.
