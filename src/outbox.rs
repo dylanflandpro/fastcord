@@ -49,6 +49,11 @@ impl Outbox {
         cancelled.into_iter().map(|o: Outgoing| o.nonce).collect()
     }
 
+    /// How many messages wait or are on their way.
+    pub fn pending(&self) -> usize {
+        self.queue.len() + usize::from(self.flying)
+    }
+
     /// Nothing waits and nothing is on its way.
     pub fn is_idle(&self) -> bool {
         !self.flying && self.queue.is_empty()

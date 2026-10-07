@@ -211,6 +211,12 @@ pub fn verdict(attempt: &Attempt, retries: u32) -> Verdict {
     if status == 401 {
         return Verdict::Unauthorized;
     }
+    // A proxy's 502 or 504 can come after Discord stored the message, and
+    // Retry would post it twice (the nonce does not deduplicate).
+    if status >= 500 {
+        log::warn!("a write answered HTTP {status}");
+        return Verdict::Unsure;
+    }
     let refusal = body.and_then(|body| serde_json::from_str::<Refusal>(body).ok());
     let code = refusal.as_ref().map_or(0, |r| r.code);
     let wait = body
@@ -1015,7 +1021,8 @@ mod tests {
             r#"{"captcha_key":["captcha-required"],"captcha_sitekey":"x"}"#,
         );
         assert!(matches!(verdict(&captcha, 0), Verdict::Refused(Some(r)) if r.contains("captcha")));
-        assert_eq!(verdict(&answered(502, "<html>"), 0), Verdict::Refused(None));
+        assert_eq!(verdict(&answered(502, "<html>"), 0), Verdict::Unsure);
+        assert_eq!(verdict(&answered(500, "{}"), 0), Verdict::Unsure);
     }
 
     #[test]

@@ -32,10 +32,18 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
   no copy (a new READY replaced the conversation) shows it again or puts its text
   back in the draft. Demo runs confirm sends locally after a moment, and refuse them
   in #egui (slowmode) to show a failure.
+- The keyboard never writes by accident: the composer keeps Tab (none of a message's
+  buttons or reaction pills takes keyboard focus: `Sense::CLICK`), sends only on an
+  Enter typed while it already held the cursor (not the one that opened the channel,
+  nor a held Enter repeating), and keeps every `/command` but `/shrug`, `/tableflip`,
+  `/unflip` and `/me` (`\/` sends a literal slash). Tests drive `ui::show` headless on
+  the demo app with synthetic keys (`ui::tests::show`).
 - `outbox.rs`: messages leave one at a time, in order; a failure fails the channel's
   later messages unsent. `api::verdict` reads each attempt, status first: a lost
-  answer is `Unsure` (no Retry until the gateway could confirm it), a 429 is waited
-  out in full while the message says so.
+  answer or a 5xx is `Unsure` (no Retry until the gateway showed life after it: a
+  connection, or a heartbeat acknowledged, `Event::Alive`), a 429 is waited out in full
+  while the message says so. After a new READY an unsure message waits for its
+  channel's history: there, it arrived; else it returns to the draft with a notice.
 - Buttons acting on one message take their id from it (`ui::keyed_button`): egui
   credits a click to the id pressed, so auto ids (drawing order) could hand it to
   another message when the layout shifts. It allocates in the row and `interact`s

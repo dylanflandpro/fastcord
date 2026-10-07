@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -113,6 +113,9 @@ pub enum Event {
         nonce: Id,
         reason: Option<String>,
     },
+    /// The gateway answered a heartbeat: what it had to deliver until now,
+    /// it has.
+    Alive,
     /// The answer to the message sent with `nonce` was lost: it may have
     /// arrived, which the gateway will tell.
     SendUnsure {
@@ -131,9 +134,8 @@ pub struct Backend {
     commands: UnboundedSender<Command>,
     events: mpsc::Receiver<Event>,
     thread: std::thread::JoinHandle<()>,
-    /// Whether acks or messages wait or are on their way, which closing
-    /// waits for, a little while.
-    acking: Arc<AtomicBool>,
+    /// What closing waits for, a little while.
+    acking: Arc<Pending>,
     notifier: notify::Notifier,
 }
 
@@ -142,7 +144,7 @@ impl Backend {
     pub fn start(ctx: egui::Context, shared: Arc<notify::Shared>) -> Self {
         let (commands, receiver) = unbounded_channel();
         let (sender, events) = mpsc::channel();
-        let acking = Arc::new(AtomicBool::new(false));
+        let acking = Arc::new(Pending::default());
         let busy = acking.clone();
         let opened = {
             let (sender, ctx) = (sender.clone(), ctx.clone());
@@ -208,15 +210,16 @@ impl Backend {
         } = self;
         drop(commands);
         let deadline = std::time::Instant::now() + ACK_FLUSH + Duration::from_millis(500);
-        while acking.load(Ordering::Relaxed)
-            && !thread.is_finished()
-            && std::time::Instant::now() < deadline
-        {
+        while !acking.idle() && !thread.is_finished() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
 
     pub fn send(&self, command: Command) {
+        // Closing waits for a message from the moment it is handed over.
+        if matches!(command, Command::Send(_)) {
+            self.acking.handed.fetch_add(1, Ordering::Relaxed);
+        }
         let _ = self.commands.send(command);
     }
 
@@ -236,16 +239,41 @@ struct Alerts<'a> {
 
 /// Restore or sign in, stay signed in until logged out, then start over.
 /// Returns when the window is gone.
+/// What is still owed to Discord, shared with the window, which waits for
+/// it before closing.
+#[derive(Debug, Default)]
+pub struct Pending {
+    /// Acks or messages waiting or on their way.
+    working: AtomicBool,
+    /// Messages handed to the backend and not yet taken in.
+    handed: AtomicUsize,
+    /// Messages waiting or on their way, as last counted: what is lost if
+    /// the session ends under them.
+    unsent: AtomicUsize,
+}
+
+impl Pending {
+    fn idle(&self) -> bool {
+        !self.working.load(Ordering::Relaxed) && self.handed.load(Ordering::Relaxed) == 0
+    }
+
+    fn taken(&self) {
+        let _ = self
+            .handed
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
+}
+
 async fn session(
     mut commands: UnboundedReceiver<Command>,
     emit: Emit<'_>,
-    busy: &AtomicBool,
+    busy: &Pending,
     alerts: &Alerts<'_>,
 ) {
     let api = Api::new();
     let keyring = Keyring::start();
     loop {
-        busy.store(false, Ordering::Relaxed);
+        busy.working.store(false, Ordering::Relaxed);
         emit(Event::Session(Session::Checking));
         let signed_in = match restore(&api, &keyring).await {
             Ok(Some(signed_in)) => Some(signed_in),
@@ -309,6 +337,9 @@ async fn session(
         match ended {
             Some(Ended::Revoked) => {
                 log::info!("Discord no longer accepts the session; signing in again");
+                if let Some(lost) = unsent_lost(busy) {
+                    log::warn!("{lost}");
+                }
                 if let Err(error) = keyring.run(credentials::delete).await {
                     emit(Event::Session(Session::Failed(keyring_message(error))));
                     if !wait_for(&mut commands, |c| matches!(c, Command::Retry)).await {
@@ -318,10 +349,14 @@ async fn session(
                 continue;
             }
             Some(ended @ (Ended::Refused(_) | Ended::Unreadable)) => {
-                let message = match ended {
+                let mut message = match ended {
                     Ended::Refused(code) => format!("Discord refused the connection (code {code})."),
                     _ => "Discord sent account data this version cannot read. Try again, or update fastcord.".into(),
                 };
+                if let Some(lost) = unsent_lost(busy) {
+                    message.push(' ');
+                    message.push_str(&lost);
+                }
                 emit(Event::Session(Session::Failed(message)));
                 if !wait_for(&mut commands, |c| matches!(c, Command::Retry)).await {
                     return;
@@ -346,6 +381,17 @@ async fn session(
 /// (`None`) or revoked, rather than failed and waiting for Retry.
 fn signs_out(ended: Option<&Ended>) -> bool {
     matches!(ended, None | Some(Ended::Revoked))
+}
+
+/// The messages the session took with it when it ended under them, said.
+fn unsent_lost(busy: &Pending) -> Option<String> {
+    let lost = busy.unsent.swap(0, Ordering::Relaxed);
+    busy.working.store(false, Ordering::Relaxed);
+    match lost {
+        0 => None,
+        1 => Some("A message could not be sent.".into()),
+        n => Some(format!("{n} messages could not be sent.")),
+    }
 }
 
 /// Why the live connection stopped for good.
@@ -470,6 +516,7 @@ async fn stay_connected(
                 established = true;
                 emit(Event::Link(Link::Connected));
             },
+            &mut || emit(Event::Alive),
         )
         .await;
         match end {
@@ -507,7 +554,7 @@ async fn serve<S, F, P, G>(
     token: &RefCell<Token>,
     emit: Emit<'_>,
     acks: &RefCell<AckQueue>,
-    busy: &AtomicBool,
+    busy: &Pending,
     send: S,
     post: P,
 ) -> Served
@@ -517,7 +564,12 @@ where
     P: Fn(Outgoing, Token) -> G,
     G: Future<Output = (Attempt, Token)>,
 {
-    while commands.try_recv().is_ok() {}
+    // Left from an earlier screen: dropped (see `wait_for`).
+    while let Ok(command) = commands.try_recv() {
+        if matches!(command, Command::Send(_)) {
+            busy.taken();
+        }
+    }
     let mut loading = FuturesUnordered::new();
     let mut sending = FuturesUnordered::new();
     let mut reactions = Reactions::default();
@@ -546,10 +598,9 @@ where
         if let Some(outgoing) = outbox.next() {
             writing.push(send_one(&post, token, emit, outgoing));
         }
-        busy.store(
-            !acks.borrow().is_empty() || !outbox.is_idle(),
-            Ordering::Relaxed,
-        );
+        let working = !acks.borrow().is_empty() || !outbox.is_idle();
+        busy.working.store(working, Ordering::Relaxed);
+        busy.unsent.store(outbox.pending(), Ordering::Relaxed);
         let due = acks.borrow().next_due();
         tokio::select! {
             command = commands.recv() => match command {
@@ -567,23 +618,26 @@ where
                 Some(Command::React(reaction)) => {
                     reacting.extend(reactions.request(reaction).map(&fly));
                 }
-                Some(Command::Send(outgoing)) => outbox.push(outgoing),
+                Some(Command::Send(outgoing)) => {
+                    outbox.push(outgoing);
+                    busy.taken();
+                }
                 Some(Command::Retry) => {}
             },
             Some((outgoing, verdict, used)) = writing.next(), if !writing.is_empty() => {
                 if posted(&mut outbox, acks, token, emit, outgoing, verdict, &used) {
-                    return Served::Revoked;
+                    break Served::Revoked;
                 }
             }
             // Only the token in force: one rotated meanwhile is fine.
             Some((revoked, used)) = loading.next(), if !loading.is_empty() => {
                 if revoked && used.expose() == token.borrow().expose() {
-                    return Served::Revoked;
+                    break Served::Revoked;
                 }
             }
             Some((reaction, outcome)) = reacting.next(), if !reacting.is_empty() => {
                 match settle(&mut reactions, reaction, outcome, emit) {
-                    Settled::Revoked => return Served::Revoked,
+                    Settled::Revoked => break Served::Revoked,
                     Settled::Next(next) => reacting.extend(next.map(&fly)),
                 }
             }
@@ -593,11 +647,16 @@ where
             }
             Some((ack, attempt, delivery, used)) = sending.next(), if !sending.is_empty() => {
                 if landed(acks, token, emit, ack, attempt, delivery, &used) {
-                    return Served::Revoked;
+                    break Served::Revoked;
                 }
             }
         }
     };
+    if matches!(served, Served::Revoked) {
+        // Nothing more goes out on a token Discord refused.
+        busy.working.store(false, Ordering::Relaxed);
+        return served;
+    }
     let rest = acks.borrow_mut().take_due(None);
     sending.extend(rest.into_iter().map(&launch));
     let drain = async {
@@ -621,7 +680,8 @@ where
         }
     };
     let _ = tokio::time::timeout(ACK_FLUSH, async { tokio::join!(drain, flush) }).await;
-    busy.store(false, Ordering::Relaxed);
+    busy.working.store(false, Ordering::Relaxed);
+    busy.unsent.store(outbox.pending(), Ordering::Relaxed);
     served
 }
 
@@ -1353,6 +1413,8 @@ mod tests {
         /// Messages posted, by nonce, in order.
         posted: Vec<Id>,
         events: Vec<Event>,
+        /// Nothing left for closing to wait for.
+        idle: bool,
     }
 
     /// A signed-in phase whose acks get `answers` and messages `posts`, in
@@ -1367,7 +1429,7 @@ mod tests {
         let api = Api::new();
         let token = RefCell::new(Token::new("first".into()));
         let acks = RefCell::new(AckQueue::default());
-        let busy = AtomicBool::new(false);
+        let busy = Pending::default();
         let events = Mutex::new(Vec::new());
         let emit = |event: Event| events.lock().unwrap().push(event);
         let answers = RefCell::new(answers.into_iter());
@@ -1418,6 +1480,7 @@ mod tests {
             sent: sent.get(),
             posted: posted.into_inner(),
             events: events.into_inner().unwrap(),
+            idle: busy.idle(),
         }
     }
 
@@ -1531,12 +1594,13 @@ mod tests {
     fn a_401_on_a_message_ends_the_session_only_for_the_token_in_force() {
         let refused = || answered(401, Some("{}"));
         let outcome = paused(session_with(
-            vec![message(7, 1)],
+            vec![message(7, 1), message(7, 2)],
             vec![],
             vec![refused()],
             false,
         ));
         assert!(matches!(outcome.served, Served::Revoked));
+        assert!(outcome.idle, "closing has nothing left to wait for");
         // The token was replaced while it flew: the message goes again.
         let outcome = paused(session_with(
             vec![message(7, 1)],
@@ -1546,6 +1610,23 @@ mod tests {
         ));
         assert!(matches!(outcome.served, Served::Closed));
         assert_eq!(outcome.posted, [1, 1]);
+    }
+
+    #[test]
+    fn closing_waits_for_messages_handed_over_and_says_what_was_lost() {
+        let busy = Pending::default();
+        assert!(busy.idle());
+        busy.handed.fetch_add(1, Ordering::Relaxed);
+        assert!(!busy.idle(), "handed over, not yet taken in");
+        busy.taken();
+        busy.taken();
+        assert!(busy.idle());
+        assert_eq!(unsent_lost(&busy), None);
+        busy.unsent.store(2, Ordering::Relaxed);
+        busy.working.store(true, Ordering::Relaxed);
+        let lost = unsent_lost(&busy).unwrap();
+        assert_eq!(lost, "2 messages could not be sent.");
+        assert!(busy.idle() && unsent_lost(&busy).is_none(), "said once");
     }
 
     #[test]
@@ -1623,7 +1704,7 @@ mod tests {
             let api = Api::new();
             let token = RefCell::new(Token::new("t".into()));
             let acks = RefCell::new(AckQueue::default());
-            let busy = AtomicBool::new(false);
+            let busy = Pending::default();
             let emit = |_: Event| {};
             let sent = Cell::new(0);
             let send = |_: Ack, used: Token| {

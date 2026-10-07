@@ -235,7 +235,16 @@ struct Posted {
     content: String,
     /// On its way to Discord.
     flying: bool,
+    /// Its answer was lost: it may be on Discord.
+    unsure: bool,
+    /// A new READY took its copy while it was unsure: it waits for its
+    /// channel's history to say whether it arrived.
+    checking: bool,
 }
+
+/// What the composer says of a message put back in the draft that may have
+/// gone through after all.
+pub const MAYBE_SENT: &str = "A message put back here may already have been sent: check the conversation before sending it again.";
 
 /// What I write: a draft per channel, kept while I look elsewhere as the
 /// official client keeps them, the messages Discord has not confirmed yet,
@@ -284,6 +293,8 @@ impl Composer {
             channel,
             content: content.clone(),
             flying: true,
+            unsure: false,
+            checking: false,
         };
         self.posted.insert(nonce, posted);
         Some(Outgoing {
@@ -303,6 +314,8 @@ impl Composer {
             channel,
             content: content.clone(),
             flying: true,
+            unsure: false,
+            checking: false,
         };
         self.posted.insert(nonce, posted);
         Some(Outgoing {
@@ -333,6 +346,7 @@ impl Composer {
             return;
         };
         posted.flying = delivery.in_flight();
+        posted.unsure = delivery == Delivery::Unsure;
         if model.send_settled(channel, nonce, delivery.clone()) {
             return;
         }
@@ -351,14 +365,50 @@ impl Composer {
         let mut landed: Vec<Id> = self
             .posted
             .iter()
-            .filter(|(_, p)| !p.flying)
+            .filter(|(_, p)| !p.flying && !p.checking)
             .map(|(&n, _)| n)
             .collect();
         landed.sort_unstable();
         for nonce in landed {
-            if let Some(posted) = self.posted.remove(&nonce) {
+            let Some(posted) = self.posted.get_mut(&nonce) else {
+                continue;
+            };
+            // Maybe on Discord: the reloaded history will say.
+            if posted.unsure {
+                posted.checking = true;
+            } else if let Some(posted) = self.posted.remove(&nonce) {
                 self.restore(posted);
             }
+        }
+    }
+
+    /// `channel`'s history is back: an unsure message whose copy went with
+    /// a READY is there, by me with its text, or it goes back to the draft
+    /// with a word that it may have been sent after all.
+    pub fn history_loaded(&mut self, model: &Model, channel: Id) {
+        let mut checked: Vec<Id> = self
+            .posted
+            .iter()
+            .filter(|(_, p)| p.checking && p.channel == channel)
+            .map(|(&n, _)| n)
+            .collect();
+        checked.sort_unstable();
+        for nonce in checked {
+            let Some(posted) = self.posted.remove(&nonce) else {
+                continue;
+            };
+            let mine = model
+                .messages(channel)
+                .iter()
+                .filter(|m| m.author.id == model.me);
+            if mine
+                .into_iter()
+                .any(|m| m.delivery == Delivery::Sent && m.content == posted.content)
+            {
+                continue;
+            }
+            self.restore(posted);
+            self.notice = Some((channel, MAYBE_SENT.into()));
         }
     }
 
@@ -376,15 +426,12 @@ impl Composer {
     }
 }
 
-/// How long a gateway that stayed connected gets to deliver the copy of a
-/// message whose answer was lost, before Retry is offered.
-const UNSURE_GRACE: Duration = Duration::from_secs(10);
-
 /// Whether a message whose answer was lost may be retried: once the gateway
-/// connected after the loss (a resume replays what it missed, ending with
-/// RESUMED), or, connected throughout, once its copy would have come.
-pub fn unsure_settled(since: Instant, connected_at: Option<Instant>, now: Instant) -> bool {
-    connected_at.is_some_and(|at| at > since || now >= since + UNSURE_GRACE)
+/// showed it was alive after the loss. A resume replays what it missed
+/// before RESUMED, and a heartbeat's acknowledgement comes after what was
+/// already on its way: had the message arrived, its copy would be here.
+pub fn unsure_settled(since: Instant, alive_at: Option<Instant>) -> bool {
+    alive_at.is_some_and(|at| at > since)
 }
 
 /// How long a demo message takes to "reach Discord": long enough to see it
@@ -431,8 +478,9 @@ pub struct App {
     demo_outbox: Vec<(std::time::Instant, Outgoing)>,
     /// Messages whose answer was lost, as channel and nonce, since when.
     unsure: HashMap<(Id, Id), Instant>,
-    /// When the gateway last connected, while it is.
-    connected_at: Option<Instant>,
+    /// When the gateway last showed it was alive (connected, or answered a
+    /// heartbeat), while it is connected.
+    alive_at: Option<Instant>,
 }
 
 /// What the conversation shows above or instead of its messages.
@@ -526,7 +574,7 @@ impl App {
             composer: Composer::default(),
             demo_outbox: Vec::new(),
             unsure: HashMap::new(),
-            connected_at: None,
+            alive_at: None,
         }
     }
 
@@ -703,21 +751,15 @@ impl App {
     }
 
     /// Offers Retry on the messages whose answer was lost, once the gateway
-    /// has had its chance to confirm them, and wakes up for the next.
-    fn settle_unsure(&mut self, ctx: &egui::Context) {
-        let now = Instant::now();
-        let connected_at = self.connected_at;
+    /// has had its chance to confirm them.
+    fn settle_unsure(&mut self) {
+        let alive_at = self.alive_at;
         let (settled, waiting): (HashMap<_, _>, _) = std::mem::take(&mut self.unsure)
             .into_iter()
-            .partition(|&(_, since)| unsure_settled(since, connected_at, now));
+            .partition(|&(_, since)| unsure_settled(since, alive_at));
         self.unsure = waiting;
         for (channel, nonce) in settled.into_keys() {
             self.settled(channel, nonce, Delivery::Failed(None));
-        }
-        if connected_at.is_some()
-            && let Some(since) = self.unsure.values().min()
-        {
-            ctx.request_repaint_after((*since + UNSURE_GRACE).saturating_duration_since(now));
         }
     }
 
@@ -839,7 +881,7 @@ impl App {
             }
             Event::Link(link) => {
                 self.link = link;
-                self.connected_at = (link == Link::Connected).then(Instant::now);
+                self.alive_at = (link == Link::Connected).then(Instant::now);
             }
             Event::Ready(model) => {
                 // A new session after a reconnect missed what happened
@@ -893,6 +935,11 @@ impl App {
                 let until = now.checked_add(wait).unwrap_or(now);
                 self.settled(channel, nonce, Delivery::Held(until));
             }
+            Event::Alive => {
+                if self.link == Link::Connected {
+                    self.alive_at = Some(Instant::now());
+                }
+            }
             Event::Update(update) => {
                 self.confirm(&update);
                 // A message arriving while its channel's first page loads
@@ -927,6 +974,9 @@ impl App {
                     model.apply(update);
                     if let Some(early) = landed.and_then(|c| self.early_messages.remove(&c)) {
                         early.into_iter().for_each(|update| model.apply(update));
+                    }
+                    if let Some(channel) = landed {
+                        self.composer.history_loaded(model, channel);
                     }
                     self.selection.repair(model);
                 }
@@ -1007,7 +1057,7 @@ impl eframe::App for App {
         }
         self.drop_unreadable_acks();
         self.deliver_demo(ctx);
-        self.settle_unsure(ctx);
+        self.settle_unsure();
         if let Some(channel) = self.selection.channel {
             self.request_history(channel, false);
         }
@@ -1306,10 +1356,7 @@ mod tests {
         composer.drafts.insert(111, "/nick Dyl".into());
         assert_eq!(composer.send(&mut model, 111, now()), None);
         let notice = composer.notice.clone().unwrap();
-        assert_eq!(
-            notice,
-            (111, "/nick is not available in fastcord yet.".into())
-        );
+        assert_eq!(notice, (111, crate::compose::SLASH.into()));
         assert!(composer.drafts.contains_key(&111));
         // A command the web client runs as text goes, and the notice with it.
         composer.drafts.insert(111, "/shrug".into());
@@ -1328,18 +1375,44 @@ mod tests {
         let second = sent(&mut model, &mut composer, 111, "deux");
         let third = sent(&mut model, &mut composer, 111, "trois");
         composer.settled(&mut model, 111, first, Delivery::Failed(None));
-        composer.settled(&mut model, 111, second, Delivery::Unsure);
+        composer.settled(&mut model, 111, second, Delivery::Failed(None));
         // A new READY: the conversation is replaced, its history not back.
         model.messages.clear();
         composer.drafts.insert(111, "brouillon".into());
         composer.after_ready();
         assert_eq!(
             composer.drafts[&111], "brouillon\nun\ndeux",
-            "landed ones, oldest first"
+            "failed ones, oldest first"
         );
         // The one still on its way fails later: its text comes back too.
         composer.settled(&mut model, 111, third, Delivery::Failed(None));
         assert_eq!(composer.drafts[&111], "brouillon\nun\ndeux\ntrois");
+        assert!(composer.posted.is_empty());
+    }
+
+    #[test]
+    fn an_unsure_message_waits_for_its_history_after_ready() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        let arrived = sent(&mut model, &mut composer, 111, "arrivé");
+        let lost = sent(&mut model, &mut composer, 111, "perdu");
+        composer.settled(&mut model, 111, arrived, Delivery::Unsure);
+        composer.settled(&mut model, 111, lost, Delivery::Unsure);
+        let mut history = model.messages.remove(&111).unwrap();
+        composer.after_ready();
+        assert!(
+            !composer.drafts.contains_key(&111),
+            "nothing yet: it may be there"
+        );
+        // The reloaded history holds the first, by me.
+        history.retain(|m| m.delivery == Delivery::Sent);
+        let mut there = history[0].clone();
+        (there.id, there.author.id, there.content) = (arrived + 7, model.me, "arrivé".into());
+        history.push(there);
+        model.messages.insert(111, history);
+        composer.history_loaded(&model, 111);
+        assert_eq!(composer.drafts[&111], "perdu");
+        assert_eq!(composer.notice, Some((111, MAYBE_SENT.into())));
         assert!(composer.posted.is_empty());
     }
 
@@ -1361,17 +1434,15 @@ mod tests {
     #[test]
     fn retry_waits_for_the_gateway_after_a_lost_answer() {
         let since = Instant::now();
-        let later = |s| since + Duration::from_secs(s);
-        assert!(
-            !unsure_settled(since, None, later(60)),
-            "offline: no way to know"
-        );
-        // Connected throughout: its copy would have come by now.
-        let before = since.checked_sub(Duration::from_secs(5));
-        assert!(!unsure_settled(since, before, later(3)));
-        assert!(unsure_settled(since, before, later(10)));
-        // Reconnected after: the resume replayed what was missed.
-        assert!(unsure_settled(since, Some(later(1)), later(1)));
+        let at = |s| Some(since + Duration::from_secs(s));
+        assert!(!unsure_settled(since, None), "offline: no way to know");
+        // Alive before the loss says nothing of it, however long ago.
+        assert!(!unsure_settled(
+            since,
+            since.checked_sub(Duration::from_secs(60))
+        ));
+        // Reconnected, or a heartbeat answered, after the loss.
+        assert!(unsure_settled(since, at(1)));
     }
 
     #[test]

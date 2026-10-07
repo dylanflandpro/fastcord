@@ -89,6 +89,8 @@ pub enum Step {
         name: String,
         data: Box<RawValue>,
     },
+    /// Discord acknowledged a heartbeat: the connection is alive now.
+    Alive,
     /// READY (a new session) or RESUMED: the connection works, reconnect
     /// delays start over.
     Established {
@@ -227,7 +229,7 @@ impl Gateway {
             op::HEARTBEAT => vec![Step::Send(self.heartbeat_payload())],
             op::HEARTBEAT_ACK => {
                 self.awaiting_ack = false;
-                Vec::new()
+                vec![Step::Alive]
             }
             op::RECONNECT => return Err(End::Resume),
             op::INVALID_SESSION => {
@@ -272,7 +274,8 @@ impl Gateway {
 
 /// One connection, until it ends. `dispatch` receives every event and
 /// returns `false` for one it cannot read at all, which ends the
-/// connection; `established` is told of READY and RESUMED. `token` is read
+/// connection; `established` is told of READY and RESUMED, and `alive` of
+/// each heartbeat Discord acknowledges. `token` is read
 /// at each hello, so a token rotated meanwhile is the one used. Dropping
 /// the future (the person logged out) closes the socket.
 pub async fn connect(
@@ -281,6 +284,7 @@ pub async fn connect(
     properties: &serde_json::Value,
     dispatch: &mut dyn FnMut(&str, &RawValue) -> bool,
     established: &mut dyn FnMut(),
+    alive: &mut dyn FnMut(),
 ) -> End {
     let host = gateway.host().to_owned();
     let connecting = crate::websocket::connect(
@@ -371,6 +375,7 @@ pub async fn connect(
                     );
                     established();
                 }
+                Step::Alive => alive(),
                 Step::Dispatch { name, data } => {
                     if !dispatch(&name, &data) {
                         return End::Unreadable;
@@ -467,7 +472,11 @@ mod tests {
         let mut gateway = Gateway::default();
         frame(&mut gateway, HELLO).unwrap();
         gateway.heartbeat().unwrap();
-        frame(&mut gateway, r#"{"op":11,"d":null,"s":null,"t":null}"#).unwrap();
+        let acked = frame(&mut gateway, r#"{"op":11,"d":null,"s":null,"t":null}"#).unwrap();
+        assert!(
+            matches!(acked[..], [Step::Alive]),
+            "an ack says the connection lives"
+        );
         gateway.heartbeat().unwrap();
         assert_eq!(gateway.heartbeat(), Err(End::Resume));
     }

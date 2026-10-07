@@ -123,6 +123,12 @@ fn composer(
                 // Grows with the draft up to a part of the window, then
                 // scrolls.
                 let tallest = ui.ctx().content_rect().height() * 0.4;
+                // Tab stays here, and types nothing for now (autocomplete
+                // will take it): it would move the cursor to the messages'
+                // buttons, where Space or Enter click.
+                if ui.memory(|m| m.has_focus(id)) {
+                    ui.input_mut(|i| i.events.retain(|e| !is_tab(e)));
+                }
                 let edit = egui::ScrollArea::vertical()
                     .id_salt(id)
                     .max_height(tallest)
@@ -140,6 +146,7 @@ fn composer(
                                 .margin(Margin::ZERO)
                                 .desired_rows(1)
                                 .desired_width(f32::INFINITY)
+                                .lock_focus(true)
                                 .return_key(newline),
                         )
                     })
@@ -150,7 +157,13 @@ fn composer(
                     ui.data_mut(|d| d.insert_temp(opened, channel));
                     edit.request_focus();
                 }
-                send = edit.has_focus() && ui.input(|i| enter_sends(&i.events));
+                // Only an Enter typed here sends: not the one that opened the
+                // channel as the cursor came, nor one held down.
+                let held = egui::Id::new(("composer-held", channel));
+                let had_focus = ui.data(|d| d.get_temp::<bool>(held)).unwrap_or(false);
+                let focused = edit.has_focus();
+                send = had_focus && focused && ui.input(|i| enter_sends(&i.events));
+                ui.data_mut(|d| d.insert_temp(held, focused));
                 if edit.changed() {
                     state.notice = None;
                 }
@@ -751,11 +764,21 @@ fn channel_title(model: &Model, view: View, channel: Id) -> String {
 }
 
 /// Whether this frame's keys send the draft: Enter does, Shift+Enter (a
-/// new line) does not.
+/// new line) and a held Enter repeating do not.
 fn enter_sends(events: &[egui::Event]) -> bool {
     events.iter().any(|event| {
-        matches!(event, egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. } if !modifiers.shift)
+        matches!(event, egui::Event::Key { key: egui::Key::Enter, pressed: true, repeat: false, modifiers, .. } if !modifiers.shift)
     })
+}
+
+fn is_tab(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key {
+            key: egui::Key::Tab,
+            ..
+        }
+    )
 }
 
 /// How opaque a message's content is drawn: half until Discord has it.
@@ -808,7 +831,9 @@ fn keyed_button(
     );
     let padding = egui::vec2(ui.spacing().button_padding.x, 0.0);
     let (rect, _) = ui.allocate_exact_size(galley.size() + 2.0 * padding, Sense::hover());
-    let response = ui.interact(rect, egui::Id::new(key), Sense::click());
+    // Clicked, never focused: the keyboard must not reach a message's
+    // buttons by accident (Tab, then Space).
+    let response = ui.interact(rect, egui::Id::new(key), Sense::CLICK);
     if ui.is_rect_visible(rect) {
         let visuals = ui.style().interact(&response);
         let frame = rect.expand(visuals.expansion);
@@ -981,11 +1006,9 @@ fn reaction_pill(
         .painter()
         .layout_no_wrap(label.clone(), theme::regular(13.0), color);
     let (rect, _) = ui.allocate_exact_size(galley.size() + PADDING * 2.0, Sense::hover());
-    let sense = if burst {
-        Sense::hover()
-    } else {
-        Sense::click()
-    };
+    // Clicked, never focused: the keyboard must not toggle a reaction by
+    // accident (Tab, then Space).
+    let sense = if burst { Sense::hover() } else { Sense::CLICK };
     let mut response = ui.interact(rect, id, sense);
     response.widget_info(|| {
         egui::WidgetInfo::selected(egui::WidgetType::Button, ui.is_enabled(), mine, &label)
@@ -1916,8 +1939,30 @@ mod tests {
         }
     }
 
-    /// Draws one frame, headless, with these events.
-    fn frame(ctx: &egui::Context, events: Vec<egui::Event>, draw: impl FnMut(&mut egui::Ui)) {
+    /// Draws one frame, headless, with these events. Each key pressed is
+    /// released at the end, as a tap: egui counts a key pressed again
+    /// before its release as held, repeating.
+    fn frame(ctx: &egui::Context, mut events: Vec<egui::Event>, draw: impl FnMut(&mut egui::Ui)) {
+        let released: Vec<egui::Event> = events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } => Some(egui::Event::Key {
+                    key: *key,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: *modifiers,
+                }),
+                _ => None,
+            })
+            .collect();
+        events.extend(released);
         let input = egui::RawInput {
             events,
             screen_rect: Some(Rect::from_min_size(
@@ -1962,7 +2007,7 @@ mod tests {
         let enter = key(egui::Key::Enter, egui::Modifiers::NONE);
         assert!(compose(&ctx, &model, &mut state, 111, vec![enter.clone()]));
         // A notice goes once the draft changes.
-        state.notice = Some((111, "/nick is not available in fastcord yet.".into()));
+        state.notice = Some((111, "Slash commands aren't supported yet.".into()));
         compose(&ctx, &model, &mut state, 111, vec![]);
         assert!(state.notice.is_some());
         compose(
@@ -1979,6 +2024,121 @@ mod tests {
         assert!(!state.drafts.contains_key(&101));
     }
 
+    fn context() -> egui::Context {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        ctx
+    }
+
+    /// The demo app on #général, one of its messages with a reaction.
+    fn demo_app(ctx: &egui::Context) -> App {
+        let mut model = crate::demo::model();
+        let emoji = model::Emoji {
+            id: None,
+            name: "👍".into(),
+            animated: false,
+        };
+        model.messages.get_mut(&111).unwrap()[9].reactions = vec![model::Reaction {
+            emoji,
+            count: 1,
+            ..model::Reaction::default()
+        }];
+        let mut app = App::new(ctx, Some(model), None);
+        app.selection.open_channel(111);
+        app
+    }
+
+    fn show(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+        frame(ctx, events, |ui| super::show(app, ui));
+    }
+
+    fn reactions(app: &App) -> Vec<Vec<model::Reaction>> {
+        let messages = app.model.as_ref().unwrap().messages(111);
+        messages.iter().map(|m| m.reactions.clone()).collect()
+    }
+
+    #[test]
+    fn tab_and_space_never_reach_the_messages() {
+        let ctx = context();
+        let mut app = demo_app(&ctx);
+        let before = reactions(&app);
+        show(&ctx, &mut app, vec![]);
+        show(&ctx, &mut app, vec![egui::Event::Text(":smi".into())]);
+        // Tab then Space, again and again: each time, a focused message
+        // widget would take Space as a click.
+        for _ in 0..8 {
+            show(
+                &ctx,
+                &mut app,
+                vec![key(egui::Key::Tab, egui::Modifiers::NONE)],
+            );
+            let space = key(egui::Key::Space, egui::Modifiers::NONE);
+            show(&ctx, &mut app, vec![space, egui::Event::Text(" ".into())]);
+        }
+        assert_eq!(reactions(&app), before, "no reaction toggled");
+        let draft = &app.composer.drafts[&111];
+        assert!(
+            draft.starts_with(":smi") && !draft.contains('\t'),
+            "{draft:?}"
+        );
+        let composer = egui::Id::new(("composer", 111_u64));
+        assert_eq!(
+            ctx.memory(|m| m.focused()),
+            Some(composer),
+            "the cursor stays"
+        );
+    }
+
+    #[test]
+    fn the_enter_that_opens_a_channel_does_not_send_its_draft() {
+        let ctx = context();
+        let mut app = demo_app(&ctx);
+        app.composer.drafts.insert(112, "brouillon".into());
+        show(&ctx, &mut app, vec![]);
+        show(&ctx, &mut app, vec![]);
+        let count = |app: &App| app.model.as_ref().unwrap().messages(112).len();
+        let before = count(&app);
+        // The Enter that chose the channel arrives as its composer takes
+        // the cursor, and stays down a while, repeating.
+        app.selection.open_channel(112);
+        for _ in 0..3 {
+            show(&ctx, &mut app, vec![held(egui::Key::Enter)]);
+        }
+        let draft = app.composer.drafts.get(&112).map(String::as_str);
+        assert_eq!(draft, Some("brouillon"));
+        assert_eq!(count(&app), before);
+        // Released, then a fresh Enter: that one sends.
+        show(&ctx, &mut app, vec![released(egui::Key::Enter)]);
+        show(
+            &ctx,
+            &mut app,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+        assert_eq!(count(&app), before + 1);
+    }
+
+    fn released(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: false,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// A key pressed and kept down: egui counts each press after the first
+    /// as a repeat.
+    fn held(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: true,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
     #[test]
     fn enter_sends_but_shift_enter_does_not() {
         assert!(enter_sends(&[key(egui::Key::Enter, egui::Modifiers::NONE)]));
@@ -1987,6 +2147,7 @@ mod tests {
             egui::Modifiers::SHIFT
         )]));
         assert!(!enter_sends(&[key(egui::Key::A, egui::Modifiers::NONE)]));
+        assert!(!enter_sends(&[held(egui::Key::Enter)]));
     }
 
     #[test]

@@ -39,9 +39,6 @@ const FACES: [(&str, &str); 3] = [
     ("unflip", "┬─┬ノ( º _ ºノ)"),
 ];
 
-/// The web client's other built-in commands, which fastcord does not run.
-const COMMANDS: [&str; 5] = ["me", "gif", "tts", "spoiler", "nick"];
-
 /// The message a draft sends. Surrounding whitespace goes, as Discord drops
 /// it anyway, `/shrug`, `/tableflip`, `/unflip` and `/me` become the text
 /// the web client makes of them, and shortcodes become emoji.
@@ -61,18 +58,15 @@ pub fn prepare(draft: &str) -> Result<String, Unsent> {
 }
 
 /// A draft the web client would act on instead of sending, as it would
-/// send it, or why it stays.
+/// send it, or why it stays. Any `/command` but the four the web client
+/// turns into text stays: posted as text it could ping (`/msg @Sam…`).
 fn command(text: &str) -> Result<String, Unsent> {
-    let unsupported = |what: &str| {
-        Err(Unsent::Unsupported(format!(
-            "{what} is not available in fastcord yet."
-        )))
-    };
+    let unsupported = |what: &str| Err(Unsent::Unsupported(what.to_owned()));
     if text.starts_with("s/") {
-        return unsupported("Editing with s/old/new");
+        return unsupported("Editing with s/old/new is not available in fastcord yet.");
     }
     if text == "+" || text.starts_with("+:") {
-        return unsupported("Reacting with +:emoji:");
+        return unsupported("Reacting with +:emoji: is not available in fastcord yet.");
     }
     let Some(command) = text.strip_prefix('/') else {
         return Ok(text.to_owned());
@@ -80,6 +74,14 @@ fn command(text: &str) -> Result<String, Unsent> {
     let (name, message) = command
         .split_once(char::is_whitespace)
         .unwrap_or((command, ""));
+    // `/home/dylan` names no command: text.
+    let named = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-'));
+    if !named {
+        return Ok(text.to_owned());
+    }
     let message = message.trim();
     if let Some((_, face)) = FACES.iter().find(|(n, _)| *n == name) {
         return Ok(format!("{message} {face}").trim().to_owned());
@@ -88,11 +90,15 @@ fn command(text: &str) -> Result<String, Unsent> {
         // `_${message}_`; without a message there is nothing to send.
         "me" if message.is_empty() => Ok(String::new()),
         "me" => Ok(format!("_{message}_")),
-        _ if COMMANDS.contains(&name) => unsupported(&format!("/{name}")),
-        // Not a command the web client knows: plain text.
-        _ => Ok(text.to_owned()),
+        // Built-in or a bot's (`/ban`, `/msg`, `/remind`…): the web client
+        // runs them, it never posts them. `\/text` sends text that starts
+        // with a slash: Discord shows the escaped slash as a slash.
+        _ => unsupported(SLASH),
     }
 }
+
+/// What the composer says of a slash command it keeps.
+pub const SLASH: &str = "Slash commands aren't supported yet. Start with \\/ to send a slash.";
 
 /// Discord's skin tone shortcodes, `:skin-tone-1:` (lightest) to `-5:`,
 /// as they follow an emoji.
@@ -272,6 +278,12 @@ mod tests {
             "/tts bonjour",
             "/gif chat",
             "/spoiler x",
+            "/msg @Sam secret",
+            "/ban",
+            "/timeout sam 10m",
+            "/thread idée",
+            "/giphy chat",
+            "/remind-me demain",
             "s/foo/bar",
             "+:tada:",
             "+",
@@ -281,9 +293,16 @@ mod tests {
                 "{draft}"
             );
         }
-        let Err(Unsent::Unsupported(hint)) = prepare("/nick Dyl") else {
-            unreachable!()
-        };
-        assert_eq!(hint, "/nick is not available in fastcord yet.");
+        assert_eq!(
+            prepare("/msg @Sam secret"),
+            Err(Unsent::Unsupported(SLASH.into()))
+        );
+        // An escaped slash is text, and Discord shows it as a slash.
+        assert_eq!(
+            prepare("\\/ban est une commande").as_deref(),
+            Ok("\\/ban est une commande")
+        );
+        assert_eq!(prepare("/home/dylan").as_deref(), Ok("/home/dylan"));
+        assert_eq!(prepare("/ est seul").as_deref(), Ok("/ est seul"));
     }
 }
