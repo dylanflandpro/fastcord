@@ -734,6 +734,7 @@ mod tests {
             content: content.into(),
             attachments: vec![],
             embeds: vec![],
+            reactions: vec![],
         }
     }
 

@@ -3,6 +3,7 @@
 //! The shapes follow Discord's own objects closely enough that the gateway
 //! can fill them later, and no further than the interface needs.
 
+use crate::events::ReactionChange;
 use std::collections::{HashMap, HashSet};
 
 /// A Discord snowflake: guilds, channels, users and messages all use one.
@@ -288,6 +289,108 @@ pub struct Message {
     pub content: String,
     pub attachments: Vec<Attachment>,
     pub embeds: Vec<Embed>,
+    /// In the order they were first added, as Discord lists them.
+    pub reactions: Vec<Reaction>,
+}
+
+/// An emoji as reactions carry it: a Unicode one by its text, or a
+/// server's own by id.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Emoji {
+    pub id: Option<Id>,
+    pub name: String,
+    pub animated: bool,
+}
+
+impl Emoji {
+    /// Discord's `emojiEquals`: a server's emoji by id (its name can
+    /// change), a Unicode one by its text.
+    pub fn same(&self, other: &Emoji) -> bool {
+        match self.id {
+            Some(id) => other.id == Some(id),
+            None => other.id.is_none() && self.name == other.name,
+        }
+    }
+
+    /// What a reaction shows: the emoji itself, or a server's as `:name:`
+    /// until fastcord draws them.
+    pub fn label(&self) -> String {
+        match self.id {
+            Some(_) => format!(":{}:", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// Everyone's reactions with one emoji. Super reactions (`burst`) count
+/// apart, as Discord keeps them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reaction {
+    pub emoji: Emoji,
+    pub count: u32,
+    /// Whether one of them is mine.
+    pub me: bool,
+    pub burst_count: u32,
+    pub me_burst: bool,
+}
+
+/// A plain reaction, or a super reaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReactionKind {
+    Normal,
+    Burst,
+}
+
+impl Message {
+    /// One more reaction, as the web client's message record counts it: my
+    /// own counts once however often Discord repeats it; in a DM, so does
+    /// the other person's, the only one who can add it.
+    pub fn add_reaction(&mut self, emoji: &Emoji, mine: bool, kind: ReactionKind, dm: bool) {
+        let Some(reaction) = self.reactions.iter_mut().find(|r| r.emoji.same(emoji)) else {
+            let (normal, burst) = match kind {
+                ReactionKind::Normal => (1, 0),
+                ReactionKind::Burst => (0, 1),
+            };
+            self.reactions.push(Reaction {
+                emoji: emoji.clone(),
+                count: normal,
+                me: mine && normal > 0,
+                burst_count: burst,
+                me_burst: mine && burst > 0,
+            });
+            return;
+        };
+        let (count, me) = match kind {
+            ReactionKind::Normal => (&mut reaction.count, &mut reaction.me),
+            ReactionKind::Burst => (&mut reaction.burst_count, &mut reaction.me_burst),
+        };
+        let theirs = *count - u32::from(*me);
+        if (mine && *me) || (dm && !mine && theirs >= 1) {
+            return;
+        }
+        *count += 1;
+        *me |= mine;
+    }
+
+    /// One reaction fewer; mine only once. An emoji nobody reacts with any
+    /// more goes.
+    pub fn remove_reaction(&mut self, emoji: &Emoji, mine: bool, kind: ReactionKind) {
+        let Some(at) = self.reactions.iter().position(|r| r.emoji.same(emoji)) else {
+            return;
+        };
+        let reaction = &mut self.reactions[at];
+        let (count, me) = match kind {
+            ReactionKind::Normal => (&mut reaction.count, &mut reaction.me),
+            ReactionKind::Burst => (&mut reaction.burst_count, &mut reaction.me_burst),
+        };
+        if !mine || *me {
+            *count = count.saturating_sub(1);
+        }
+        *me &= !mine;
+        if reaction.count == 0 && reaction.burst_count == 0 {
+            self.reactions.remove(at);
+        }
+    }
 }
 
 /// A file sent with a message.
@@ -631,7 +734,74 @@ impl Model {
                     self.users.insert(user.id, user);
                 }
             }
+            Update::Reactions {
+                channel,
+                message,
+                change,
+            } => self.change_reactions(channel, message, change),
         }
+    }
+
+    fn message_mut(&mut self, channel: Id, message: Id) -> Option<&mut Message> {
+        let loaded = self.messages.get_mut(&channel)?;
+        loaded.iter_mut().find(|m| m.id == message)
+    }
+
+    /// Applies what the gateway says of a message's reactions, if the
+    /// message is loaded (a history loaded later has them already).
+    fn change_reactions(&mut self, channel: Id, message: Id, change: ReactionChange) {
+        let (me, dm) = (self.me, self.dm(channel).is_some());
+        let Some(message) = self.message_mut(channel, message) else {
+            return;
+        };
+        match change {
+            ReactionChange::Add { emoji, user, kind } => {
+                message.add_reaction(&emoji, user == me, kind, dm)
+            }
+            ReactionChange::Remove { emoji, user, kind } => {
+                message.remove_reaction(&emoji, user == me, kind)
+            }
+            ReactionChange::AddMany(added) => {
+                for (emoji, users) in added {
+                    for user in users {
+                        message.add_reaction(&emoji, user == me, ReactionKind::Normal, dm);
+                    }
+                }
+            }
+            ReactionChange::Clear => message.reactions.clear(),
+            ReactionChange::ClearEmoji(emoji) => {
+                message.reactions.retain(|r| !r.emoji.same(&emoji))
+            }
+        }
+    }
+
+    /// Adds my reaction to a loaded message, or takes it back if it is
+    /// there, at once: `Some(true)` when added. Discord is told after.
+    pub fn toggle_reaction(&mut self, channel: Id, message: Id, emoji: &Emoji) -> Option<bool> {
+        let reacted = self
+            .messages(channel)
+            .iter()
+            .find(|m| m.id == message)?
+            .reactions
+            .iter()
+            .any(|r| r.emoji.same(emoji) && r.me);
+        self.react(channel, message, emoji, !reacted);
+        Some(!reacted)
+    }
+
+    /// Adds or removes my reaction at once, before Discord confirms it (and
+    /// undoes it if Discord refuses). `false` when the message is not loaded.
+    pub fn react(&mut self, channel: Id, message: Id, emoji: &Emoji, add: bool) -> bool {
+        let dm = self.dm(channel).is_some();
+        let Some(message) = self.message_mut(channel, message) else {
+            return false;
+        };
+        if add {
+            message.add_reaction(emoji, true, ReactionKind::Normal, dm);
+        } else {
+            message.remove_reaction(emoji, true, ReactionKind::Normal);
+        }
+        true
     }
 
     /// Moves a guild channel's newest message forward, never back: a late
@@ -679,6 +849,17 @@ pub struct Ack {
     /// Sent at once rather than after the usual delay: the channel had
     /// mentions, which the web client clears without waiting.
     pub immediate: bool,
+}
+
+/// My reaction to add or remove on Discord; the model already shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReactionRequest {
+    pub channel: Id,
+    /// `None` for a DM: the page the request comes from.
+    pub guild: Option<Id>,
+    pub message: Id,
+    pub emoji: Emoji,
+    pub add: bool,
 }
 
 /// A mute, for good or until a time Discord set.
@@ -1379,6 +1560,7 @@ mod tests {
             content: String::new(),
             attachments: vec![],
             embeds: vec![],
+            reactions: vec![],
         }
     }
 
@@ -1848,6 +2030,147 @@ mod tests {
         );
         assert_eq!(model.dm_badge(&model.dms[1], now), shown(false, 2, true));
         assert_eq!(model.dm_mentions(), 3);
+    }
+
+    fn emoji(name: &str, id: Option<Id>) -> Emoji {
+        Emoji {
+            id,
+            name: name.into(),
+            animated: false,
+        }
+    }
+
+    /// Each reaction as (label, count, mine, super count, super mine).
+    fn pills(message: &Message) -> Vec<(String, u32, bool, u32, bool)> {
+        message
+            .reactions
+            .iter()
+            .map(|r| (r.emoji.label(), r.count, r.me, r.burst_count, r.me_burst))
+            .collect()
+    }
+
+    #[test]
+    fn reactions_count_as_the_web_client_counts_them() {
+        use ReactionKind::{Burst, Normal};
+        let (thumbs, custom) = (emoji("👍", None), emoji("ferris", Some(7)));
+        let mut m = message(1, 2);
+        m.add_reaction(&thumbs, false, Normal, false);
+        m.add_reaction(&thumbs, true, Normal, false);
+        m.add_reaction(&thumbs, true, Normal, false);
+        m.add_reaction(&emoji("renamed", Some(7)), false, Burst, false);
+        m.add_reaction(&custom, false, Normal, false);
+        let t = |label: &str, n, me, b, mb| (label.to_owned(), n, me, b, mb);
+        assert_eq!(
+            pills(&m),
+            [
+                t("👍", 2, true, 0, false),
+                t(":renamed:", 1, false, 1, false)
+            ],
+            "mine counts once; a server emoji is the same by id"
+        );
+        m.remove_reaction(&thumbs, true, Normal);
+        m.remove_reaction(&thumbs, true, Normal);
+        m.remove_reaction(&custom, false, Burst);
+        assert_eq!(
+            pills(&m),
+            [
+                t("👍", 1, false, 0, false),
+                t(":renamed:", 1, false, 0, false)
+            ]
+        );
+        m.remove_reaction(&thumbs, false, Normal);
+        m.remove_reaction(&emoji("absent", None), false, Normal);
+        assert_eq!(pills(&m), [t(":renamed:", 1, false, 0, false)]);
+
+        // In a DM only the other person can add theirs: a repeat is an echo.
+        let mut dm = message(2, 2);
+        dm.add_reaction(&thumbs, false, Normal, true);
+        dm.add_reaction(&thumbs, false, Normal, true);
+        dm.add_reaction(&thumbs, true, Normal, true);
+        assert_eq!(pills(&dm), [t("👍", 2, true, 0, false)]);
+    }
+
+    fn on_message(model: &mut Model, channel: Id, change: crate::events::ReactionChange) {
+        model.apply(crate::events::Update::Reactions {
+            channel,
+            message: channel * 10,
+            change,
+        });
+    }
+
+    #[test]
+    fn reaction_events_apply_to_loaded_messages() {
+        use crate::events::ReactionChange;
+        let mut model = Model {
+            me: ME,
+            ..Model::default()
+        };
+        model.messages.insert(5, vec![message(50, 2)]);
+        let thumbs = emoji("👍", None);
+        let add = |user| ReactionChange::Add {
+            emoji: thumbs.clone(),
+            user,
+            kind: ReactionKind::Normal,
+        };
+        // A removal before its addition (events cross) changes nothing.
+        let remove = ReactionChange::Remove {
+            emoji: thumbs.clone(),
+            user: 3,
+            kind: ReactionKind::Normal,
+        };
+        on_message(&mut model, 5, remove);
+        for user in [3, ME, ME] {
+            on_message(&mut model, 5, add(user));
+        }
+        let many = vec![(thumbs.clone(), vec![4, ME]), (emoji("🦀", None), vec![4])];
+        on_message(&mut model, 5, ReactionChange::AddMany(many));
+        let t = |label: &str, n, me| (label.to_owned(), n, me, 0, false);
+        assert_eq!(
+            pills(&model.messages[&5][0]),
+            [t("👍", 3, true), t("🦀", 1, false)]
+        );
+        on_message(&mut model, 5, ReactionChange::ClearEmoji(thumbs.clone()));
+        assert_eq!(pills(&model.messages[&5][0]), [t("🦀", 1, false)]);
+        on_message(&mut model, 5, ReactionChange::Clear);
+        assert!(model.messages[&5][0].reactions.is_empty());
+        // Messages not loaded are left alone.
+        on_message(&mut model, 6, add(3));
+        assert!(!model.messages.contains_key(&6));
+    }
+
+    #[test]
+    fn my_reaction_shows_at_once_survives_its_echo_and_rolls_back() {
+        use crate::events::ReactionChange;
+        let mut model = Model {
+            me: ME,
+            ..Model::default()
+        };
+        model.messages.insert(5, vec![message(50, 2)]);
+        let thumbs = emoji("👍", None);
+        let echo = |model: &mut Model, add: bool| {
+            let (emoji, user, kind) = (thumbs.clone(), ME, ReactionKind::Normal);
+            let change = match add {
+                true => ReactionChange::Add { emoji, user, kind },
+                false => ReactionChange::Remove { emoji, user, kind },
+            };
+            on_message(model, 5, change);
+        };
+        let shown = |model: &Model| pills(&model.messages[&5][0]);
+        let mine = vec![("👍".to_owned(), 1, true, 0, false)];
+
+        assert_eq!(model.toggle_reaction(5, 50, &thumbs), Some(true));
+        echo(&mut model, true);
+        assert_eq!(shown(&model), mine, "the echo of mine is not a second one");
+        assert_eq!(model.toggle_reaction(5, 50, &thumbs), Some(false));
+        assert!(shown(&model).is_empty());
+        echo(&mut model, false);
+        assert!(shown(&model).is_empty());
+
+        // Refused: undone.
+        assert_eq!(model.toggle_reaction(5, 50, &thumbs), Some(true));
+        model.react(5, 50, &thumbs, false);
+        assert!(shown(&model).is_empty());
+        assert_eq!(model.toggle_reaction(5, 99, &thumbs), None, "not loaded");
     }
 
     fn create(model: &mut Model, channel: Id, guild: Option<Id>, message: Message, ping: Ping) {

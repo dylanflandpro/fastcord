@@ -8,7 +8,7 @@
 
 use crate::acks::{Delivery, MAX_RETRY_WAIT};
 use crate::credentials::Token;
-use crate::model::{Ack, DISCORD_EPOCH_MS, Id, User};
+use crate::model::{Ack, DISCORD_EPOCH_MS, Emoji, Id, ReactionRequest, User};
 use crate::remote_auth;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -516,6 +516,44 @@ impl Api {
         delivery
     }
 
+    /// Adds or removes my reaction, as the web client's reaction actions
+    /// do. Never fails: what went wrong says whether to try again.
+    pub async fn react(&self, token: &Token, reaction: &ReactionRequest) -> Reacted {
+        let web = self.web().await;
+        let page = match reaction.guild {
+            Some(guild) => format!("/channels/{guild}/{}", reaction.channel),
+            None => format!("/channels/@me/{}", reaction.channel),
+        };
+        let url = format!("{BASE}{}", reaction_path(reaction));
+        let request = match reaction.add {
+            true => self.client.put(url),
+            false => self.client.delete(url),
+        };
+        let sent = Self::dress(
+            request.header(reqwest::header::AUTHORIZATION, token.expose()),
+            &web,
+            &page,
+        )
+        .send()
+        .await;
+        let Ok(response) = sent else {
+            return Reacted::Failed;
+        };
+        let status = response.status();
+        let wait = match status {
+            reqwest::StatusCode::TOO_MANY_REQUESTS => response
+                .json::<RateLimited>()
+                .await
+                .ok()
+                .map(|limited| limited.retry_after),
+            _ => None,
+        };
+        if !status.is_success() {
+            log::info!("reaction answered HTTP {status}");
+        }
+        reacted(status.as_u16(), wait)
+    }
+
     /// Ends the session on Discord's side, so the token stops working even
     /// if a copy survived somewhere.
     pub async fn logout(&self, token: &Token) -> Result<(), Error> {
@@ -557,6 +595,65 @@ fn delivery(status: u16, retry_after: Option<f64>) -> Delivery {
     }
 }
 
+/// What a reaction request's answer means.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Reacted {
+    Done,
+    /// 401: the session is over.
+    Unauthorized,
+    /// 429, with the wait Discord asked for.
+    RateLimited(Duration),
+    /// Discord said no (too many reactions, blocked, gone): trying again
+    /// would not help.
+    Refused,
+    /// The network or Discord failed: worth one more try.
+    Failed,
+}
+
+fn reacted(status: u16, retry_after: Option<f64>) -> Reacted {
+    match status {
+        200..=299 => Reacted::Done,
+        401 => Reacted::Unauthorized,
+        429 => Reacted::RateLimited(retry_after.map_or(MAX_RETRY_AFTER, self::retry_after)),
+        400..=499 => Reacted::Refused,
+        _ => Reacted::Failed,
+    }
+}
+
+/// The web client's reaction URLs: `PUT …/reactions/{emoji}/@me` with the
+/// `location` it was added from and its `type` (0, plain), and
+/// `DELETE …/reactions/{emoji}/{type}/@me` with `location` and `burst`.
+/// Clicking a reaction under a message is the location "Message".
+fn reaction_path(reaction: &ReactionRequest) -> String {
+    let base = format!(
+        "/channels/{}/messages/{}/reactions/{}",
+        reaction.channel,
+        reaction.message,
+        emoji_segment(&reaction.emoji)
+    );
+    match reaction.add {
+        true => format!("{base}/@me?location=Message&type=0"),
+        false => format!("{base}/0/@me?location=Message&burst=false"),
+    }
+}
+
+/// An emoji in a URL: a Unicode one by its text, a server's as
+/// `name:id`, percent-encoded.
+fn emoji_segment(emoji: &Emoji) -> String {
+    let text = match emoji.id {
+        Some(id) => format!("{}:{id}", emoji.name),
+        None => emoji.name.clone(),
+    };
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b':' => {
+                char::from(b).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 /// Days since Discord's epoch, rounded up, as the web client reports when
 /// a channel was last viewed.
 fn last_viewed(now: jiff::Timestamp) -> i64 {
@@ -577,6 +674,50 @@ fn ack_body(ack: &Ack, now: jiff::Timestamp) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reaction_requests_follow_the_web_client() {
+        let request = |name: &str, id, add| ReactionRequest {
+            channel: 2,
+            guild: None,
+            message: 3,
+            emoji: Emoji {
+                id,
+                name: name.into(),
+                animated: false,
+            },
+            add,
+        };
+        assert_eq!(
+            reaction_path(&request("👍", None, true)),
+            "/channels/2/messages/3/reactions/%F0%9F%91%8D/@me?location=Message&type=0"
+        );
+        assert_eq!(
+            reaction_path(&request("ferris", Some(77), false)),
+            "/channels/2/messages/3/reactions/ferris:77/0/@me?location=Message&burst=false"
+        );
+        assert_eq!(
+            emoji_segment(&request("a b/#?", None, true).emoji),
+            "a%20b%2F%23%3F"
+        );
+    }
+
+    #[test]
+    fn reaction_answers() {
+        assert_eq!(reacted(204, None), Reacted::Done);
+        assert_eq!(reacted(401, None), Reacted::Unauthorized);
+        assert_eq!(
+            reacted(429, Some(1.5)),
+            Reacted::RateLimited(Duration::from_millis(1500))
+        );
+        assert_eq!(
+            reacted(429, Some(600.0)),
+            Reacted::RateLimited(MAX_RETRY_AFTER)
+        );
+        assert_eq!(reacted(403, None), Reacted::Refused);
+        assert_eq!(reacted(404, None), Reacted::Refused);
+        assert_eq!(reacted(502, None), Reacted::Failed);
+    }
 
     #[test]
     fn ack_answers_say_what_comes_next() {

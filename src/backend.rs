@@ -8,7 +8,7 @@ use crate::api::{self, Api};
 use crate::credentials::{self, Token};
 use crate::events::{Decoder, Update};
 use crate::gateway::{self, End, Gateway};
-use crate::model::{Ack, Id, Model, User};
+use crate::model::{Ack, Id, Model, ReactionRequest, User};
 use crate::notify::{self, Notice, Notifications};
 use crate::remote_auth::{self, Progress};
 use futures_util::StreamExt as _;
@@ -40,6 +40,9 @@ pub enum Command {
     /// Drop the ack waiting for a channel: marked unread elsewhere, or no
     /// longer mine to read.
     DropAck(Id),
+    /// Add or remove my reaction; the model already shows it. Writes to the
+    /// account.
+    React(ReactionRequest),
 }
 
 #[derive(Debug, PartialEq)]
@@ -89,6 +92,8 @@ pub enum Event {
     },
     /// A notification for this channel was clicked.
     Open(Id),
+    /// Discord did not take a reaction: the interface undoes it.
+    ReactionFailed(ReactionRequest),
 }
 
 pub struct Backend {
@@ -461,6 +466,7 @@ where
     while commands.try_recv().is_ok() {}
     let mut loading = FuturesUnordered::new();
     let mut sending = FuturesUnordered::new();
+    let mut reacting = FuturesUnordered::new();
     // Each request with the token in force when it leaves.
     let launch = |(ack, attempt): (Ack, u32)| {
         let flight = send(ack, Token::new(token.borrow().expose().to_owned()));
@@ -484,9 +490,18 @@ where
                 }
                 Some(Command::Ack(ack)) => acks.borrow_mut().push(ack, Instant::now()),
                 Some(Command::DropAck(channel)) => acks.borrow_mut().cancel(channel),
+                Some(Command::React(reaction)) => {
+                    let token = Token::new(token.borrow().expose().to_owned());
+                    reacting.push(async move { react(api, &token, reaction, emit).await });
+                }
                 Some(Command::Retry) => {}
             },
             Some(revoked) = loading.next(), if !loading.is_empty() => {
+                if revoked {
+                    return Served::Revoked;
+                }
+            }
+            Some(revoked) = reacting.next(), if !reacting.is_empty() => {
                 if revoked {
                     return Served::Revoked;
                 }
@@ -563,6 +578,50 @@ fn landed(
     acks.borrow_mut()
         .finished(ack, attempt, retry, Instant::now());
     false
+}
+
+/// What to do after a reaction request, as the web client does: a rate
+/// limit is waited out once, another failure is tried again once at once;
+/// a refusal, or a second failure, undoes the reaction.
+#[derive(Debug, PartialEq)]
+enum Next {
+    Done,
+    Retry(Duration),
+    Undo,
+    Revoked,
+}
+
+fn after_reaction(reacted: api::Reacted, retried: bool) -> Next {
+    match reacted {
+        api::Reacted::Done => Next::Done,
+        api::Reacted::Unauthorized => Next::Revoked,
+        api::Reacted::RateLimited(wait) if !retried => Next::Retry(wait),
+        api::Reacted::Failed if !retried => Next::Retry(Duration::ZERO),
+        api::Reacted::RateLimited(_) | api::Reacted::Failed | api::Reacted::Refused => Next::Undo,
+    }
+}
+
+/// Sends one reaction, reporting it undone when Discord does not take it.
+/// `true` when Discord says the token is no longer valid.
+async fn react(api: &Api, token: &Token, reaction: ReactionRequest, emit: Emit<'_>) -> bool {
+    let mut retried = false;
+    loop {
+        match after_reaction(api.react(token, &reaction).await, retried) {
+            Next::Done => return false,
+            Next::Retry(wait) => {
+                retried = true;
+                tokio::time::sleep(wait).await;
+            }
+            Next::Undo => {
+                emit(Event::ReactionFailed(reaction));
+                return false;
+            }
+            Next::Revoked => {
+                emit(Event::ReactionFailed(reaction));
+                return true;
+            }
+        }
+    }
 }
 
 /// Loads one page and reports it. `true` when Discord says the token is no
@@ -797,6 +856,7 @@ mod tests {
                 content: "hi".into(),
                 attachments: vec![],
                 embeds: vec![],
+                reactions: vec![],
             },
             ping: crate::model::Ping::default(),
         };
@@ -813,6 +873,20 @@ mod tests {
         assert!(signs_out(Some(&Ended::Revoked)));
         assert!(!signs_out(Some(&Ended::Refused(4004))));
         assert!(!signs_out(Some(&Ended::Unreadable)));
+    }
+
+    #[test]
+    fn a_reaction_is_tried_twice_at_most_then_undone() {
+        use api::Reacted::*;
+        let wait = Duration::from_secs(2);
+        assert_eq!(after_reaction(Done, false), Next::Done);
+        assert_eq!(after_reaction(RateLimited(wait), false), Next::Retry(wait));
+        assert_eq!(after_reaction(Failed, false), Next::Retry(Duration::ZERO));
+        assert_eq!(after_reaction(Done, true), Next::Done);
+        assert_eq!(after_reaction(RateLimited(wait), true), Next::Undo);
+        assert_eq!(after_reaction(Failed, true), Next::Undo);
+        assert_eq!(after_reaction(Refused, false), Next::Undo);
+        assert_eq!(after_reaction(Unauthorized, false), Next::Revoked);
     }
 
     #[test]

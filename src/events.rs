@@ -9,8 +9,8 @@
 use crate::api::{ApiUser, optional_snowflake, snowflake};
 use crate::model::{
     Attachment, Channel, ChannelKind, ChannelSettings, DmChannel, Embed, EmbedField, EmbedImage,
-    Guild, GuildSettings, Id, Message, Model, Mute, Notify, Overwrite, OverwriteKind, Permissions,
-    Ping, ReadState, Role, Unreads, User,
+    Emoji, Guild, GuildSettings, Id, Message, Model, Mute, Notify, Overwrite, OverwriteKind,
+    Permissions, Ping, Reaction, ReactionKind, ReadState, Role, Unreads, User,
 };
 use serde_json::value::RawValue;
 use std::collections::HashMap;
@@ -120,6 +120,35 @@ pub enum Update {
         guild: Option<Id>,
         people: Vec<(User, Option<Option<String>>)>,
     },
+    /// Reactions on a message changed.
+    Reactions {
+        channel: Id,
+        message: Id,
+        change: ReactionChange,
+    },
+}
+
+/// What happened to a message's reactions.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReactionChange {
+    Add {
+        emoji: Emoji,
+        user: Id,
+        kind: ReactionKind,
+    },
+    Remove {
+        emoji: Emoji,
+        user: Id,
+        kind: ReactionKind,
+    },
+    /// Several at once: the gateway gathers reactions that come in quick
+    /// succession (the DEBOUNCE_MESSAGE_REACTIONS capability), each emoji
+    /// with who added it. The web client counts them all as plain ones.
+    AddMany(Vec<(Emoji, Vec<Id>)>),
+    /// A moderator removed them all.
+    Clear,
+    /// A moderator removed every reaction with this emoji.
+    ClearEmoji(Emoji),
 }
 
 /// How many messages a history page asks for, as the official client does.
@@ -155,6 +184,8 @@ struct WireMessage {
     /// Read leniently: an odd value must not cost the message.
     #[serde(default, deserialize_with = "lenient_one")]
     flags: Option<u64>,
+    #[serde(default, deserialize_with = "lenient")]
+    reactions: Vec<WireReaction>,
 }
 
 /// A user a message mentions, with their membership in a guild.
@@ -346,6 +377,7 @@ impl From<WireMessage> for Message {
             content: wire.content,
             attachments: wire.attachments.into_iter().map(Into::into).collect(),
             embeds: wire.embeds.into_iter().map(Into::into).collect(),
+            reactions: wire.reactions.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -521,6 +553,103 @@ struct WireChannelOverride {
     message_notifications: Option<u8>,
     #[serde(default)]
     flags: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct WireEmoji {
+    /// Null for a Unicode emoji.
+    #[serde(default, deserialize_with = "optional_snowflake")]
+    id: Option<Id>,
+    /// Null for a server emoji that was deleted.
+    name: Option<String>,
+    #[serde(default)]
+    animated: bool,
+}
+
+impl From<WireEmoji> for Emoji {
+    fn from(wire: WireEmoji) -> Self {
+        Emoji {
+            id: wire.id,
+            name: wire.name.unwrap_or_default(),
+            animated: wire.animated,
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct WireReaction {
+    emoji: WireEmoji,
+    /// Plain and super reactions together.
+    #[serde(default)]
+    count: u32,
+    count_details: Option<CountDetails>,
+    #[serde(default)]
+    me: bool,
+    #[serde(default)]
+    me_burst: bool,
+    #[serde(default)]
+    burst_count: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct CountDetails {
+    normal: Option<u32>,
+}
+
+impl From<WireReaction> for Reaction {
+    fn from(wire: WireReaction) -> Self {
+        let normal = wire.count_details.and_then(|d| d.normal);
+        Reaction {
+            emoji: wire.emoji.into(),
+            count: normal.unwrap_or(wire.count.saturating_sub(wire.burst_count)),
+            me: wire.me,
+            burst_count: wire.burst_count,
+            me_burst: wire.me_burst,
+        }
+    }
+}
+
+/// MESSAGE_REACTION_ADD and MESSAGE_REACTION_REMOVE.
+#[derive(serde::Deserialize)]
+struct ReactionEvent {
+    #[serde(deserialize_with = "snowflake")]
+    user_id: Id,
+    #[serde(deserialize_with = "snowflake")]
+    channel_id: Id,
+    #[serde(deserialize_with = "snowflake")]
+    message_id: Id,
+    emoji: WireEmoji,
+    /// 1 for a super reaction.
+    #[serde(rename = "type", default)]
+    kind: u8,
+}
+
+/// MESSAGE_REACTION_ADD_MANY.
+#[derive(serde::Deserialize)]
+struct ReactionsAdded {
+    #[serde(deserialize_with = "snowflake")]
+    channel_id: Id,
+    #[serde(deserialize_with = "snowflake")]
+    message_id: Id,
+    #[serde(default, deserialize_with = "lenient")]
+    reactions: Vec<ReactionUsers>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReactionUsers {
+    emoji: WireEmoji,
+    #[serde(default)]
+    users: Vec<String>,
+}
+
+/// MESSAGE_REACTION_REMOVE_ALL and MESSAGE_REACTION_REMOVE_EMOJI.
+#[derive(serde::Deserialize)]
+struct ReactionsRemoved {
+    #[serde(deserialize_with = "snowflake")]
+    channel_id: Id,
+    #[serde(deserialize_with = "snowflake")]
+    message_id: Id,
+    emoji: Option<WireEmoji>,
 }
 
 /// Discord's notification levels; 3 (and anything else) inherits.
@@ -1330,6 +1459,54 @@ impl Decoder {
                         .into_iter()
                         .map(|c| (c.id, c.last_message_id))
                         .collect(),
+                }]
+            }
+            "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE" => {
+                let event: ReactionEvent = serde_json::from_str(data)?;
+                let (emoji, user) = (event.emoji.into(), event.user_id);
+                let kind = match event.kind {
+                    1 => ReactionKind::Burst,
+                    _ => ReactionKind::Normal,
+                };
+                let change = match name {
+                    "MESSAGE_REACTION_ADD" => ReactionChange::Add { emoji, user, kind },
+                    _ => ReactionChange::Remove { emoji, user, kind },
+                };
+                vec![Update::Reactions {
+                    channel: event.channel_id,
+                    message: event.message_id,
+                    change,
+                }]
+            }
+            "MESSAGE_REACTION_ADD_MANY" => {
+                let added: ReactionsAdded = serde_json::from_str(data)?;
+                let reactions = added
+                    .reactions
+                    .into_iter()
+                    .map(|r| {
+                        let users = r.users.iter().filter_map(|u| u.parse().ok()).collect();
+                        (r.emoji.into(), users)
+                    })
+                    .collect();
+                vec![Update::Reactions {
+                    channel: added.channel_id,
+                    message: added.message_id,
+                    change: ReactionChange::AddMany(reactions),
+                }]
+            }
+            "MESSAGE_REACTION_REMOVE_ALL" | "MESSAGE_REACTION_REMOVE_EMOJI" => {
+                let removed: ReactionsRemoved = serde_json::from_str(data)?;
+                let change = match removed.emoji {
+                    Some(emoji) if name == "MESSAGE_REACTION_REMOVE_EMOJI" => {
+                        ReactionChange::ClearEmoji(emoji.into())
+                    }
+                    _ if name == "MESSAGE_REACTION_REMOVE_ALL" => ReactionChange::Clear,
+                    _ => return Ok(Vec::new()),
+                };
+                vec![Update::Reactions {
+                    channel: removed.channel_id,
+                    message: removed.message_id,
+                    change,
                 }]
             }
             "USER_SETTINGS_PROTO_UPDATE" => {
@@ -2395,6 +2572,120 @@ mod tests {
         assert_eq!(update(&mut decoder, event(&dnd, true, 2)), [], "frecency");
         let other = settings_proto(None, 0);
         assert_eq!(update(&mut decoder, event(&other, true, 1)), []);
+    }
+
+    #[test]
+    fn messages_carry_their_reactions() {
+        let page = r#"[{"id":"50","channel_id":"2002","content":"hi","author":{"id":"9001","username":"marc"},"reactions":[
+            {"emoji":{"id":null,"name":"👍"},"count":3,"count_details":{"burst":1,"normal":2},"burst_colors":[],"me_burst":true,"burst_me":true,"me":false,"burst_count":1},
+            {"emoji":{"id":"77","name":"ferris","animated":true},"count":1,"me":true},
+            {"emoji":{"id":"78","name":null},"count":2,"burst_count":1},
+            {"emoji":"unknown"}
+        ]}]"#;
+        let Update::History { messages, .. } = history(2002, page).unwrap() else {
+            panic!("expected a page");
+        };
+        let reactions = &messages[0].reactions;
+        let thumbs = Reaction {
+            emoji: Emoji {
+                id: None,
+                name: "👍".into(),
+                animated: false,
+            },
+            count: 2,
+            me: false,
+            burst_count: 1,
+            me_burst: true,
+        };
+        assert_eq!(reactions[0], thumbs);
+        assert_eq!(
+            (
+                &reactions[1].emoji.label(),
+                reactions[1].emoji.animated,
+                reactions[1].me
+            ),
+            (&":ferris:".to_owned(), true, true)
+        );
+        assert_eq!(
+            (reactions[2].count, reactions[2].emoji.id),
+            (1, Some(78)),
+            "without details"
+        );
+        assert_eq!(reactions.len(), 3, "an unreadable one is skipped");
+    }
+
+    #[test]
+    fn reaction_events_become_changes() {
+        let mut decoder = Decoder::default();
+        let mut event = |name: &str, data: &str| {
+            let [
+                Update::Reactions {
+                    channel,
+                    message,
+                    change,
+                },
+            ] = &decoder.event(name, data).unwrap()[..]
+            else {
+                panic!("expected a reaction change for {name}");
+            };
+            assert_eq!((*channel, *message), (2002, 50));
+            change.clone()
+        };
+        let thumbs = Emoji {
+            id: None,
+            name: "👍".into(),
+            animated: false,
+        };
+        let custom = Emoji {
+            id: Some(77),
+            name: "ferris".into(),
+            animated: false,
+        };
+        let added = event(
+            "MESSAGE_REACTION_ADD",
+            r#"{"user_id":"9001","channel_id":"2002","message_id":"50","guild_id":"1001","emoji":{"id":null,"name":"👍"},"burst":false,"type":0,"message_author_id":"9000"}"#,
+        );
+        assert_eq!(
+            added,
+            ReactionChange::Add {
+                emoji: thumbs.clone(),
+                user: 9001,
+                kind: ReactionKind::Normal
+            }
+        );
+        let removed = event(
+            "MESSAGE_REACTION_REMOVE",
+            r#"{"user_id":"9001","channel_id":"2002","message_id":"50","emoji":{"id":"77","name":"ferris"},"burst":true,"type":1}"#,
+        );
+        assert_eq!(
+            removed,
+            ReactionChange::Remove {
+                emoji: custom.clone(),
+                user: 9001,
+                kind: ReactionKind::Burst
+            }
+        );
+        let many = event(
+            "MESSAGE_REACTION_ADD_MANY",
+            r#"{"channel_id":"2002","message_id":"50","guild_id":"1001","reactions":[{"emoji":{"id":null,"name":"👍"},"users":["9001","9002"]},{"emoji":{"id":"77","name":"ferris"},"users":["9000"]}]}"#,
+        );
+        assert_eq!(
+            many,
+            ReactionChange::AddMany(vec![
+                (thumbs.clone(), vec![9001, 9002]),
+                (custom, vec![9000])
+            ])
+        );
+        let all = event(
+            "MESSAGE_REACTION_REMOVE_ALL",
+            r#"{"channel_id":"2002","message_id":"50","guild_id":"1001"}"#,
+        );
+        assert_eq!(all, ReactionChange::Clear);
+        let one = event(
+            "MESSAGE_REACTION_REMOVE_EMOJI",
+            r#"{"channel_id":"2002","message_id":"50","emoji":{"id":null,"name":"👍"}}"#,
+        );
+        assert_eq!(one, ReactionChange::ClearEmoji(thumbs));
     }
 
     #[test]

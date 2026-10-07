@@ -3,7 +3,7 @@
 use crate::backend::{Backend, Command, Event, Link, Session};
 use crate::events::Update;
 use crate::media::{self, Media};
-use crate::model::{Ack, ChannelKind, Id, Model};
+use crate::model::{Ack, ChannelKind, Emoji, Id, Model, ReactionRequest};
 use crate::notify::{self, Attention};
 use crate::theme::{self, Catalog, Palette};
 use std::collections::{HashMap, HashSet};
@@ -346,6 +346,26 @@ impl App {
         }
     }
 
+    /// Adds my reaction to a message, or removes it if it is there: at once
+    /// on screen, then on Discord. Demo runs only change what is shown.
+    pub fn toggle_reaction(&mut self, channel: Id, message: Id, emoji: Emoji) {
+        let Some(model) = &mut self.model else {
+            return;
+        };
+        let Some(add) = model.toggle_reaction(channel, message, &emoji) else {
+            return;
+        };
+        if let Some(backend) = &self.backend {
+            backend.send(Command::React(ReactionRequest {
+                channel,
+                guild: model.guild_of(channel),
+                message,
+                emoji,
+                add,
+            }));
+        }
+    }
+
     /// Whether notifications show what messages say.
     pub fn notification_content(&self) -> bool {
         self.notifications.show_content()
@@ -514,6 +534,12 @@ impl App {
                     self.reading.outstanding.remove(&channel);
                     if let (Some(model), Some(flags)) = (&mut self.model, flags) {
                         model.save_flags(channel, flags);
+                    }
+                }
+                Event::ReactionFailed(reaction) => {
+                    if let Some(model) = &mut self.model {
+                        let undo = !reaction.add;
+                        model.react(reaction.channel, reaction.message, &reaction.emoji, undo);
                     }
                 }
                 Event::Open(channel) => {

@@ -42,6 +42,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         conversation(selection, model, &palette, status, &mut app.media, ui)
     };
     app.report_bottom(bottom);
+    let clicked =
+        ui.data_mut(|d| d.remove_temp::<(Id, model::Emoji)>(egui::Id::new(REACTION_CLICK)));
+    if let (Some((message, emoji)), Some(channel)) = (clicked, app.selection.channel) {
+        app.toggle_reaction(channel, message, emoji);
+    }
     viewer(&mut app.media, &palette, ui);
     match request {
         Some(HistoryRequest::Older(channel)) => app.request_history(channel, true),
@@ -643,6 +648,67 @@ fn message_line(
     body.blocks(ui, &parsed(ui, &message.content));
     attachments(ui, &body, media, &message.attachments);
     embeds(ui, &body, media, &message.embeds);
+    reactions(ui, palette, message);
+}
+
+/// Where a click on a reaction waits for `show`, which can change the app.
+const REACTION_CLICK: &str = "reaction-click";
+
+/// A message's reactions, in pills under it: the emoji and how many, in the
+/// accent colour when one is mine. Clicking a plain one adds mine or takes
+/// it back. Super reactions (Nitro) get a pill of their own, outlined in
+/// the warning colour, and only show.
+fn reactions(ui: &mut egui::Ui, palette: &Palette, message: &Message) {
+    if message.reactions.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+        for reaction in &message.reactions {
+            let label = reaction.emoji.label();
+            if reaction.count > 0
+                && reaction_pill(ui, palette, &label, reaction.count, reaction.me, false)
+                    .on_hover_cursor(CursorIcon::PointingHand)
+                    .clicked()
+            {
+                let click = (message.id, reaction.emoji.clone());
+                ui.data_mut(|d| d.insert_temp(egui::Id::new(REACTION_CLICK), click));
+            }
+            if reaction.burst_count > 0 {
+                let (count, mine) = (reaction.burst_count, reaction.me_burst);
+                reaction_pill(ui, palette, &label, count, mine, true);
+            }
+        }
+    });
+}
+
+fn reaction_pill(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    label: &str,
+    count: u32,
+    mine: bool,
+    burst: bool,
+) -> Response {
+    let (fill, stroke, text) = match mine {
+        true => (
+            palette.accent.gamma_multiply(0.15),
+            palette.accent,
+            palette.text,
+        ),
+        false => (palette.surface, palette.outline, palette.secondary),
+    };
+    let stroke = if burst { palette.warning } else { stroke };
+    let text = egui::RichText::new(format!("{label} {}", model::badge_count(count)))
+        .font(theme::regular(13.0))
+        .color(text);
+    ui.add(
+        egui::Button::new(text)
+            .fill(fill)
+            .stroke(Stroke::new(1.0, stroke))
+            .corner_radius(CornerRadius::same(8)),
+    )
 }
 
 /// A message's embeds: pictures and GIF links on their own, the rest as
