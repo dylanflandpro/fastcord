@@ -595,20 +595,24 @@ fn landed(
 /// What to do after a reaction request, as the web client does: a rate
 /// limit is waited out once, another failure is tried again once at once;
 /// a refusal, or a second failure, undoes the reaction. A 401 on a token
-/// rotated since tries again with the new one; on the token in force, the
-/// session is over.
+/// rotated since tries once more with the new one, whatever was tried
+/// before; on the token in force, the session is over.
 #[derive(Debug, PartialEq)]
 enum Next {
     Done,
     Retry(Duration),
+    /// Again at once with the token now in force.
+    Rotated,
     Undo,
     Revoked,
 }
 
+/// `rotated`: the token used is no longer the one in force, and no try
+/// was made again for that yet.
 fn after_reaction(reacted: api::Reacted, retried: bool, rotated: bool) -> Next {
     match reacted {
         api::Reacted::Done => Next::Done,
-        api::Reacted::Unauthorized if rotated && !retried => Next::Retry(Duration::ZERO),
+        api::Reacted::Unauthorized if rotated => Next::Rotated,
         api::Reacted::Unauthorized => Next::Revoked,
         api::Reacted::RateLimited(wait) if !retried => Next::Retry(wait),
         api::Reacted::Failed if !retried => Next::Retry(Duration::ZERO),
@@ -630,13 +634,14 @@ where
     S: Fn(ReactionRequest, Token) -> F,
     F: Future<Output = (api::Reacted, Token)>,
 {
-    let mut retried = false;
+    let (mut retried, mut retried_rotated) = (false, false);
     loop {
         let current = || Token::new(token.borrow().expose().to_owned());
         let (reacted, used) = send(reaction.clone(), current()).await;
-        let rotated = used.expose() != token.borrow().expose();
+        let rotated = !retried_rotated && used.expose() != token.borrow().expose();
         match after_reaction(reacted, retried, rotated) {
             Next::Done => return Outcome::Taken,
+            Next::Rotated => retried_rotated = true,
             Next::Retry(wait) => {
                 retried = true;
                 tokio::time::sleep(wait).await;
@@ -1058,6 +1063,20 @@ mod tests {
             );
             assert_eq!(*used.borrow(), ["first", "second"]);
 
+            // A failure retried, then a rotation: still one more try.
+            *token.borrow_mut() = Token::new("third".into());
+            let answers = RefCell::new(vec![Failed, Unauthorized, Done].into_iter());
+            let rotating = |_: ReactionRequest, with: Token| {
+                let answer = answers.borrow_mut().next().expect("an answer");
+                // Rotated while the 401 was on its way.
+                if answer == Unauthorized {
+                    *token.borrow_mut() = Token::new("fourth".into());
+                }
+                async move { (answer, with) }
+            };
+            let outcome = react(&rotating, &token, &reaction(5, true)).await;
+            assert_eq!(outcome, Outcome::Taken);
+
             let answers = RefCell::new(vec![Unauthorized].into_iter());
             let send = |_: ReactionRequest, with: Token| {
                 let answer = answers.borrow_mut().next().expect("an answer");
@@ -1104,12 +1123,10 @@ mod tests {
         assert_eq!(next(Refused, false), Next::Undo);
         assert_eq!(next(Unauthorized, false), Next::Revoked);
         let rotated = after_reaction(Unauthorized, false, true);
-        assert_eq!(
-            rotated,
-            Next::Retry(Duration::ZERO),
-            "a token rotated since"
-        );
-        assert_eq!(after_reaction(Unauthorized, true, true), Next::Revoked);
+        assert_eq!(rotated, Next::Rotated, "a token rotated since");
+        let after_a_retry = after_reaction(Unauthorized, true, true);
+        assert_eq!(after_a_retry, Next::Rotated, "even after a first retry");
+        assert_eq!(after_reaction(Unauthorized, true, false), Next::Revoked);
     }
 
     #[test]
