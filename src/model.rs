@@ -326,14 +326,18 @@ impl Model {
     pub fn apply(&mut self, update: crate::events::Update) {
         use crate::events::Update;
         match update {
-            Update::Ready(model) => *self = model,
             Update::GuildUpsert(guild) => match self.guilds.iter_mut().find(|g| g.id == guild.id) {
                 Some(existing) => *existing = guild,
                 None => self.guilds.push(guild),
             },
-            Update::GuildRename { id, name } => {
+            Update::GuildChanged { id, name, owner_id } => {
                 if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == id) {
-                    guild.name = name;
+                    if let Some(name) = name {
+                        guild.name = name;
+                    }
+                    if let Some(owner_id) = owner_id {
+                        guild.owner_id = owner_id;
+                    }
                 }
             }
             Update::GuildRemove(id) => self.guilds.retain(|g| g.id != id),
@@ -684,11 +688,13 @@ mod tests {
             channel: 10,
         });
         assert!(model.guild(GUILD).unwrap().channel(10).is_none());
-        model.apply(Update::GuildRename {
+        model.apply(Update::GuildChanged {
             id: GUILD,
-            name: "h".into(),
+            name: Some("h".into()),
+            owner_id: Some(ME),
         });
         assert_eq!(model.guild(GUILD).unwrap().name, "h");
+        assert_eq!(model.guild(GUILD).unwrap().owner_id, ME);
         model.apply(Update::GuildRemove(GUILD));
         assert!(model.guilds.is_empty());
     }

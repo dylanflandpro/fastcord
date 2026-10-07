@@ -69,10 +69,14 @@ pub enum End {
     AuthenticationFailed,
     /// Discord refuses this client outright; retrying would not help.
     Refused(u16),
+    /// An event this version cannot read at all (READY): reconnecting would
+    /// only receive it again.
+    Unreadable,
 }
 
-/// What the connection does next.
-#[derive(Debug)]
+/// What the connection does next. No `Debug` outside tests: `Send` holds
+/// IDENTIFY with the token, `Dispatch` can hold message content.
+#[cfg_attr(test, derive(Debug))]
 pub enum Step {
     Send(String),
     /// Heartbeat after `first`, then every `every`.
@@ -135,9 +139,17 @@ impl Gateway {
     }
 
     /// Forgets the session, so the next connection identifies.
-    pub fn forget(&mut self) {
+    fn forget(&mut self) {
         self.resumable = None;
         self.seq = None;
+    }
+
+    /// Takes in how a connection ended: a session the gateway ended is not
+    /// resumed.
+    pub fn ended(&mut self, end: End) {
+        if end == End::Identify {
+            self.forget();
+        }
     }
 
     fn heartbeat_payload(&self) -> String {
@@ -180,14 +192,14 @@ impl Gateway {
         .to_string()
     }
 
-    /// Reads one text frame. `jitter` (0 to 1) spreads first heartbeats, as
-    /// the gateway asks.
+    /// Reads one text frame. `jitter` (0 to 1, asked for at hello only)
+    /// spreads first heartbeats, as the gateway asks.
     pub fn on_frame(
         &mut self,
         text: &str,
         token: &Token,
         properties: &serde_json::Value,
-        jitter: f64,
+        jitter: impl FnOnce() -> f64,
     ) -> Result<Vec<Step>, End> {
         let frame: Frame<'_> = serde_json::from_str(text).map_err(|_| End::Resume)?;
         if let Some(seq) = frame.s {
@@ -206,7 +218,7 @@ impl Gateway {
                 self.awaiting_ack = false;
                 vec![
                     Step::Heartbeat {
-                        first: every.mul_f64(jitter.clamp(0.0, 1.0)),
+                        first: every.mul_f64(jitter().clamp(0.0, 1.0)),
                         every,
                     },
                     Step::Send(self.greeting(token, properties)),
@@ -259,14 +271,16 @@ impl Gateway {
 }
 
 /// One connection, until it ends. `dispatch` receives every event and
-/// `established` is told of READY and RESUMED. Dropping the future (the
-/// person logged out) closes the socket.
+/// returns `false` for one it cannot read at all, which ends the
+/// connection; `established` is told of READY and RESUMED. `token` is read
+/// at each hello, so a token rotated meanwhile is the one used. Dropping
+/// the future (the person logged out) closes the socket.
 pub async fn connect(
     gateway: &mut Gateway,
-    token: &Token,
+    token: &std::cell::RefCell<Token>,
     properties: &serde_json::Value,
-    dispatch: &mut (dyn FnMut(&str, &RawValue) + Send),
-    established: &mut (dyn FnMut() + Send),
+    dispatch: &mut dyn FnMut(&str, &RawValue) -> bool,
+    established: &mut dyn FnMut(),
 ) -> End {
     let host = gateway.host().to_owned();
     let connecting = crate::websocket::connect(
@@ -293,6 +307,9 @@ pub async fn connect(
     // Replaced at hello; until then only the hello deadline runs.
     let mut heartbeat = tokio::time::interval(Duration::from_secs(3600));
     heartbeat.reset();
+    // After a suspend, one late heartbeat rather than a burst: a burst would
+    // find the first still unacknowledged and drop a working connection.
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let hello = tokio::time::sleep(HELLO_TIMEOUT);
     tokio::pin!(hello);
     let mut greeted = false;
@@ -312,7 +329,8 @@ pub async fn connect(
                 let Some(text) = frame.as_text() else {
                     continue;
                 };
-                match gateway.on_frame(text, token, properties, rand_jitter()) {
+                let read = gateway.on_frame(text, &token.borrow(), properties, rand_jitter);
+                match read {
                     Ok(steps) => steps,
                     Err(end) => return end,
                 }
@@ -344,6 +362,7 @@ pub async fn connect(
                     greeted = true;
                     heartbeat =
                         tokio::time::interval_at(tokio::time::Instant::now() + first, every);
+                    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 }
                 Step::Established { resumed } => {
                     log::info!(
@@ -352,7 +371,11 @@ pub async fn connect(
                     );
                     established();
                 }
-                Step::Dispatch { name, data } => dispatch(&name, &data),
+                Step::Dispatch { name, data } => {
+                    if !dispatch(&name, &data) {
+                        return End::Unreadable;
+                    }
+                }
             }
         }
     }
@@ -372,7 +395,12 @@ mod tests {
     }
 
     fn frame(gateway: &mut Gateway, text: &str) -> Result<Vec<Step>, End> {
-        gateway.on_frame(text, &token(), &serde_json::json!({ "os": "Linux" }), 0.5)
+        gateway.on_frame(
+            text,
+            &token(),
+            &serde_json::json!({ "os": "Linux" }),
+            || 0.5,
+        )
     }
 
     fn sent(steps: &[Step]) -> Vec<serde_json::Value> {
@@ -468,6 +496,17 @@ mod tests {
             frame(&mut gateway, r#"{"op":9,"d":false}"#).unwrap_err(),
             End::Identify
         );
+        assert_eq!(gateway.host(), HOST);
+        assert_eq!(sent(&frame(&mut gateway, HELLO).unwrap())[0]["op"], 2);
+    }
+
+    #[test]
+    fn a_session_the_gateway_ended_is_not_resumed() {
+        let mut gateway = Gateway::default();
+        frame(&mut gateway, READY).unwrap();
+        gateway.ended(End::Resume);
+        assert_eq!(gateway.host(), "gateway-us-east1-b.discord.gg");
+        gateway.ended(on_close(4009));
         assert_eq!(gateway.host(), HOST);
         assert_eq!(sent(&frame(&mut gateway, HELLO).unwrap())[0]["op"], 2);
     }

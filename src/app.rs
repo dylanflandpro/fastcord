@@ -1,7 +1,6 @@
 //! The window: the model, what is open, and the palette it is drawn in.
 
 use crate::backend::{Backend, Command, Event, Link, Session};
-use crate::events::Update;
 use crate::model::{Id, Model};
 use crate::theme::{self, Catalog, Palette};
 use std::collections::HashMap;
@@ -199,6 +198,11 @@ impl App {
     /// answers, so the button cannot be pressed twice.
     pub fn send(&mut self, command: Command) {
         if let Some(backend) = &self.backend {
+            // Logging out takes the account off screen at once, not once
+            // Discord and the keyring have answered.
+            if matches!(command, Command::LogOut) {
+                self.model = None;
+            }
             backend.send(command);
             self.session = Session::Checking;
             self.qr = None;
@@ -224,12 +228,15 @@ impl App {
                     self.session = session;
                 }
                 Event::Link(link) => self.link = link,
-                Event::Update(Update::Ready(model)) => {
-                    // A new session after a reconnect keeps what was open
-                    // when it still exists.
-                    match self.model.is_some() {
-                        true => self.selection.repair(&model),
-                        false => self.selection = Selection::initial(Some(&model)),
+                Event::Ready(mut model) => {
+                    // A new session after a reconnect keeps what was open,
+                    // and the history already loaded, when it still exists.
+                    match self.model.take() {
+                        Some(old) => {
+                            model.messages = old.messages;
+                            self.selection.repair(&model);
+                        }
+                        None => self.selection = Selection::initial(Some(&model)),
                     }
                     self.model = Some(model);
                 }
@@ -264,6 +271,7 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::Update;
 
     #[test]
     fn opens_on_the_first_guild_and_its_first_text_channel() {

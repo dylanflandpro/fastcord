@@ -7,8 +7,9 @@ use crate::api::{self, Api};
 use crate::credentials::{self, Token};
 use crate::events::{Decoder, Update};
 use crate::gateway::{self, End, Gateway};
-use crate::model::User;
+use crate::model::{Model, User};
 use crate::remote_auth::{self, Progress};
+use std::cell::RefCell;
 use std::sync::mpsc;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -52,6 +53,8 @@ pub enum Link {
 pub enum Event {
     Session(Session),
     Link(Link),
+    /// Everything at once, from READY.
+    Ready(Model),
     Update(Update),
 }
 
@@ -104,11 +107,12 @@ type Emit<'a> = &'a (dyn Fn(Event) + Send + Sync);
 /// Returns when the window is gone.
 async fn session(mut commands: UnboundedReceiver<Command>, emit: Emit<'_>) {
     let api = Api::new();
+    let keyring = Keyring::start();
     loop {
         emit(Event::Session(Session::Checking));
-        let signed_in = match restore(&api).await {
+        let signed_in = match restore(&api, &keyring).await {
             Ok(Some(signed_in)) => Some(signed_in),
-            Ok(None) => sign_in(&api, emit).await,
+            Ok(None) => sign_in(&api, &keyring, emit).await,
             Err(message) => {
                 emit(Event::Session(Session::Failed(message)));
                 None
@@ -121,9 +125,11 @@ async fn session(mut commands: UnboundedReceiver<Command>, emit: Emit<'_>) {
             continue;
         };
         emit(Event::Session(Session::SignedIn(user)));
-        let mut token = token;
+        // Replaced in place when Discord rotates it, so logging out uses the
+        // token in force.
+        let token = RefCell::new(token);
         let ended = tokio::select! {
-            ended = stay_connected(&api, &mut token, emit) => Some(ended),
+            ended = stay_connected(&api, &keyring, &token, emit) => Some(ended),
             logged_out = wait_for(&mut commands, |c| matches!(c, Command::LogOut)) => {
                 if !logged_out {
                     return;
@@ -134,7 +140,7 @@ async fn session(mut commands: UnboundedReceiver<Command>, emit: Emit<'_>) {
         match ended {
             Some(Ended::Revoked) => {
                 log::info!("Discord no longer accepts the session; signing in again");
-                if let Err(error) = blocking(credentials::delete).await {
+                if let Err(error) = keyring.run(credentials::delete).await {
                     emit(Event::Session(Session::Failed(keyring_message(error))));
                     if !wait_for(&mut commands, |c| matches!(c, Command::Retry)).await {
                         return;
@@ -142,10 +148,12 @@ async fn session(mut commands: UnboundedReceiver<Command>, emit: Emit<'_>) {
                 }
                 continue;
             }
-            Some(Ended::Refused(code)) => {
-                emit(Event::Session(Session::Failed(format!(
-                    "Discord refused the connection (code {code})."
-                ))));
+            Some(ended @ (Ended::Refused(_) | Ended::Unreadable)) => {
+                let message = match ended {
+                    Ended::Refused(code) => format!("Discord refused the connection (code {code})."),
+                    _ => "Discord sent account data this version cannot read. Try again, or update fastcord.".into(),
+                };
+                emit(Event::Session(Session::Failed(message)));
                 if !wait_for(&mut commands, |c| matches!(c, Command::Retry)).await {
                     return;
                 }
@@ -155,7 +163,8 @@ async fn session(mut commands: UnboundedReceiver<Command>, emit: Emit<'_>) {
         }
         // Until the token is gone, trying again means logging out again,
         // never signing back in with what is left in the keyring.
-        while let Err(error) = log_out(&api, &token).await {
+        let token = token.into_inner();
+        while let Err(error) = log_out(&api, &keyring, &token).await {
             emit(Event::Session(Session::Failed(error)));
             if !wait_for(&mut commands, |c| matches!(c, Command::Retry)).await {
                 return;
@@ -171,6 +180,8 @@ enum Ended {
     Revoked,
     /// Discord refuses this client (a close code retrying cannot fix).
     Refused(u16),
+    /// READY could not be read: reconnecting would only get it again.
+    Unreadable,
 }
 
 /// The first delay before reconnecting, and the longest: doubled after each
@@ -199,8 +210,13 @@ fn describe(error: &serde_json::Error) -> String {
 
 /// Keeps the gateway connected and reports what it delivers, reconnecting
 /// with growing delays, until Discord ends the session for good. A token
-/// Discord rotates replaces `token`, in the keyring too.
-async fn stay_connected(api: &Api, token: &mut Token, emit: Emit<'_>) -> Ended {
+/// Discord rotates replaces `token` at once and is queued for the keyring.
+async fn stay_connected(
+    api: &Api,
+    keyring: &Keyring,
+    token: &RefCell<Token>,
+    emit: Emit<'_>,
+) -> Ended {
     let properties = api.client_properties().await;
     let mut gateway = Gateway::default();
     let mut decoder = Decoder::default();
@@ -208,7 +224,6 @@ async fn stay_connected(api: &Api, token: &mut Token, emit: Emit<'_>) -> Ended {
     emit(Event::Link(Link::Connecting));
     loop {
         let mut established = false;
-        let mut refreshed = None;
         let end = gateway::connect(
             &mut gateway,
             token,
@@ -216,14 +231,25 @@ async fn stay_connected(api: &Api, token: &mut Token, emit: Emit<'_>) -> Ended {
             &mut |name, data| {
                 let data = data.get();
                 if name == "READY" {
-                    match decoder.ready(data) {
-                        Ok((model, auth_token)) => {
-                            refreshed = auth_token;
-                            emit(Event::Update(Update::Ready(model)));
+                    let (model, rotated) = match decoder.ready(data) {
+                        Ok(ready) => ready,
+                        Err(error) => {
+                            log::warn!("unreadable READY: {}", describe(&error));
+                            return false;
                         }
-                        Err(error) => log::warn!("unreadable READY: {}", describe(&error)),
+                    };
+                    if let Some(rotated) = rotated {
+                        log::info!("Discord rotated the session token");
+                        let saved = Token::new(rotated);
+                        *token.borrow_mut() = Token::new(saved.expose().to_owned());
+                        keyring.queue(move || {
+                            if let Err(error) = credentials::save(&saved) {
+                                log::warn!("the rotated token could not be saved: {error}");
+                            }
+                        });
                     }
-                    return;
+                    emit(Event::Ready(model));
+                    return true;
                 }
                 match decoder.event(name, data) {
                     Ok(updates) => updates
@@ -231,6 +257,7 @@ async fn stay_connected(api: &Api, token: &mut Token, emit: Emit<'_>) -> Ended {
                         .for_each(|update| emit(Event::Update(update))),
                     Err(error) => log::warn!("unreadable {name}: {}", describe(&error)),
                 }
+                true
             },
             &mut || {
                 established = true;
@@ -238,19 +265,11 @@ async fn stay_connected(api: &Api, token: &mut Token, emit: Emit<'_>) -> Ended {
             },
         )
         .await;
-        if let Some(fresh) = refreshed.take() {
-            log::info!("Discord rotated the session token");
-            *token = Token::new(fresh);
-            let saved = Token::new(token.expose().to_owned());
-            if let Err(error) = blocking(move || credentials::save(&saved)).await {
-                log::warn!("the rotated token could not be saved: {error}");
-            }
-        }
         match end {
             End::AuthenticationFailed => return Ended::Revoked,
             End::Refused(code) => return Ended::Refused(code),
-            End::Identify => gateway.forget(),
-            End::Resume => {}
+            End::Unreadable => return Ended::Unreadable,
+            End::Identify | End::Resume => gateway.ended(end),
         }
         delay = next_delay(delay, established);
         emit(Event::Link(Link::Reconnecting));
@@ -277,10 +296,42 @@ async fn wait_for(
     false
 }
 
-async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
-    tokio::task::spawn_blocking(work)
-        .await
-        .expect("keyring call panicked")
+type Job = Box<dyn FnOnce() + Send>;
+
+/// Every keyring call, on one thread, in the order they were asked for: a
+/// rotated token's save and a later logout's delete can never swap, even
+/// when the save was queued by a connection that has since gone.
+struct Keyring {
+    jobs: mpsc::Sender<Job>,
+}
+
+impl Keyring {
+    fn start() -> Self {
+        let (jobs, queue) = mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("keyring".into())
+            .spawn(move || {
+                for job in queue {
+                    job();
+                }
+            })
+            .expect("the keyring thread");
+        Self { jobs }
+    }
+
+    /// Runs `work` after everything queued before it, and waits for it.
+    async fn run<T: Send + 'static>(&self, work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, result) = tokio::sync::oneshot::channel();
+        self.queue(move || {
+            let _ = done.send(work());
+        });
+        result.await.expect("the keyring thread stopped")
+    }
+
+    /// Queues `work` without waiting for it.
+    fn queue(&self, work: impl FnOnce() + Send + 'static) {
+        let _ = self.jobs.send(Box::new(work));
+    }
 }
 
 fn keyring_message(error: credentials::Error) -> String {
@@ -296,15 +347,20 @@ fn keyring_message(error: credentials::Error) -> String {
 
 /// The stored session, when there is one and Discord still accepts it. A
 /// token Discord refuses is removed.
-async fn restore(api: &Api) -> Result<Option<(Token, User)>, String> {
-    let Some(token) = blocking(credentials::load).await.map_err(keyring_message)? else {
+async fn restore(api: &Api, keyring: &Keyring) -> Result<Option<(Token, User)>, String> {
+    let Some(token) = keyring
+        .run(credentials::load)
+        .await
+        .map_err(keyring_message)?
+    else {
         return Ok(None);
     };
     match api.me(&token).await {
         Ok(user) => Ok(Some((token, user))),
         Err(api::Error::Unauthorized) => {
             log::info!("the stored session was revoked; signing in again");
-            blocking(credentials::delete)
+            keyring
+                .run(credentials::delete)
                 .await
                 .map_err(keyring_message)?;
             Ok(None)
@@ -315,7 +371,7 @@ async fn restore(api: &Api) -> Result<Option<(Token, User)>, String> {
 
 /// QR codes until one is scanned and approved. An expired or cancelled code
 /// is replaced at once, as the official client does.
-async fn sign_in(api: &Api, emit: Emit<'_>) -> Option<(Token, User)> {
+async fn sign_in(api: &Api, keyring: &Keyring, emit: Emit<'_>) -> Option<(Token, User)> {
     let progress = |progress: Progress| match progress {
         Progress::Qr(url) => emit(Event::Session(Session::Qr(url))),
         Progress::Scanned(user) => emit(Event::Session(Session::Scanned {
@@ -338,7 +394,10 @@ async fn sign_in(api: &Api, emit: Emit<'_>) -> Option<(Token, User)> {
             }
         }
     };
-    let token = match blocking(move || credentials::save(&token).map(|()| token)).await {
+    let token = match keyring
+        .run(move || credentials::save(&token).map(|()| token))
+        .await
+    {
         Ok(token) => token,
         Err(error) => {
             emit(Event::Session(Session::Failed(keyring_message(error))));
@@ -358,11 +417,11 @@ async fn sign_in(api: &Api, emit: Emit<'_>) -> Option<(Token, User)> {
 
 /// Ends the session on Discord's side, then forgets the token. A failed
 /// remote logout still removes it locally.
-async fn log_out(api: &Api, token: &Token) -> Result<(), String> {
+async fn log_out(api: &Api, keyring: &Keyring, token: &Token) -> Result<(), String> {
     if let Err(error) = api.logout(token).await {
         log::warn!("remote logout failed: {error}");
     }
-    blocking(credentials::delete).await.map_err(|error| {
+    keyring.run(credentials::delete).await.map_err(|error| {
         format!(
             "The session could not be removed: {}",
             keyring_message(error)

@@ -11,18 +11,19 @@ use crate::model::{
     Channel, ChannelKind, DmChannel, Guild, Id, Model, Overwrite, OverwriteKind, Permissions, Role,
     User,
 };
+use serde_json::value::RawValue;
 use std::collections::HashMap;
 
 /// A change to the model, in the order the gateway reported it.
 #[derive(Debug, PartialEq)]
 pub enum Update {
-    /// Everything at once, from READY.
-    Ready(Model),
     /// A guild joined or became available.
     GuildUpsert(Guild),
-    GuildRename {
+    /// A guild's name or owner changed (each `None` when unchanged).
+    GuildChanged {
         id: Id,
-        name: String,
+        name: Option<String>,
+        owner_id: Option<Id>,
     },
     /// A guild left, or deleted.
     GuildRemove(Id),
@@ -54,15 +55,16 @@ pub enum Update {
 #[derive(serde::Deserialize)]
 struct Ready {
     user: ApiUser,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     users: Vec<ApiUser>,
+    /// Read one by one in `ready`, keeping their order for `merged_members`.
     #[serde(default)]
-    guilds: Vec<WireGuild>,
+    guilds: Vec<Box<RawValue>>,
     /// Per guild, in `guilds`' order: the members READY describes, the
     /// signed-in one among them.
     #[serde(default)]
-    merged_members: Vec<Vec<WireMember>>,
-    #[serde(default)]
+    merged_members: Vec<Members>,
+    #[serde(default, deserialize_with = "lenient")]
     private_channels: Vec<WireChannel>,
     /// A refreshed token, when Discord rotates it.
     auth_token: Option<String>,
@@ -70,7 +72,7 @@ struct Ready {
 
 #[derive(serde::Deserialize)]
 struct ReadySupplemental {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     lazy_private_channels: Vec<WireChannel>,
 }
 
@@ -82,15 +84,65 @@ struct WireGuild {
     unavailable: bool,
     /// The guild's metadata, for user accounts.
     properties: Option<GuildProperties>,
-    /// Where bots and older payloads put the name.
-    name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     channels: Vec<WireChannel>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     roles: Vec<WireRole>,
     /// GUILD_CREATE's members: the signed-in one is there.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     members: Vec<WireMember>,
+}
+
+/// GUILD_UPDATE: the fields that changed, top level or under `properties`.
+#[derive(serde::Deserialize)]
+struct GuildChange {
+    #[serde(deserialize_with = "snowflake")]
+    id: Id,
+    name: Option<String>,
+    #[serde(default, deserialize_with = "optional_snowflake")]
+    owner_id: Option<Id>,
+    properties: Option<GuildPropertiesChange>,
+}
+
+#[derive(serde::Deserialize)]
+struct GuildPropertiesChange {
+    name: Option<String>,
+    #[serde(default, deserialize_with = "optional_snowflake")]
+    owner_id: Option<Id>,
+}
+
+/// One guild's members in READY, read leniently so a member in an unknown
+/// shape costs that member, not the guild's place in the list.
+struct Members(Vec<WireMember>);
+
+impl<'de> serde::Deserialize<'de> for Members {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        lenient(deserializer).map(Members)
+    }
+}
+
+/// A list read element by element: an element in a shape this version does
+/// not know is skipped (and counted in the log, by type only), rather than
+/// failing the whole event.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raw: Vec<Box<RawValue>> = serde::Deserialize::deserialize(deserializer)?;
+    let total = raw.len();
+    let items: Vec<T> = raw
+        .iter()
+        .filter_map(|item| serde_json::from_str(item.get()).ok())
+        .collect();
+    if items.len() < total {
+        log::warn!(
+            "skipped {} unreadable {}",
+            total - items.len(),
+            std::any::type_name::<T>()
+        );
+    }
+    Ok(items)
 }
 
 #[derive(serde::Deserialize)]
@@ -221,7 +273,7 @@ struct WireChannel {
     position: i32,
     #[serde(default, deserialize_with = "optional_snowflake")]
     last_message_id: Option<Id>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     permission_overwrites: Vec<WireOverwrite>,
     /// DMs in READY: users by id, resolved through READY's `users`.
     #[serde(default)]
@@ -342,6 +394,8 @@ impl Decoder {
     }
 
     /// READY: the whole model, and a refreshed token if Discord sent one.
+    /// Fails only when READY itself is unreadable; a guild, channel or user
+    /// in an unknown shape is skipped.
     pub fn ready(&mut self, data: &str) -> serde_json::Result<(Model, Option<String>)> {
         let ready: Ready = serde_json::from_str(data)?;
         self.me = ready.user.id;
@@ -356,17 +410,28 @@ impl Decoder {
             .collect();
         let me = self.me;
         let mut members = ready.merged_members.into_iter();
+        let mut unreadable = 0;
         let guilds = ready
             .guilds
-            .into_iter()
-            .filter_map(|wire| {
+            .iter()
+            .filter_map(|raw| {
+                // Taken for every guild, readable or not, so each guild keeps
+                // its own members.
                 let my_roles = members
                     .next()
-                    .and_then(|members| members.into_iter().find(|m| m.id() == Some(me)))
-                    .map(|m| m.roles());
-                self.guild(wire, Some(my_roles.unwrap_or_default()))
+                    .and_then(|Members(members)| members.into_iter().find(|m| m.id() == Some(me)))
+                    .map(|m| m.roles())
+                    .unwrap_or_default();
+                let Ok(wire) = serde_json::from_str::<WireGuild>(raw.get()) else {
+                    unreadable += 1;
+                    return None;
+                };
+                self.guild(wire, Some(my_roles))
             })
             .collect();
+        if unreadable > 0 {
+            log::warn!("skipped {unreadable} unreadable guilds in READY");
+        }
         let model = Model {
             me,
             guilds,
@@ -400,14 +465,16 @@ impl Decoder {
                     .collect()
             }
             "GUILD_UPDATE" => {
-                let wire: WireGuild = serde_json::from_str(data)?;
-                let id = wire.id;
-                wire.properties
-                    .map(|p| p.name)
-                    .or(wire.name)
-                    .map(|name| Update::GuildRename { id, name })
-                    .into_iter()
-                    .collect()
+                let change: GuildChange = serde_json::from_str(data)?;
+                let (name, owner_id) = match change.properties {
+                    Some(p) => (p.name.or(change.name), p.owner_id.or(change.owner_id)),
+                    None => (change.name, change.owner_id),
+                };
+                vec![Update::GuildChanged {
+                    id: change.id,
+                    name,
+                    owner_id,
+                }]
             }
             "GUILD_DELETE" => {
                 let deleted: GuildDelete = serde_json::from_str(data)?;
@@ -666,9 +733,10 @@ mod tests {
             decoder
                 .event("GUILD_UPDATE", r#"{"id":"1001","name":"Renamed"}"#)
                 .unwrap(),
-            [Update::GuildRename {
+            [Update::GuildChanged {
                 id: 1001,
-                name: "Renamed".into()
+                name: Some("Renamed".into()),
+                owner_id: None,
             }]
         );
         assert_eq!(
@@ -681,6 +749,57 @@ mod tests {
             decoder.event("GUILD_DELETE", r#"{"id":"1001"}"#).unwrap(),
             [Update::GuildRemove(1001)]
         );
+    }
+
+    #[test]
+    fn an_ownership_transfer_reaches_the_guild() {
+        let mut decoder = Decoder::default();
+        assert_eq!(
+            decoder
+                .event(
+                    "GUILD_UPDATE",
+                    r#"{"id":"1001","properties":{"name":"Rust","owner_id":"9000"}}"#,
+                )
+                .unwrap(),
+            [Update::GuildChanged {
+                id: 1001,
+                name: Some("Rust".into()),
+                owner_id: Some(9000),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_element_costs_only_itself() {
+        // A guild whose channel type is out of range, a channel with a bad
+        // overwrite, a user without a username, and a DM in an unknown shape.
+        let ready = r#"{
+            "user": {"id":"9000","username":"imbu","global_name":null},
+            "users": [{"id":"9001"}, {"id":"9002","username":"lea","global_name":null}],
+            "guilds": [
+                {"id":"1","properties":{"name":"Bad","owner_id":"9"},"channels":[{"id":"5","type":999}]},
+                {"id":"2","properties":{"name":"Good","owner_id":"9"},"channels":[
+                    {"id":"6","type":0,"name":"ok","position":0},
+                    {"id":"7","type":0,"name":"odd","position":1,"permission_overwrites":[{"id":"2","type":0,"allow":7,"deny":"0"}]}
+                ]},
+                {"id":"3","properties":{"name":"Mine","owner_id":"9"},"channels":[]}
+            ],
+            "merged_members": [[], [], [{"user_id":"9000","roles":["33"]}]],
+            "private_channels": [{"id":"8","type":1,"recipient_ids":["9002"]}, {"type":"weird"}]
+        }"#;
+        let mut decoder = Decoder::default();
+        let (model, _) = decoder.ready(ready).unwrap();
+        let guilds: Vec<&str> = model.guilds.iter().map(|g| g.name.as_str()).collect();
+        // The bad channel type fails only that channel, not the guild.
+        assert_eq!(guilds, ["Bad", "Good", "Mine"]);
+        assert!(model.guild(1).unwrap().channels.is_empty());
+        let good = model.guild(2).unwrap();
+        assert_eq!(good.channels.len(), 2);
+        assert!(good.channel(7).unwrap().overwrites.is_empty());
+        // Members stay with their own guild.
+        assert_eq!(model.guild(3).unwrap().my_roles, [33]);
+        assert_eq!(model.dms.len(), 1);
+        assert_eq!(model.dms[0].title(), "lea");
     }
 
     #[test]
