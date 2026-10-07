@@ -14,6 +14,7 @@ use crate::remote_auth::{self, Progress};
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -466,6 +467,17 @@ where
     while commands.try_recv().is_ok() {}
     let mut loading = FuturesUnordered::new();
     let mut sending = FuturesUnordered::new();
+    let mut reactions = Reactions::default();
+    let send_reaction = |reaction: ReactionRequest, used: Token| async move {
+        (api.react(&used, &reaction).await, used)
+    };
+    let fly = |reaction: ReactionRequest| {
+        let send = &send_reaction;
+        async move {
+            let outcome = react(send, token, &reaction).await;
+            (reaction, outcome)
+        }
+    };
     let mut reacting = FuturesUnordered::new();
     // Each request with the token in force when it leaves.
     let launch = |(ack, attempt): (Ack, u32)| {
@@ -491,8 +503,7 @@ where
                 Some(Command::Ack(ack)) => acks.borrow_mut().push(ack, Instant::now()),
                 Some(Command::DropAck(channel)) => acks.borrow_mut().cancel(channel),
                 Some(Command::React(reaction)) => {
-                    let token = Token::new(token.borrow().expose().to_owned());
-                    reacting.push(async move { react(api, &token, reaction, emit).await });
+                    reacting.extend(reactions.request(reaction).map(&fly));
                 }
                 Some(Command::Retry) => {}
             },
@@ -501,9 +512,10 @@ where
                     return Served::Revoked;
                 }
             }
-            Some(revoked) = reacting.next(), if !reacting.is_empty() => {
-                if revoked {
-                    return Served::Revoked;
+            Some((reaction, outcome)) = reacting.next(), if !reacting.is_empty() => {
+                match settle(&mut reactions, reaction, outcome, emit) {
+                    Settled::Revoked => return Served::Revoked,
+                    Settled::Next(next) => reacting.extend(next.map(&fly)),
                 }
             }
             () = sleep_until(due), if due.is_some() => {
@@ -582,7 +594,9 @@ fn landed(
 
 /// What to do after a reaction request, as the web client does: a rate
 /// limit is waited out once, another failure is tried again once at once;
-/// a refusal, or a second failure, undoes the reaction.
+/// a refusal, or a second failure, undoes the reaction. A 401 on a token
+/// rotated since tries again with the new one; on the token in force, the
+/// session is over.
 #[derive(Debug, PartialEq)]
 enum Next {
     Done,
@@ -591,9 +605,10 @@ enum Next {
     Revoked,
 }
 
-fn after_reaction(reacted: api::Reacted, retried: bool) -> Next {
+fn after_reaction(reacted: api::Reacted, retried: bool, rotated: bool) -> Next {
     match reacted {
         api::Reacted::Done => Next::Done,
+        api::Reacted::Unauthorized if rotated && !retried => Next::Retry(Duration::ZERO),
         api::Reacted::Unauthorized => Next::Revoked,
         api::Reacted::RateLimited(wait) if !retried => Next::Retry(wait),
         api::Reacted::Failed if !retried => Next::Retry(Duration::ZERO),
@@ -601,27 +616,117 @@ fn after_reaction(reacted: api::Reacted, retried: bool) -> Next {
     }
 }
 
-/// Sends one reaction, reporting it undone when Discord does not take it.
-/// `true` when Discord says the token is no longer valid.
-async fn react(api: &Api, token: &Token, reaction: ReactionRequest, emit: Emit<'_>) -> bool {
+/// How a reaction request ended.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Outcome {
+    Taken,
+    Refused,
+    Revoked,
+}
+
+/// Sends one reaction, with the token in force at each try.
+async fn react<S, F>(send: &S, token: &RefCell<Token>, reaction: &ReactionRequest) -> Outcome
+where
+    S: Fn(ReactionRequest, Token) -> F,
+    F: Future<Output = (api::Reacted, Token)>,
+{
     let mut retried = false;
     loop {
-        match after_reaction(api.react(token, &reaction).await, retried) {
-            Next::Done => return false,
+        let current = || Token::new(token.borrow().expose().to_owned());
+        let (reacted, used) = send(reaction.clone(), current()).await;
+        let rotated = used.expose() != token.borrow().expose();
+        match after_reaction(reacted, retried, rotated) {
+            Next::Done => return Outcome::Taken,
             Next::Retry(wait) => {
                 retried = true;
                 tokio::time::sleep(wait).await;
             }
-            Next::Undo => {
-                emit(Event::ReactionFailed(reaction));
-                return false;
+            Next::Undo => return Outcome::Refused,
+            Next::Revoked => return Outcome::Revoked,
+        }
+    }
+}
+
+/// One message's reaction with one emoji.
+type ReactionKey = (Id, Option<Id>, String);
+
+fn reaction_key(reaction: &ReactionRequest) -> ReactionKey {
+    let name = match reaction.emoji.id {
+        Some(_) => String::new(),
+        None => reaction.emoji.name.clone(),
+    };
+    (reaction.message, reaction.emoji.id, name)
+}
+
+/// Reactions on their way: one request at a time per message and emoji, so
+/// Discord gets them in the order they were clicked, and only the last
+/// click made while one flies.
+#[derive(Debug, Default)]
+struct Reactions {
+    /// Per reaction in flight, the click waiting behind it.
+    flying: HashMap<ReactionKey, Option<ReactionRequest>>,
+}
+
+impl Reactions {
+    /// The request to send now, or `None` when it waits for the one flying.
+    fn request(&mut self, reaction: ReactionRequest) -> Option<ReactionRequest> {
+        match self.flying.get_mut(&reaction_key(&reaction)) {
+            Some(waiting) => {
+                *waiting = Some(reaction);
+                None
             }
-            Next::Revoked => {
-                emit(Event::ReactionFailed(reaction));
-                return true;
+            None => {
+                self.flying.insert(reaction_key(&reaction), None);
+                Some(reaction)
             }
         }
     }
+
+    /// A request ended, `taken` by Discord or not. Returns the request to
+    /// send next, if a later click wants something else than what Discord
+    /// now has, and whether to undo this one on screen: only when no later
+    /// click says what is wanted.
+    fn finished(
+        &mut self,
+        reaction: &ReactionRequest,
+        taken: bool,
+    ) -> (Option<ReactionRequest>, bool) {
+        let key = reaction_key(reaction);
+        let waiting = self.flying.remove(&key).flatten();
+        let on_discord = if taken { reaction.add } else { !reaction.add };
+        match waiting {
+            None => (None, !taken),
+            Some(next) if next.add == on_discord => (None, false),
+            Some(next) => {
+                self.flying.insert(key, None);
+                (Some(next), false)
+            }
+        }
+    }
+}
+
+enum Settled {
+    Next(Option<ReactionRequest>),
+    Revoked,
+}
+
+/// Takes a reaction request's end: the window undoes one Discord did not
+/// take (unless a later click decides), and the next waiting one leaves.
+fn settle(
+    reactions: &mut Reactions,
+    reaction: ReactionRequest,
+    outcome: Outcome,
+    emit: Emit<'_>,
+) -> Settled {
+    if outcome == Outcome::Revoked {
+        emit(Event::ReactionFailed(reaction));
+        return Settled::Revoked;
+    }
+    let (next, undo) = reactions.finished(&reaction, outcome == Outcome::Taken);
+    if undo {
+        emit(Event::ReactionFailed(reaction));
+    }
+    Settled::Next(next)
 }
 
 /// Loads one page and reports it. `true` when Discord says the token is no
@@ -875,18 +980,136 @@ mod tests {
         assert!(!signs_out(Some(&Ended::Unreadable)));
     }
 
+    fn reaction(message: Id, add: bool) -> ReactionRequest {
+        ReactionRequest {
+            channel: 1,
+            guild: None,
+            message,
+            emoji: crate::model::Emoji {
+                id: None,
+                name: "👍".into(),
+                animated: false,
+            },
+            add,
+        }
+    }
+
+    #[test]
+    fn one_reaction_flies_at_a_time_and_only_the_last_click_waits() {
+        let mut flying = Reactions::default();
+        assert_eq!(flying.request(reaction(5, true)), Some(reaction(5, true)));
+        assert_eq!(
+            flying.request(reaction(6, true)),
+            Some(reaction(6, true)),
+            "another message"
+        );
+        assert_eq!(flying.request(reaction(5, false)), None);
+        assert_eq!(
+            flying.request(reaction(5, true)),
+            None,
+            "replaces the waiting one"
+        );
+        // Taken: Discord has it, as the last click wants: nothing more to do.
+        assert_eq!(flying.finished(&reaction(5, true), true), (None, false));
+        assert_eq!(flying.request(reaction(5, false)), Some(reaction(5, false)));
+
+        // Refused with a later click waiting: the click decides, no undo.
+        assert_eq!(flying.request(reaction(5, true)), None);
+        let (next, undo) = flying.finished(&reaction(5, false), false);
+        assert_eq!(
+            (next, undo),
+            (None, false),
+            "Discord still has it, as wanted"
+        );
+        assert_eq!(flying.request(reaction(5, false)), Some(reaction(5, false)));
+        assert_eq!(flying.request(reaction(5, true)), None);
+        assert_eq!(flying.request(reaction(5, false)), None);
+        let (next, undo) = flying.finished(&reaction(5, false), false);
+        assert_eq!(
+            (next, undo),
+            (Some(reaction(5, false)), false),
+            "tried again"
+        );
+        assert_eq!(
+            flying.finished(&reaction(5, false), false),
+            (None, true),
+            "undone"
+        );
+        assert_eq!(flying.finished(&reaction(6, true), true), (None, false));
+        assert!(flying.flying.is_empty());
+    }
+
+    #[test]
+    fn a_reaction_retries_with_the_rotated_token_and_reports_revocation() {
+        use api::Reacted::*;
+        paused(async {
+            let token = RefCell::new(Token::new("first".into()));
+            let answers = RefCell::new(vec![Unauthorized, Done].into_iter());
+            let used = RefCell::new(Vec::new());
+            let send = |_: ReactionRequest, with: Token| {
+                used.borrow_mut().push(with.expose().to_owned());
+                *token.borrow_mut() = Token::new("second".into());
+                let answer = answers.borrow_mut().next().expect("an answer");
+                async move { (answer, with) }
+            };
+            assert_eq!(
+                react(&send, &token, &reaction(5, true)).await,
+                Outcome::Taken
+            );
+            assert_eq!(*used.borrow(), ["first", "second"]);
+
+            let answers = RefCell::new(vec![Unauthorized].into_iter());
+            let send = |_: ReactionRequest, with: Token| {
+                let answer = answers.borrow_mut().next().expect("an answer");
+                async move { (answer, with) }
+            };
+            assert_eq!(
+                react(&send, &token, &reaction(5, true)).await,
+                Outcome::Revoked
+            );
+        });
+    }
+
+    #[test]
+    fn a_revoked_reaction_is_undone_and_ends_the_session() {
+        let events = Mutex::new(Vec::new());
+        let emit = |event: Event| events.lock().unwrap().push(event);
+        let mut flying = Reactions::default();
+        flying.request(reaction(5, true));
+        let settled = settle(&mut flying, reaction(5, true), Outcome::Revoked, &emit);
+        assert!(matches!(settled, Settled::Revoked));
+        flying.request(reaction(6, false));
+        let settled = settle(&mut flying, reaction(6, false), Outcome::Refused, &emit);
+        assert!(matches!(settled, Settled::Next(None)));
+        assert_eq!(
+            events.into_inner().unwrap(),
+            [
+                Event::ReactionFailed(reaction(5, true)),
+                Event::ReactionFailed(reaction(6, false))
+            ]
+        );
+    }
+
     #[test]
     fn a_reaction_is_tried_twice_at_most_then_undone() {
         use api::Reacted::*;
         let wait = Duration::from_secs(2);
-        assert_eq!(after_reaction(Done, false), Next::Done);
-        assert_eq!(after_reaction(RateLimited(wait), false), Next::Retry(wait));
-        assert_eq!(after_reaction(Failed, false), Next::Retry(Duration::ZERO));
-        assert_eq!(after_reaction(Done, true), Next::Done);
-        assert_eq!(after_reaction(RateLimited(wait), true), Next::Undo);
-        assert_eq!(after_reaction(Failed, true), Next::Undo);
-        assert_eq!(after_reaction(Refused, false), Next::Undo);
-        assert_eq!(after_reaction(Unauthorized, false), Next::Revoked);
+        let next = |reacted, retried| after_reaction(reacted, retried, false);
+        assert_eq!(next(Done, false), Next::Done);
+        assert_eq!(next(RateLimited(wait), false), Next::Retry(wait));
+        assert_eq!(next(Failed, false), Next::Retry(Duration::ZERO));
+        assert_eq!(next(Done, true), Next::Done);
+        assert_eq!(next(RateLimited(wait), true), Next::Undo);
+        assert_eq!(next(Failed, true), Next::Undo);
+        assert_eq!(next(Refused, false), Next::Undo);
+        assert_eq!(next(Unauthorized, false), Next::Revoked);
+        let rotated = after_reaction(Unauthorized, false, true);
+        assert_eq!(
+            rotated,
+            Next::Retry(Duration::ZERO),
+            "a token rotated since"
+        );
+        assert_eq!(after_reaction(Unauthorized, true, true), Next::Revoked);
     }
 
     #[test]

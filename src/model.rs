@@ -268,6 +268,8 @@ impl Guild {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DmChannel {
     pub id: Id,
+    /// A group DM rather than a conversation between two people.
+    pub group: bool,
     pub recipients: Vec<User>,
     pub last_message_id: Option<Id>,
 }
@@ -313,9 +315,10 @@ impl Emoji {
     }
 
     /// What a reaction shows: the emoji itself, or a server's as `:name:`
-    /// until fastcord draws them.
+    /// until fastcord draws them (`:unknown:` once deleted).
     pub fn label(&self) -> String {
         match self.id {
+            Some(_) if self.name.is_empty() => ":unknown:".to_owned(),
             Some(_) => format!(":{}:", self.name),
             None => self.name.clone(),
         }
@@ -343,8 +346,9 @@ pub enum ReactionKind {
 
 impl Message {
     /// One more reaction, as the web client's message record counts it: my
-    /// own counts once however often Discord repeats it; in a DM, so does
-    /// the other person's, the only one who can add it.
+    /// own counts once however often Discord repeats it; in a DM between
+    /// two people (`dm`), so does the other person's, the only one who can
+    /// add it.
     pub fn add_reaction(&mut self, emoji: &Emoji, mine: bool, kind: ReactionKind, dm: bool) {
         let Some(reaction) = self.reactions.iter_mut().find(|r| r.emoji.same(emoji)) else {
             let (normal, burst) = match kind {
@@ -364,7 +368,7 @@ impl Message {
             ReactionKind::Normal => (&mut reaction.count, &mut reaction.me),
             ReactionKind::Burst => (&mut reaction.burst_count, &mut reaction.me_burst),
         };
-        let theirs = *count - u32::from(*me);
+        let theirs = count.saturating_sub(u32::from(*me));
         if (mine && *me) || (dm && !mine && theirs >= 1) {
             return;
         }
@@ -750,7 +754,7 @@ impl Model {
     /// Applies what the gateway says of a message's reactions, if the
     /// message is loaded (a history loaded later has them already).
     fn change_reactions(&mut self, channel: Id, message: Id, change: ReactionChange) {
-        let (me, dm) = (self.me, self.dm(channel).is_some());
+        let (me, dm) = (self.me, self.two_people(channel));
         let Some(message) = self.message_mut(channel, message) else {
             return;
         };
@@ -764,7 +768,9 @@ impl Model {
             ReactionChange::AddMany(added) => {
                 for (emoji, users) in added {
                     for user in users {
-                        message.add_reaction(&emoji, user == me, ReactionKind::Normal, dm);
+                        // The web client's `addReactionBatch` never applies the DM
+                        // rule.
+                        message.add_reaction(&emoji, user == me, ReactionKind::Normal, false);
                     }
                 }
             }
@@ -773,6 +779,12 @@ impl Model {
                 message.reactions.retain(|r| !r.emoji.same(&emoji))
             }
         }
+    }
+
+    /// A DM between two people (not a group): only the other one can add
+    /// their reaction there.
+    fn two_people(&self, channel: Id) -> bool {
+        self.dm(channel).is_some_and(|dm| !dm.group)
     }
 
     /// Adds my reaction to a loaded message, or takes it back if it is
@@ -792,7 +804,7 @@ impl Model {
     /// Adds or removes my reaction at once, before Discord confirms it (and
     /// undoes it if Discord refuses). `false` when the message is not loaded.
     pub fn react(&mut self, channel: Id, message: Id, emoji: &Emoji, add: bool) -> bool {
-        let dm = self.dm(channel).is_some();
+        let dm = self.two_people(channel);
         let Some(message) = self.message_mut(channel, message) else {
             return false;
         };
@@ -1670,6 +1682,7 @@ mod tests {
         let mut model = Model {
             dms: vec![DmChannel {
                 id: 7,
+                group: false,
                 recipients: vec![],
                 last_message_id: None,
             }],
@@ -1712,6 +1725,7 @@ mod tests {
         let mut model = Model {
             dms: vec![DmChannel {
                 id: 8,
+                group: false,
                 recipients: vec![],
                 last_message_id: Some(5),
             }],
@@ -1788,6 +1802,7 @@ mod tests {
         let mut model = Model::default();
         let dm = DmChannel {
             id: 5,
+            group: false,
             recipients: vec![],
             last_message_id: None,
         };
@@ -1806,6 +1821,7 @@ mod tests {
     fn dms_sort_most_recent_first() {
         let dm = |id, last| DmChannel {
             id,
+            group: false,
             recipients: vec![],
             last_message_id: last,
         };
@@ -1998,6 +2014,7 @@ mod tests {
         let now = at(NOW);
         let dm = |id, last| DmChannel {
             id,
+            group: false,
             recipients: vec![],
             last_message_id: Some(last),
         };
@@ -2082,6 +2099,19 @@ mod tests {
         m.remove_reaction(&emoji("absent", None), false, Normal);
         assert_eq!(pills(&m), [t(":renamed:", 1, false, 0, false)]);
 
+        // Counts Discord left inconsistent never underflow.
+        let mut odd = message(3, 2);
+        odd.reactions.push(Reaction {
+            emoji: thumbs.clone(),
+            me: true,
+            ..Reaction::default()
+        });
+        odd.add_reaction(&thumbs, false, Normal, true);
+        odd.remove_reaction(&thumbs, true, Normal);
+        odd.remove_reaction(&thumbs, true, Normal);
+        odd.remove_reaction(&thumbs, false, Burst);
+        assert!(odd.reactions.is_empty());
+
         // In a DM only the other person can add theirs: a repeat is an echo.
         let mut dm = message(2, 2);
         dm.add_reaction(&thumbs, false, Normal, true);
@@ -2136,6 +2166,39 @@ mod tests {
         // Messages not loaded are left alone.
         on_message(&mut model, 6, add(3));
         assert!(!model.messages.contains_key(&6));
+    }
+
+    #[test]
+    fn only_a_two_person_dm_takes_a_repeat_for_an_echo() {
+        use crate::events::ReactionChange;
+        let dm = |id, group| DmChannel {
+            id,
+            group,
+            recipients: vec![],
+            last_message_id: None,
+        };
+        let mut model = Model {
+            me: ME,
+            dms: vec![dm(5, false), dm(6, true)],
+            ..Model::default()
+        };
+        model.messages.insert(5, vec![message(50, 2)]);
+        model.messages.insert(6, vec![message(60, 2)]);
+        let thumbs = emoji("👍", None);
+        let add = |user| ReactionChange::Add {
+            emoji: thumbs.clone(),
+            user,
+            kind: ReactionKind::Normal,
+        };
+        for channel in [5, 6] {
+            on_message(&mut model, channel, add(2));
+            on_message(&mut model, channel, add(3));
+        }
+        let many = ReactionChange::AddMany(vec![(thumbs.clone(), vec![2])]);
+        on_message(&mut model, 5, many);
+        let count = |channel: Id| model.messages[&channel][0].reactions[0].count;
+        assert_eq!(count(5), 2, "the DM rule, but never for a batch");
+        assert_eq!(count(6), 2, "a group DM counts everyone");
     }
 
     #[test]
@@ -2240,6 +2303,7 @@ mod tests {
             me: ME,
             dms: vec![DmChannel {
                 id: 5,
+                group: false,
                 recipients: vec![],
                 last_message_id: Some(50),
             }],

@@ -1178,6 +1178,7 @@ impl Decoder {
         }
         Some(DmChannel {
             id: wire.id,
+            group: wire.kind == GROUP_DM,
             recipients,
             last_message_id: wire.last_message_id,
         })
@@ -1837,6 +1838,7 @@ mod tests {
             updates,
             [Update::DmUpsert(DmChannel {
                 id: 3003,
+                group: false,
                 recipients: vec![User {
                     id: 9002,
                     username: "lea.dev".into(),

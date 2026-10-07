@@ -140,9 +140,9 @@ pub fn title(model: &Model, channel: Id, message: &Message) -> String {
     let guild = model.guild_of(channel);
     let author = isolate(&model.name_in(guild, &message.author));
     if let Some(dm) = model.dm(channel) {
-        return match dm.recipients.len() {
-            0 | 1 => author,
-            _ => format!("{author} ({})", isolate(&dm.title())),
+        return match dm.group {
+            false => author,
+            true => format!("{author} ({})", isolate(&dm.title())),
         };
     }
     let Some((guild, channel)) = model
@@ -706,8 +706,9 @@ mod tests {
             joined_at: None,
             default_notify: Notify::Mentions,
         };
-        let dm = |id, recipients| DmChannel {
+        let dm = |id, recipients: Vec<User>| DmChannel {
             id,
+            group: recipients.len() > 1,
             recipients,
             last_message_id: Some(START),
         };

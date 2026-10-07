@@ -359,11 +359,13 @@ pub fn model() -> Model {
 
     let dm_lea = DmChannel {
         id: 900,
+        group: false,
         recipients: vec![lea.clone()],
         last_message_id: None,
     };
     let dm_group = DmChannel {
         id: 901,
+        group: true,
         recipients: vec![marc.clone(), sam.clone()],
         last_message_id: None,
     };

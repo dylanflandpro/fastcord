@@ -638,9 +638,11 @@ fn reaction_path(reaction: &ReactionRequest) -> String {
 }
 
 /// An emoji in a URL: a Unicode one by its text, a server's as
-/// `name:id`, percent-encoded.
+/// `name:id` (`null:id` once deleted, as the web client writes its null
+/// name), percent-encoded.
 fn emoji_segment(emoji: &Emoji) -> String {
     let text = match emoji.id {
+        Some(id) if emoji.name.is_empty() => format!("null:{id}"),
         Some(id) => format!("{}:{id}", emoji.name),
         None => emoji.name.clone(),
     };
@@ -700,6 +702,7 @@ mod tests {
             emoji_segment(&request("a b/#?", None, true).emoji),
             "a%20b%2F%23%3F"
         );
+        assert_eq!(emoji_segment(&request("", Some(78), true).emoji), "null:78");
     }
 
     #[test]
