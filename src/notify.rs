@@ -296,6 +296,7 @@ impl Notifications {
                 guild,
                 message,
                 ping,
+                ..
             } => {
                 let attention = self.shared.attention();
                 let urgent = urgent(model, *channel, ping);
@@ -736,6 +737,7 @@ mod tests {
             attachments: vec![],
             embeds: vec![],
             reactions: vec![],
+            ..Default::default()
         }
     }
 
@@ -1174,6 +1176,7 @@ mod tests {
             guild: None,
             message: message(id, author, "hi"),
             ping: Ping::default(),
+            nonce: None,
         }
     }
 

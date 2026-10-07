@@ -46,6 +46,7 @@ pub struct Permissions(pub u64);
 impl Permissions {
     pub const ADMINISTRATOR: Self = Self(1 << 3);
     pub const VIEW_CHANNEL: Self = Self(1 << 10);
+    pub const SEND_MESSAGES: Self = Self(1 << 11);
     pub const ALL: Self = Self(u64::MAX);
 
     pub fn contains(self, other: Self) -> bool {
@@ -284,7 +285,7 @@ impl DmChannel {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Message {
     pub id: Id,
     pub author: User,
@@ -293,6 +294,7 @@ pub struct Message {
     pub embeds: Vec<Embed>,
     /// In the order they were first added, as Discord lists them.
     pub reactions: Vec<Reaction>,
+    pub delivery: Delivery,
 }
 
 /// An emoji as reactions carry it: a Unicode one by its text, or a
@@ -395,6 +397,27 @@ impl Message {
             self.reactions.remove(at);
         }
     }
+}
+
+/// Where a message stands on its way to Discord, as the official client
+/// shows it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Delivery {
+    /// On Discord: everything it sent us.
+    #[default]
+    Sent,
+    /// Written here and on its way, shown dimmed. Until Discord confirms it,
+    /// its id is the nonce it was sent with.
+    Sending,
+    /// Not sent: shown in red with Retry and Delete, with Discord's reason
+    /// when it gave one (slowmode, a missing permission).
+    Failed(Option<String>),
+}
+
+/// The nonce for a message sent at `now`: a snowflake for that moment, as
+/// the web client makes them, always above the `last` one handed out.
+pub fn next_nonce(last: Id, now: jiff::Timestamp) -> Id {
+    id_at(now, 0).max(last + 1)
 }
 
 /// A file sent with a message.
@@ -550,6 +573,92 @@ impl Model {
         self.guild_of(channel).is_some() || self.dm(channel).is_some()
     }
 
+    /// Whether I may write in `channel`: always in DMs, with Send Messages
+    /// in a guild channel (viewing it comes first, as Discord requires).
+    pub fn can_send(&self, channel: Id) -> bool {
+        if self.dm(channel).is_some() {
+            return true;
+        }
+        let wanted = Permissions::VIEW_CHANNEL.union(Permissions::SEND_MESSAGES);
+        self.guilds.iter().any(|g| {
+            g.channel(channel)
+                .is_some_and(|c| g.permissions(c, self.me).contains(wanted))
+        })
+    }
+
+    /// The composer's placeholder, worded as the official client words it:
+    /// "Message #general", "Message @Léa", or a group's names.
+    pub fn placeholder(&self, channel: Id) -> String {
+        if let Some(dm) = self.dm(channel) {
+            return match &dm.recipients[..] {
+                [one] => format!("Message @{}", one.display_name()),
+                _ => format!("Message {}", dm.title()),
+            };
+        }
+        let name = self
+            .guilds
+            .iter()
+            .find_map(|g| g.channel(channel))
+            .map_or("", |c| c.name.as_str());
+        format!("Message #{name}")
+    }
+
+    /// Shows a message I just wrote at the bottom of `channel`, dimmed until
+    /// Discord confirms it. `false` while the channel's history is not
+    /// loaded: there is nowhere to show it yet.
+    pub fn add_pending(&mut self, channel: Id, nonce: Id, content: String) -> bool {
+        let author = self.users.get(&self.me).cloned().unwrap_or(User {
+            id: self.me,
+            ..User::default()
+        });
+        let Some(loaded) = self.messages.get_mut(&channel) else {
+            return false;
+        };
+        loaded.push(Message {
+            id: nonce,
+            author,
+            content,
+            attachments: Vec::new(),
+            embeds: Vec::new(),
+            reactions: Vec::new(),
+            delivery: Delivery::Sending,
+        });
+        loaded.sort_by_key(|m| m.id);
+        true
+    }
+
+    /// My message still waiting for Discord, or refused, by its nonce.
+    fn unconfirmed(&mut self, channel: Id, nonce: Id) -> Option<&mut Message> {
+        self.messages
+            .get_mut(&channel)?
+            .iter_mut()
+            .find(|m| m.id == nonce && m.delivery != Delivery::Sent)
+    }
+
+    /// Discord did not take the message sent with `nonce`. One it confirmed
+    /// meanwhile (through the gateway) stays sent.
+    pub fn send_failed(&mut self, channel: Id, nonce: Id, reason: Option<String>) {
+        if let Some(message) = self.unconfirmed(channel, nonce)
+            && message.delivery == Delivery::Sending
+        {
+            message.delivery = Delivery::Failed(reason);
+        }
+    }
+
+    /// Removes a message that failed (Delete) and hands back its text, so
+    /// Retry can send it again.
+    pub fn discard(&mut self, channel: Id, nonce: Id) -> Option<String> {
+        let message = self.unconfirmed(channel, nonce)?;
+        if message.delivery == Delivery::Sending {
+            return None;
+        }
+        let content = std::mem::take(&mut message.content);
+        self.messages
+            .get_mut(&channel)?
+            .retain(|m| m.id != nonce || m.delivery == Delivery::Sent);
+        Some(content)
+    }
+
     /// Drops what was loaded for a channel that went away.
     fn forget_history(&mut self, channel: Id) {
         self.messages.remove(&channel);
@@ -648,9 +757,19 @@ impl Model {
                 guild,
                 message,
                 ping,
+                nonce,
             } => {
                 self.users.insert(message.author.id, message.author.clone());
                 self.count_message(channel, guild, &message, &ping);
+                // My own message coming back: it replaces the one shown
+                // while it was on its way, whether the API's answer or the
+                // gateway's event comes first.
+                if let Some(nonce) = nonce
+                    && message.author.id == self.me
+                    && let Some(loaded) = self.messages.get_mut(&channel)
+                {
+                    loaded.retain(|m| m.id != nonce || m.delivery == Delivery::Sent);
+                }
                 if let Some(dm) = self.dms.iter_mut().find(|d| d.id == channel) {
                     dm.last_message_id = dm.last_message_id.max(Some(message.id));
                 }
@@ -1573,6 +1692,7 @@ mod tests {
             attachments: vec![],
             embeds: vec![],
             reactions: vec![],
+            delivery: Delivery::Sent,
         }
     }
 
@@ -1736,6 +1856,7 @@ mod tests {
             guild: None,
             message: said(50, 1, "unseen"),
             ping: Ping::default(),
+            nonce: None,
         });
         assert!(!model.messages.contains_key(&7), "not loaded, not started");
         model.apply(Update::History {
@@ -1749,12 +1870,14 @@ mod tests {
             guild: None,
             message: said(60, 2, "new"),
             ping: Ping::default(),
+            nonce: None,
         });
         model.apply(Update::MessageCreate {
             channel: 8,
             guild: None,
             message: said(60, 2, "new"),
             ping: Ping::default(),
+            nonce: None,
         });
         assert_eq!(model.messages(8).len(), 2, "a repeated event adds nothing");
         assert_eq!(model.dm(8).unwrap().last_message_id, Some(60));
@@ -1815,6 +1938,145 @@ mod tests {
         assert_eq!(model.dm(5).unwrap().last_message_id, Some(9));
         model.apply(Update::DmRemove(5));
         assert!(model.dms.is_empty());
+    }
+
+    /// A DM with `ME`, its history loaded.
+    fn conversation() -> Model {
+        let mut model = Model {
+            me: ME,
+            dms: vec![DmChannel {
+                id: 8,
+                recipients: vec![],
+                last_message_id: None,
+                group: false,
+            }],
+            ..Model::default()
+        };
+        model.messages.insert(8, vec![said(5, 2, "salut")]);
+        model
+    }
+
+    fn deliveries(model: &Model) -> Vec<(Id, Delivery)> {
+        let loaded = model.messages(8).iter();
+        loaded.map(|m| (m.id, m.delivery.clone())).collect()
+    }
+
+    #[test]
+    fn a_sent_message_waits_then_is_replaced_by_discords() {
+        use crate::events::Update;
+        let mut model = conversation();
+        let badge = |m: &Model| m.dm_badge(&m.dms[0], jiff::Timestamp::now());
+        let before = badge(&model);
+        assert!(model.add_pending(8, 100, "ok".into()));
+        assert_eq!(badge(&model), before, "a pending message is not news");
+        let sending = [(5, Delivery::Sent), (100, Delivery::Sending)];
+        assert_eq!(deliveries(&model), sending);
+        // The API's answer, then the gateway's event: one message.
+        for _ in 0..2 {
+            model.apply(Update::MessageCreate {
+                channel: 8,
+                guild: None,
+                ping: Ping::default(),
+                message: said(101, ME, "ok"),
+                nonce: Some(100),
+            });
+        }
+        let sent = [(5, Delivery::Sent), (101, Delivery::Sent)];
+        assert_eq!(deliveries(&model), sent);
+        // My own message leaves the conversation read, as the official
+        // client does: no unread mark, no mention.
+        let state = &model.read_states[&8];
+        assert_eq!((state.last_read, state.mentions), (Some(101), 0));
+        // A failure reported after the confirmation changes nothing.
+        model.send_failed(8, 100, None);
+        assert_eq!(model.messages(8).len(), 2);
+    }
+
+    #[test]
+    fn only_my_own_message_replaces_a_pending_one() {
+        use crate::events::Update;
+        let mut model = conversation();
+        model.add_pending(8, 100, "ok".into());
+        model.apply(Update::MessageCreate {
+            channel: 8,
+            guild: None,
+            ping: Ping::default(),
+            message: said(101, 2, "same nonce"),
+            nonce: Some(100),
+        });
+        assert_eq!(model.messages(8).len(), 3);
+    }
+
+    #[test]
+    fn a_failed_message_can_be_retried_or_deleted() {
+        let mut model = conversation();
+        model.add_pending(8, 100, "ok".into());
+        assert_eq!(model.discard(8, 100), None, "still on its way");
+        let reason = Some("Slowmode is enabled.".to_owned());
+        model.send_failed(8, 100, reason.clone());
+        assert_eq!(model.messages(8)[1].delivery, Delivery::Failed(reason));
+        assert_eq!(model.discard(8, 100).as_deref(), Some("ok"));
+        assert_eq!(deliveries(&model), [(5, Delivery::Sent)]);
+        // A sent message is never discarded.
+        assert_eq!(model.discard(8, 5), None);
+    }
+
+    #[test]
+    fn nothing_is_shown_before_the_history_is() {
+        let mut model = conversation();
+        model.messages.clear();
+        assert!(!model.add_pending(8, 100, "ok".into()));
+        assert!(model.messages.is_empty());
+    }
+
+    #[test]
+    fn the_placeholder_names_the_channel_or_the_people() {
+        let mut model = conversation();
+        let person = |id, name: &str| User {
+            id,
+            username: name.into(),
+            global_name: None,
+        };
+        model.dms[0].recipients = vec![person(2, "lea")];
+        model.guilds.push(guild(vec![Channel {
+            name: "général".into(),
+            ..channel(10, ChannelKind::Text, None, 0)
+        }]));
+        assert_eq!(model.placeholder(8), "Message @lea");
+        assert_eq!(model.placeholder(10), "Message #général");
+        model.dms[0].recipients.push(person(3, "sam"));
+        assert_eq!(model.placeholder(8), "Message lea, sam");
+    }
+
+    #[test]
+    fn nonces_follow_the_clock_and_never_repeat() {
+        let now: jiff::Timestamp = "2026-10-07T12:00:00Z".parse().unwrap();
+        let first = next_nonce(0, now);
+        assert_eq!(first, id_at(now, 0));
+        assert_eq!(next_nonce(first, now), first + 1);
+        assert!(next_nonce(first + 1, now + jiff::SignedDuration::from_millis(1)) > first + 1);
+    }
+
+    #[test]
+    fn sending_needs_the_permission_except_in_dms() {
+        let mut model = conversation();
+        let mut g = guild(vec![channel(10, ChannelKind::Text, None, 0)]);
+        model.guilds.push(g.clone());
+        assert!(model.can_send(8), "DMs always");
+        assert!(!model.can_send(10), "@everyone may only view");
+        g.roles[0].permissions = Permissions::VIEW_CHANNEL.union(Permissions::SEND_MESSAGES);
+        g.channels[0].overwrites.push(Overwrite {
+            id: GUILD,
+            kind: OverwriteKind::Role,
+            allow: Permissions::default(),
+            deny: Permissions::SEND_MESSAGES,
+        });
+        model.guilds[0] = g.clone();
+        assert!(!model.can_send(10), "an announcement-style channel");
+        g.channels[0].overwrites.clear();
+        model.guilds[0] = g;
+        assert!(model.can_send(10));
+        assert!(!model.can_send(99), "an unknown channel");
     }
 
     #[test]
@@ -2242,6 +2504,7 @@ mod tests {
             guild,
             message,
             ping,
+            nonce: None,
         });
     }
 

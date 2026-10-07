@@ -1,9 +1,9 @@
 //! The window: the model, what is open, and the palette it is drawn in.
 
-use crate::backend::{Backend, Command, Event, Link, Session};
+use crate::backend::{Backend, Command, Event, Link, Outgoing, Session};
 use crate::events::Update;
 use crate::media::{self, Media};
-use crate::model::{Ack, ChannelKind, Emoji, Id, Model, ReactionRequest};
+use crate::model::{Ack, ChannelKind, Delivery, Emoji, Id, Message, Model, ReactionRequest};
 use crate::notify::{self, Attention};
 use crate::theme::{self, Catalog, Palette};
 use std::collections::{HashMap, HashSet};
@@ -217,6 +217,72 @@ fn acknowledge(
     }
     model.mark_read(channel)
 }
+/// What I write: a draft per channel, kept while I look elsewhere as the
+/// official client keeps them, and the nonces handed out.
+#[derive(Default)]
+pub struct Composer {
+    pub drafts: HashMap<Id, String>,
+    last_nonce: Id,
+}
+
+impl Composer {
+    /// Sends `channel`'s draft: it shows at once, pending, and the backend
+    /// gets what to post. Nothing happens (the draft stays) when the draft
+    /// is blank or too long, when I may not write there, or before the
+    /// channel's history is shown.
+    pub fn send(
+        &mut self,
+        model: &mut Model,
+        channel: Id,
+        now: jiff::Timestamp,
+    ) -> Option<Outgoing> {
+        let draft = self.drafts.get(&channel)?;
+        let content = crate::compose::prepare(draft).filter(|_| model.can_send(channel))?;
+        let outgoing = self.post(model, channel, content, now)?;
+        self.drafts.remove(&channel);
+        Some(outgoing)
+    }
+
+    /// Sends a failed message again. It goes to the bottom with a new
+    /// nonce: the failed copy is gone.
+    pub fn retry(
+        &mut self,
+        model: &mut Model,
+        channel: Id,
+        nonce: Id,
+        now: jiff::Timestamp,
+    ) -> Option<Outgoing> {
+        let content = model.discard(channel, nonce)?;
+        self.post(model, channel, content, now)
+    }
+
+    fn post(
+        &mut self,
+        model: &mut Model,
+        channel: Id,
+        content: String,
+        now: jiff::Timestamp,
+    ) -> Option<Outgoing> {
+        let nonce = self.next_id(now);
+        model
+            .add_pending(channel, nonce, content.clone())
+            .then(|| Outgoing {
+                channel,
+                guild: model.guild_of(channel),
+                nonce,
+                content,
+            })
+    }
+
+    fn next_id(&mut self, now: jiff::Timestamp) -> Id {
+        self.last_nonce = crate::model::next_nonce(self.last_nonce, now);
+        self.last_nonce
+    }
+}
+
+/// How long a demo message takes to "reach Discord": long enough to see it
+/// pending.
+const DEMO_DELIVERY: std::time::Duration = std::time::Duration::from_millis(700);
 
 pub struct App {
     /// `None` until the account is connected.
@@ -253,6 +319,9 @@ pub struct App {
     notifications: Arc<notify::Shared>,
     /// A notification was clicked: bring the window forward.
     raise: bool,
+    pub composer: Composer,
+    /// Demo runs have no Discord: what they send arrives here, by when.
+    demo_outbox: Vec<(std::time::Instant, Outgoing)>,
 }
 
 /// What the conversation shows above or instead of its messages.
@@ -343,6 +412,8 @@ impl App {
             reading: Reading::new(Instant::now()),
             notifications,
             raise: false,
+            composer: Composer::default(),
+            demo_outbox: Vec::new(),
         }
     }
 
@@ -462,6 +533,82 @@ impl App {
         self.failed_history.clear();
         self.early_messages.clear();
         self.media.clear();
+        self.composer = Composer::default();
+    }
+
+    /// Enter in the composer.
+    pub fn send_draft(&mut self, channel: Id) {
+        let Some(model) = &mut self.model else {
+            return;
+        };
+        if let Some(outgoing) = self.composer.send(model, channel, jiff::Timestamp::now()) {
+            self.post(outgoing);
+        }
+    }
+
+    /// Retry on a message that failed.
+    pub fn retry_send(&mut self, channel: Id, nonce: Id) {
+        let Some(model) = &mut self.model else {
+            return;
+        };
+        let now = jiff::Timestamp::now();
+        if let Some(outgoing) = self.composer.retry(model, channel, nonce, now) {
+            self.post(outgoing);
+        }
+    }
+
+    /// Delete on a message that failed.
+    pub fn discard_failed(&mut self, channel: Id, nonce: Id) {
+        if let Some(model) = &mut self.model {
+            model.discard(channel, nonce);
+        }
+    }
+
+    fn post(&mut self, outgoing: Outgoing) {
+        match &self.backend {
+            Some(backend) => backend.send(Command::Send(outgoing)),
+            None => self
+                .demo_outbox
+                .push((std::time::Instant::now() + DEMO_DELIVERY, outgoing)),
+        }
+    }
+
+    /// Demo runs confirm what was sent, as Discord would, once it is due,
+    /// or refuse it where the demo says Discord would.
+    fn deliver_demo(&mut self, ctx: &egui::Context) {
+        let now = std::time::Instant::now();
+        let (due, waiting) = std::mem::take(&mut self.demo_outbox)
+            .into_iter()
+            .partition(|(at, _)| *at <= now);
+        self.demo_outbox = waiting;
+        if let Some((at, _)) = self.demo_outbox.iter().min_by_key(|(at, _)| *at) {
+            ctx.request_repaint_after(*at - now);
+        }
+        let Some(model) = &mut self.model else {
+            return;
+        };
+        for (_, Outgoing { channel, nonce, .. }) in due {
+            if let Some(reason) = crate::demo::refusal(channel) {
+                model.send_failed(channel, nonce, Some(reason.into()));
+                continue;
+            }
+            let pending = model.messages(channel).iter().find(|m| m.id == nonce);
+            let Some(pending) = pending.cloned() else {
+                continue;
+            };
+            let message = Message {
+                id: self.composer.next_id(jiff::Timestamp::now()),
+                delivery: Delivery::Sent,
+                ..pending
+            };
+            model.apply(Update::MessageCreate {
+                channel,
+                guild: model.guild_of(channel),
+                message,
+                ping: crate::model::Ping::default(),
+                nonce: Some(nonce),
+            });
+        }
     }
 
     /// Where the open channel's history stands.
@@ -559,6 +706,15 @@ impl App {
             Event::HistoryFailed { channel } => {
                 self.loading_history.remove(&channel);
                 self.failed_history.insert(channel);
+            }
+            Event::SendFailed {
+                channel,
+                nonce,
+                reason,
+            } => {
+                if let Some(model) = &mut self.model {
+                    model.send_failed(channel, nonce, reason);
+                }
             }
             Event::Update(update) => {
                 // A message arriving while its channel's first page loads
@@ -672,6 +828,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         }
         self.drop_unreadable_acks();
+        self.deliver_demo(ctx);
         if let Some(channel) = self.selection.channel {
             self.request_history(channel, false);
         }
@@ -892,6 +1049,67 @@ mod tests {
         model.apply(Update::DmRemove(900));
         selection.repair(&model);
         assert_eq!(selection.channel, Some(901));
+    }
+
+    /// The demo's messages are dated from the real clock.
+    fn now() -> jiff::Timestamp {
+        jiff::Timestamp::now()
+    }
+
+    #[test]
+    fn a_draft_is_sent_once_and_shows_at_once() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        composer.drafts.insert(111, " :wave: salut ".into());
+        let outgoing = composer.send(&mut model, 111, now()).unwrap();
+        assert_eq!(outgoing.content, "👋 salut");
+        assert_eq!(outgoing.guild, Some(100));
+        let shown = model.messages(111).last().unwrap();
+        assert_eq!(
+            (shown.id, &shown.delivery),
+            (outgoing.nonce, &Delivery::Sending)
+        );
+        assert_eq!(shown.author.id, model.me);
+        assert!(!composer.drafts.contains_key(&111));
+        assert_eq!(composer.send(&mut model, 111, now()), None, "nothing left");
+    }
+
+    #[test]
+    fn some_drafts_stay_unsent() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        // No permission in #annonces, blank, too long, history not loaded.
+        model.messages.remove(&112);
+        for (channel, draft) in [
+            (101, "salut".to_owned()),
+            (111, "  \n".to_owned()),
+            (113, "a".repeat(2001)),
+            (112, "salut".to_owned()),
+        ] {
+            composer.drafts.insert(channel, draft);
+            assert_eq!(composer.send(&mut model, channel, now()), None);
+            assert!(composer.drafts.contains_key(&channel));
+        }
+    }
+
+    #[test]
+    fn a_retry_sends_the_failed_message_again_at_the_bottom() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        composer.drafts.insert(900, "un".into());
+        let first = composer.send(&mut model, 900, now()).unwrap();
+        model.send_failed(900, first.nonce, None);
+        let retried = composer.retry(&mut model, 900, first.nonce, now()).unwrap();
+        assert_eq!(retried.content, "un");
+        assert!(retried.nonce > first.nonce);
+        let last = model.messages(900).last().unwrap();
+        assert_eq!(
+            (last.id, &last.delivery),
+            (retried.nonce, &Delivery::Sending)
+        );
+        assert!(model.messages(900).iter().all(|m| m.id != first.nonce));
+        // Only a failed message is retried.
+        assert_eq!(composer.retry(&mut model, 900, retried.nonce, now()), None);
     }
 
     #[test]

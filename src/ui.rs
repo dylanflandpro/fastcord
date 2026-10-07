@@ -7,7 +7,7 @@ use crate::backend::{Command, Link};
 use crate::markdown::{self, Action, Block, Content, Directory, Span, Style};
 use crate::media::{self, Media, Picture, Shown};
 use crate::model::{
-    self, Attachment, Badge, ChannelKind, Embed, EmbedField, Entry, Id, Message, Model,
+    self, Attachment, Badge, ChannelKind, Delivery, Embed, EmbedField, Entry, Id, Message, Model,
     ReactionKind,
 };
 use crate::theme::{self, Icon, Palette};
@@ -17,7 +17,7 @@ use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Galley, Margin, Rect, Response,
     Sense, Stroke, Vec2,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -33,14 +33,20 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
     status_bar(app, ui);
     let status = app.selection.channel.map(|c| app.history_status(c));
-    let (request, bottom) = {
+    let (request, bottom, send) = {
         let Some(model) = &app.model else {
             return;
         };
         let selection = &mut app.selection;
         rail(selection, model, &palette, ui);
         sidebar(selection, model, &palette, ui);
-        conversation(selection, model, &palette, status, &mut app.media, ui)
+        let drafts = &mut app.composer.drafts;
+        let send = selection
+            .channel
+            .filter(|&channel| composer(channel, model, drafts, &palette, ui));
+        let (request, bottom) =
+            conversation(selection, model, &palette, status, &mut app.media, ui);
+        (request, bottom, send)
     };
     app.report_bottom(bottom);
     let clicked =
@@ -49,18 +55,114 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         app.toggle_reaction(channel, message, emoji);
     }
     viewer(&mut app.media, &palette, ui);
+    if let Some(channel) = send {
+        app.send_draft(channel);
+    }
     match request {
-        Some(HistoryRequest::Older(channel)) => app.request_history(channel, true),
-        Some(HistoryRequest::Retry(channel)) => app.retry_history(channel),
+        Some(Request::Older(channel)) => app.request_history(channel, true),
+        Some(Request::Retry(channel)) => app.retry_history(channel),
+        Some(Request::Resend(channel, nonce)) => app.retry_send(channel, nonce),
+        Some(Request::Discard(channel, nonce)) => app.discard_failed(channel, nonce),
         None => {}
     }
 }
 
-/// What the conversation asks of its history.
-enum HistoryRequest {
+/// What the conversation asks for.
+enum Request {
     /// Scrolled to the top: the page before.
     Older(Id),
     Retry(Id),
+    /// Retry and Delete on a message that failed: channel, nonce.
+    Resend(Id, Id),
+    Discard(Id, Id),
+}
+
+/// Discord's words for a channel where I may not write.
+const NO_PERMISSION: &str = "You do not have permission to send messages in this channel.";
+
+/// The box under the conversation. Enter sends, Shift+Enter starts a new
+/// line, and the counter shows near the limit, as in the official client.
+/// `true` when Enter asks to send.
+fn composer(
+    channel: Id,
+    model: &Model,
+    drafts: &mut HashMap<Id, String>,
+    palette: &Palette,
+    ui: &mut egui::Ui,
+) -> bool {
+    let mut send = false;
+    let margin = Margin {
+        left: 16,
+        right: 16,
+        top: 0,
+        bottom: 20,
+    };
+    egui::Panel::bottom("composer")
+        .show_separator_line(false)
+        .frame(Frame::new().fill(palette.window).inner_margin(margin))
+        .show(ui, |ui| {
+            let field = Frame::new()
+                .fill(palette.surface)
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(16, 11));
+            field.show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if !model.can_send(channel) {
+                    let text = egui::RichText::new(NO_PERMISSION).color(palette.dim);
+                    ui.label(text.font(theme::regular(15.0)));
+                    return;
+                }
+                let draft = drafts.entry(channel).or_default();
+                let id = egui::Id::new(("composer", channel));
+                let hint = egui::RichText::new(model.placeholder(channel)).color(palette.dim);
+                // Grows with the draft up to a part of the window, then
+                // scrolls.
+                let tallest = ui.ctx().content_rect().height() * 0.4;
+                let edit = egui::ScrollArea::vertical()
+                    .id_salt(id)
+                    .max_height(tallest)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        let newline =
+                            egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter);
+                        ui.add(
+                            egui::TextEdit::multiline(draft)
+                                .id(id)
+                                .hint_text(hint)
+                                .font(theme::regular(TEXT_SIZE))
+                                .text_color(palette.text)
+                                .frame(Frame::NONE)
+                                .margin(Margin::ZERO)
+                                .desired_rows(1)
+                                .desired_width(f32::INFINITY)
+                                .return_key(newline),
+                        )
+                    })
+                    .inner;
+                // Opening a channel puts the cursor in its composer.
+                let opened = egui::Id::new("composer-channel");
+                if ui.data(|d| d.get_temp::<Id>(opened)) != Some(channel) {
+                    ui.data_mut(|d| d.insert_temp(opened, channel));
+                    edit.request_focus();
+                }
+                send = edit.has_focus() && ui.input(|i| enter_sends(&i.events));
+                if let Some(left) = crate::compose::counter(draft) {
+                    let color = if left < 0 {
+                        palette.danger
+                    } else {
+                        palette.secondary
+                    };
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                        ui.label(
+                            egui::RichText::new(left.to_string())
+                                .font(theme::semibold(13.0))
+                                .color(color),
+                        );
+                    });
+                }
+            });
+        });
+    send
 }
 
 /// The connection's state and the account, along the bottom of the window.
@@ -442,7 +544,7 @@ fn conversation(
     status: Option<HistoryStatus>,
     media: &mut Media,
     ui: &mut egui::Ui,
-) -> (Option<HistoryRequest>, Option<Id>) {
+) -> (Option<Request>, Option<Id>) {
     let Some(channel) = selection.channel else {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(palette.window))
@@ -485,7 +587,7 @@ fn conversation(
                     }
                     HistoryStatus::Failed => {
                         if failed(ui, palette, "Couldn't load messages.") {
-                            request = Some(HistoryRequest::Retry(channel));
+                            request = Some(Request::Retry(channel));
                         }
                     }
                     HistoryStatus::Idle => {
@@ -535,7 +637,7 @@ fn conversation(
                                 }
                                 HistoryStatus::Failed => {
                                     if failed(ui, palette, "Couldn't load older messages.") {
-                                        request = Some(HistoryRequest::Retry(channel));
+                                        request = Some(Request::Retry(channel));
                                     }
                                 }
                                 HistoryStatus::Idle => {}
@@ -546,9 +648,31 @@ fn conversation(
                 if messages.is_empty() && complete {
                     return;
                 }
+                // Failed messages read in red, as the official client shows them.
+                let red = Palette {
+                    text: palette.danger,
+                    ..*palette
+                };
+                let failed = |m: &Message| matches!(m.delivery, Delivery::Failed(_));
+                let red_reader = messages.iter().any(failed).then(|| Reader {
+                    palette: &red,
+                    clock: Clock::now(),
+                    names: Directory::new(model, channel),
+                    revealed: reader.revealed.clone(),
+                });
                 let mut previous: Option<&Message> = None;
                 for message in messages {
-                    message_line(ui, &reader, media, previous, message);
+                    let body = red_reader.as_ref().filter(|_| failed(message));
+                    let body = body.unwrap_or(&reader);
+                    match message_line(ui, &reader, body, media, previous, message) {
+                        Some(Failure::Retry) => {
+                            request = Some(Request::Resend(channel, message.id));
+                        }
+                        Some(Failure::Delete) => {
+                            request = Some(Request::Discard(channel, message.id));
+                        }
+                        None => {}
+                    }
                     previous = Some(message);
                 }
             });
@@ -577,7 +701,7 @@ fn conversation(
             // before, until the channel's first message is in.
             let fills = height > output.inner_rect.height();
             if !complete && status == HistoryStatus::Idle && (at_top || !fills) {
-                request = Some(HistoryRequest::Older(channel));
+                request = Some(Request::Older(channel));
             }
         });
     (request, bottom)
@@ -618,13 +742,44 @@ fn channel_title(model: &Model, view: View, channel: Id) -> String {
     }
 }
 
+/// Whether this frame's keys send the draft: Enter does, Shift+Enter (a
+/// new line) does not.
+fn enter_sends(events: &[egui::Event]) -> bool {
+    events.iter().any(|event| {
+        matches!(event, egui::Event::Key { key: egui::Key::Enter, pressed: true, modifiers, .. } if !modifiers.shift)
+    })
+}
+
+/// How opaque a message's content is drawn: half while on its way.
+fn opacity(delivery: &Delivery) -> f32 {
+    match delivery {
+        Delivery::Sending => 0.5,
+        Delivery::Sent | Delivery::Failed(_) => 1.0,
+    }
+}
+
+/// The line under a failed message: Discord's reason, or the official
+/// client's words when it gave none (the network was down).
+fn failure_text(reason: Option<&str>) -> &str {
+    reason.unwrap_or("Message failed to send.")
+}
+
+/// What is asked of a message that failed.
+enum Failure {
+    Retry,
+    Delete,
+}
+
+/// A message, under its author's name when it starts a group. `body` draws
+/// its content: red when it failed. One on its way is dimmed.
 fn message_line(
     ui: &mut egui::Ui,
     reader: &Reader<'_>,
+    body: &Reader<'_>,
     media: &mut Media,
     previous: Option<&Message>,
     message: &Message,
-) {
+) -> Option<Failure> {
     let palette = reader.palette;
     if model::starts_group(previous, message) {
         ui.add_space(14.0);
@@ -642,14 +797,33 @@ fn message_line(
         });
     }
     let body = Body {
-        reader,
+        reader: body,
         message: message.id,
         part: 0,
     };
-    body.blocks(ui, &parsed(ui, &message.content));
-    attachments(ui, &body, media, &message.attachments);
-    embeds(ui, &body, media, &message.embeds);
+    ui.scope(|ui| {
+        ui.multiply_opacity(opacity(&message.delivery));
+        body.blocks(ui, &parsed(ui, &message.content));
+        attachments(ui, &body, media, &message.attachments);
+        embeds(ui, &body, media, &message.embeds);
+    });
     reactions(ui, palette, message);
+    let Delivery::Failed(reason) = &message.delivery else {
+        return None;
+    };
+    let mut failure = None;
+    ui.horizontal_wrapped(|ui| {
+        let text = egui::RichText::new(failure_text(reason.as_deref()));
+        let text = text.font(theme::regular(12.0));
+        ui.label(text.color(palette.danger));
+        if ui.small_button("Retry").clicked() {
+            failure = Some(Failure::Retry);
+        }
+        if ui.small_button("Delete").clicked() {
+            failure = Some(Failure::Delete);
+        }
+    });
+    failure
 }
 
 /// Where a click on a reaction waits for `show`, which can change the app.
@@ -1589,6 +1763,7 @@ mod tests {
             attachments: vec![],
             embeds: vec![],
             reactions: names.map(reaction).to_vec(),
+            ..Default::default()
         };
         let drawn = pills(&message, 0, 200.0);
         assert_eq!(drawn.len(), 6);
@@ -1619,6 +1794,7 @@ mod tests {
             attachments: vec![],
             embeds: vec![],
             reactions: vec![reaction("🎉", 1, 1), reaction("😂", 2, 0)],
+            ..Default::default()
         };
         let first = pill_ids(&message, 0);
         message.reactions.reverse();

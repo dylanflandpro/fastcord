@@ -2,9 +2,9 @@
 //! so the interface can be built without touching a Discord account.
 
 use crate::model::{
-    Attachment, Channel, ChannelKind, ChannelSettings, DmChannel, Embed, EmbedField, EmbedImage,
-    Emoji, Guild, GuildSettings, Id, Message, Model, Mute, Notify, Overwrite, OverwriteKind,
-    Permissions, Reaction, ReadState, Role, User, id_at,
+    Attachment, Channel, ChannelKind, ChannelSettings, Delivery, DmChannel, Embed, EmbedField,
+    EmbedImage, Emoji, Guild, GuildSettings, Id, Message, Model, Mute, Notify, Overwrite,
+    OverwriteKind, Permissions, Reaction, ReadState, Role, User, id_at,
 };
 use std::collections::HashMap;
 
@@ -28,7 +28,8 @@ fn channel(id: Id, name: &str, kind: ChannelKind, parent: Option<Id>, position: 
     }
 }
 
-/// A guild where @everyone may view channels; `extra` lists the other roles.
+/// A guild where @everyone may view channels and write in them; `extra`
+/// lists the other roles.
 fn guild(id: Id, name: &str, owner_id: Id, extra: &[Id], my_roles: &[Id]) -> Guild {
     let guild_id = id;
     let role = |id, permissions| Role {
@@ -41,7 +42,8 @@ fn guild(id: Id, name: &str, owner_id: Id, extra: &[Id], my_roles: &[Id]) -> Gui
         position: 0,
         permissions,
     };
-    let mut roles = vec![role(id, Permissions::VIEW_CHANNEL)];
+    let everyone = Permissions::VIEW_CHANNEL.union(Permissions::SEND_MESSAGES);
+    let mut roles = vec![role(id, everyone)];
     roles.extend(extra.iter().map(|&r| role(r, Permissions::default())));
     Guild {
         id,
@@ -96,6 +98,7 @@ impl Timeline {
                     attachments: vec![],
                     embeds: vec![],
                     reactions: vec![],
+                    delivery: Delivery::Sent,
                 }
             })
             .collect()
@@ -183,6 +186,12 @@ fn meetup_embed() -> Embed {
     }
 }
 
+/// Where demo sends fail, and Discord's words for why: #egui is in
+/// slowmode, so the failed state can be seen without a network.
+pub fn refusal(channel: Id) -> Option<&'static str> {
+    (channel == 113).then_some("Slowmode is enabled. You are sending messages too quickly.")
+}
+
 pub fn model() -> Model {
     let me = user(1, "dylan", Some("Dylan"));
     let lea = user(2, "lea.dev", Some("Léa"));
@@ -194,7 +203,16 @@ pub fn model() -> Model {
     // #contributeurs, but neither #bureau nor the Modération category.
     let mut rust = guild(100, "Rust Francophone", marc.id, &[150, 151], &[150]);
     rust.channels = vec![
-        channel(101, "annonces", ChannelKind::Announcement, None, 0),
+        // Only the owner writes here: the composer shows why Dylan cannot.
+        Channel {
+            overwrites: vec![Overwrite {
+                id: 100,
+                kind: OverwriteKind::Role,
+                allow: Permissions::default(),
+                deny: Permissions::SEND_MESSAGES,
+            }],
+            ..channel(101, "annonces", ChannelKind::Announcement, None, 0)
+        },
         channel(110, "Discussions", ChannelKind::Category, None, 0),
         channel(111, "général", ChannelKind::Text, Some(110), 0),
         channel(112, "aide", ChannelKind::Text, Some(110), 1),
@@ -391,6 +409,16 @@ pub fn model() -> Model {
         .into_iter()
         .map(|user| (user.id, user))
         .collect();
+    // Every text channel has its history, if only an empty one, so
+    // messages can be written anywhere.
+    let channels = model.guilds.iter().flat_map(|g| &g.channels);
+    let text: Vec<Id> = channels
+        .filter(|c| matches!(c.kind, ChannelKind::Text | ChannelKind::Announcement))
+        .map(|c| c.id)
+        .collect();
+    for channel in text {
+        model.messages.entry(channel).or_default();
+    }
     // The demo's histories are whole: nothing older to load.
     model.complete = model.messages.keys().copied().collect();
     read_states(&mut model, timeline.now);
@@ -474,6 +502,13 @@ mod tests {
         assert!(rust.contains(&"contributeurs"));
         assert!(!rust.contains(&"bureau") && !rust.contains(&"Modération"));
         assert!(names(300).contains(&"direction"));
+    }
+
+    #[test]
+    fn the_demo_user_writes_everywhere_but_the_announcements() {
+        let model = model();
+        assert!(!model.can_send(101));
+        assert!(model.can_send(111) && model.can_send(201) && model.can_send(900));
     }
 
     #[test]

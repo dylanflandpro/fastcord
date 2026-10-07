@@ -5,6 +5,7 @@ mod api;
 mod app;
 mod backend;
 mod captcha;
+mod compose;
 mod credentials;
 mod demo;
 mod events;

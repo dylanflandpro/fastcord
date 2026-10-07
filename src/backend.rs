@@ -44,6 +44,18 @@ pub enum Command {
     /// Add or remove my reaction; the model already shows it. Writes to the
     /// account.
     React(ReactionRequest),
+    /// Post a message I wrote. Messages leave one at a time, in the order
+    /// they were written, as the official client's queue sends them.
+    Send(Outgoing),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Outgoing {
+    pub channel: Id,
+    /// The channel's guild, `None` for a DM: the page it is sent from.
+    pub guild: Option<Id>,
+    pub nonce: Id,
+    pub content: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -95,6 +107,13 @@ pub enum Event {
     Open(Id),
     /// Discord did not take a reaction: the interface undoes it.
     ReactionFailed(ReactionRequest),
+    /// The message sent with `nonce` did not go through; `reason` is
+    /// Discord's, when it gave one.
+    SendFailed {
+        channel: Id,
+        nonce: Id,
+        reason: Option<String>,
+    },
 }
 
 pub struct Backend {
@@ -487,7 +506,16 @@ where
             (ack, attempt, delivery, used)
         }
     };
+    let mut outbox = std::collections::VecDeque::new();
+    // One message in flight at most: see `Command::Send`.
+    let mut writing = FuturesUnordered::new();
     let served = loop {
+        if writing.is_empty()
+            && let Some(outgoing) = outbox.pop_front()
+        {
+            let token = Token::new(token.borrow().expose().to_owned());
+            writing.push(async move { post_message(api, &token, outgoing, emit).await });
+        }
         busy.store(!acks.borrow().is_empty(), Ordering::Relaxed);
         let due = acks.borrow().next_due();
         tokio::select! {
@@ -505,8 +533,14 @@ where
                 Some(Command::React(reaction)) => {
                     reacting.extend(reactions.request(reaction).map(&fly));
                 }
+                Some(Command::Send(outgoing)) => outbox.push_back(outgoing),
                 Some(Command::Retry) => {}
             },
+            Some(revoked) = writing.next(), if !writing.is_empty() => {
+                if revoked {
+                    return Served::Revoked;
+                }
+            }
             Some(revoked) = loading.next(), if !loading.is_empty() => {
                 if revoked {
                     return Served::Revoked;
@@ -781,6 +815,42 @@ async fn load_history(
     false
 }
 
+/// Sends one message and reports how it went: the message as Discord stored
+/// it, or the failure. `true` when Discord says the token is no longer valid.
+async fn post_message(api: &Api, token: &Token, outgoing: Outgoing, emit: Emit<'_>) -> bool {
+    let Outgoing {
+        channel,
+        guild,
+        nonce,
+        content,
+    } = outgoing;
+    let failed = |reason| Event::SendFailed {
+        channel,
+        nonce,
+        reason,
+    };
+    match api
+        .send_message(token, channel, guild, nonce, &content)
+        .await
+    {
+        // Unreadable, it still went through: the gateway's copy confirms it.
+        Ok(body) => match crate::events::sent(&body, guild) {
+            Ok(update) => emit(Event::Update(update)),
+            Err(error) => log::warn!("unreadable sent message: {}", describe(&error)),
+        },
+        Err(api::SendError::Unauthorized) => {
+            emit(failed(None));
+            return true;
+        }
+        Err(api::SendError::Network) => {
+            log::warn!("sending a message failed: unable to reach Discord");
+            emit(failed(None));
+        }
+        Err(api::SendError::Refused(reason)) => emit(failed(reason)),
+    }
+    false
+}
+
 /// Waits for a command matching `wanted`, ignoring others. `false` once the
 /// window has closed.
 async fn wait_for(
@@ -967,7 +1037,9 @@ mod tests {
                 attachments: vec![],
                 embeds: vec![],
                 reactions: vec![],
+                ..Default::default()
             },
+            nonce: None,
             ping: crate::model::Ping::default(),
         };
         connection.update(message(next, me), me);

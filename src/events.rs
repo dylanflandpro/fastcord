@@ -62,12 +62,15 @@ pub enum Update {
         oldest: Option<Id>,
         complete: bool,
     },
+    /// A new message. `nonce` comes back with my own: the one it was sent
+    /// with, so the copy shown while it was on its way gives way to it.
     MessageCreate {
         channel: Id,
         /// `None` in a DM.
         guild: Option<Id>,
         message: Message,
         ping: Ping,
+        nonce: Option<Id>,
     },
     /// An edit. Each part is `None` when the edit left it alone: a link
     /// preview resolving after the message sends `embeds` only.
@@ -186,6 +189,39 @@ struct WireMessage {
     flags: Option<u64>,
     #[serde(default, deserialize_with = "lenient")]
     reactions: Vec<WireReaction>,
+    #[serde(default, deserialize_with = "nonce")]
+    nonce: Option<Id>,
+}
+
+/// A message's nonce: a snowflake string from Discord's clients, but bots
+/// may send any string or a number. Only snowflakes can be fastcord's own.
+fn nonce<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Id>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Nonce {
+        Text(String),
+        Number(u64),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match serde::Deserialize::deserialize(deserializer)? {
+        Nonce::Text(text) => text.parse().ok(),
+        Nonce::Number(number) => Some(number),
+        Nonce::Other(_) => None,
+    })
+}
+
+/// The API's answer to a message I sent in `guild`: the message as Discord
+/// stored it. My own message pings no one I need to count.
+pub fn sent(body: &str, guild: Option<Id>) -> serde_json::Result<Update> {
+    let wire: WireMessage = serde_json::from_str(body)?;
+    let (channel, nonce) = (wire.channel_id, wire.nonce);
+    Ok(Update::MessageCreate {
+        channel,
+        guild: wire.guild_id.or(guild),
+        message: wire.into(),
+        ping: Ping::default(),
+        nonce,
+    })
 }
 
 /// A user a message mentions, with their membership in a guild.
@@ -378,6 +414,7 @@ impl From<WireMessage> for Message {
             attachments: wire.attachments.into_iter().map(Into::into).collect(),
             embeds: wire.embeds.into_iter().map(Into::into).collect(),
             reactions: wire.reactions.into_iter().map(Into::into).collect(),
+            delivery: crate::model::Delivery::Sent,
         }
     }
 }
@@ -1380,7 +1417,7 @@ impl Decoder {
                 if !shown(wire.kind) {
                     return Ok(Vec::new());
                 }
-                let (channel, guild) = (wire.channel_id, wire.guild_id);
+                let (channel, guild, nonce) = (wire.channel_id, wire.guild_id, wire.nonce);
                 let ping = wire.ping(self.me);
                 let people = wire.people();
                 let message = Message::from(wire);
@@ -1394,6 +1431,7 @@ impl Decoder {
                         guild,
                         message,
                         ping,
+                        nonce,
                     },
                 ]
             }
@@ -2118,7 +2156,29 @@ mod tests {
             .unwrap();
         assert!(matches!(
             &created[..],
-            [_, Update::MessageCreate { channel: 7, guild: Some(1), message, .. }] if message.content == "salut"
+            [_, Update::MessageCreate { channel: 7, guild: Some(1), message, nonce: None, .. }] if message.content == "salut"
+        ));
+        for (nonce, read) in [
+            (r#""1425000000000000000""#, Some(1425000000000000000)),
+            ("42", Some(42)),
+            (r#""not a snowflake""#, None),
+            ("null", None),
+            ("{}", None),
+        ] {
+            let data = format!(
+                r#"{{"id":"41","channel_id":"7","content":"","author":{{"id":"1","username":"me"}},"nonce":{nonce}}}"#
+            );
+            let created = decoder.event("MESSAGE_CREATE", &data).unwrap();
+            assert!(
+                matches!(&created[..], [.., Update::MessageCreate { nonce, .. }] if *nonce == read),
+                "{nonce}"
+            );
+        }
+        // The API answers a send with the message, nonce included.
+        let answer = r#"{"id":"42","channel_id":"7","content":"ok","author":{"id":"1","username":"me"},"nonce":"40"}"#;
+        assert!(matches!(
+            sent(answer, Some(1)).unwrap(),
+            Update::MessageCreate { channel: 7, guild: Some(1), nonce: Some(40), message, .. } if message.id == 42
         ));
         assert_eq!(decoder.user(5).display_name(), "Sam");
         assert_eq!(

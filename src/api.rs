@@ -124,6 +124,53 @@ struct Experiments {
 const RATE_LIMIT_RETRIES: u32 = 2;
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
 
+/// The body the web client posts for a message, fields in its order.
+#[derive(serde::Serialize)]
+struct NewMessage<'a> {
+    /// What the browser's network information reports; desktop browsers
+    /// leave it unknown.
+    mobile_network_type: &'static str,
+    content: &'a str,
+    /// A snowflake for now, as a string: Discord echoes it back with the
+    /// message so the copy shown while it was on its way can be replaced.
+    nonce: String,
+    tts: bool,
+    flags: u64,
+}
+
+fn new_message(content: &str, nonce: Id) -> NewMessage<'_> {
+    NewMessage {
+        mobile_network_type: "unknown",
+        content,
+        nonce: nonce.to_string(),
+        tts: false,
+        flags: 0,
+    }
+}
+
+/// Why a message was not sent.
+#[derive(Debug, PartialEq)]
+pub enum SendError {
+    /// The token is no longer valid.
+    Unauthorized,
+    /// No answer, or one that could not be read.
+    Network,
+    /// Discord said no, in its own words when it gave some.
+    Refused(Option<String>),
+}
+
+/// Discord's error body (`{"code": 50013, "message": "Missing Permissions"}`).
+#[derive(serde::Deserialize)]
+struct Refusal {
+    #[serde(default)]
+    code: u64,
+    message: Option<String>,
+}
+
+/// The error code for a slowmode refusal: a 429 that waiting a few seconds
+/// will not fix, which the official client reports instead of retrying.
+const SLOWMODE: u64 = 20016;
+
 #[derive(serde::Deserialize)]
 struct RateLimited {
     /// Seconds, fractional.
@@ -554,6 +601,68 @@ impl Api {
         reacted(status.as_u16(), wait)
     }
 
+    /// Posts a message as the web client does, from the channel's page.
+    /// Rate limits are waited out like [`Self::messages`]; slowmode is not,
+    /// as the official client does. The answer is the message as stored.
+    pub async fn send_message(
+        &self,
+        token: &Token,
+        channel: Id,
+        guild: Option<Id>,
+        nonce: Id,
+        content: &str,
+    ) -> Result<String, SendError> {
+        let web = self.web().await;
+        let page = match guild {
+            Some(guild) => format!("/channels/{guild}/{channel}"),
+            None => format!("/channels/@me/{channel}"),
+        };
+        let body = new_message(content, nonce);
+        let mut retries = 0;
+        loop {
+            let response = Self::dress(
+                self.client
+                    .post(format!("{BASE}/channels/{channel}/messages"))
+                    .header(reqwest::header::AUTHORIZATION, token.expose())
+                    .json(&body),
+                &web,
+                &page,
+            )
+            .send()
+            .await
+            .map_err(|_| SendError::Network)?;
+            let status = response.status();
+            let text = response.text().await.map_err(|_| SendError::Network)?;
+            if status.is_success() {
+                return Ok(text);
+            }
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(SendError::Unauthorized);
+            }
+            let refusal = serde_json::from_str::<Refusal>(&text).ok();
+            let code = refusal.as_ref().map_or(0, |r| r.code);
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                && code != SLOWMODE
+                && retries < RATE_LIMIT_RETRIES
+            {
+                retries += 1;
+                let wait = serde_json::from_str::<RateLimited>(&text)
+                    .map_or(MAX_RETRY_AFTER, |limited| retry_after(limited.retry_after));
+                log::info!("rate limited; retrying in {} ms", wait.as_millis());
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            // Status and code only: the reason may quote what was sent.
+            log::warn!("sending a message failed with HTTP {status} (code {code})");
+            if serde_json::from_str::<Challenge>(&text).is_ok() {
+                return Err(SendError::Refused(Some(
+                    "Discord asked for a captcha, which fastcord cannot show here yet.".into(),
+                )));
+            }
+            return Err(SendError::Refused(refusal.and_then(|r| r.message)));
+        }
+    }
+
     /// Ends the session on Discord's side, so the token stops working even
     /// if a copy survived somewhere.
     pub async fn logout(&self, token: &Token) -> Result<(), Error> {
@@ -796,6 +905,25 @@ mod tests {
         assert_eq!(header("X-Captcha-Key"), "solved");
         assert_eq!(header("X-Captcha-Rqtoken"), "t");
         assert_eq!(header("X-Captcha-Session-Id"), "s");
+    }
+
+    #[test]
+    fn a_message_is_posted_as_the_web_client_posts_it() {
+        let body = serde_json::to_string(&new_message("salut :)", 1425000000000000000)).unwrap();
+        assert_eq!(
+            body,
+            r#"{"mobile_network_type":"unknown","content":"salut :)","nonce":"1425000000000000000","tts":false,"flags":0}"#
+        );
+    }
+
+    #[test]
+    fn reads_discords_refusals() {
+        let refusal: Refusal = serde_json::from_str(
+            r#"{"message":"Slowmode is enabled.","code":20016,"retry_after":3.2}"#,
+        )
+        .unwrap();
+        assert_eq!(refusal.code, SLOWMODE);
+        assert_eq!(refusal.message.as_deref(), Some("Slowmode is enabled."));
     }
 
     #[test]

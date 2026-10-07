@@ -24,6 +24,13 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
   which hosts may be loaded: Discord's only) are tested functions; `Media` keeps the
   textures in memory under a cap and fetches off the interface's thread. Draw a
   picture only when it is on screen, so only what is seen loads.
+- `compose.rs`: what a draft sends (trimming, emoji shortcodes, the 2,000-character
+  limit and its counter). `app::Composer` keeps the drafts and turns one into a
+  pending message (`model::Delivery`) and a `Command::Send`; the API's answer or
+  the gateway's MESSAGE_CREATE with the same `nonce` replaces it. Demo runs confirm
+  sends locally after a moment, and refuse them in #egui (slowmode) to show a failure.
+- `ui.rs` tests can draw a widget headless with `Context::run_ui` and synthetic
+  events (see the composer's test): prefer that to launching the app.
 - `theme.rs`: the palette, which follows Omarchy's through `fastframe-theme`.
 - `backend.rs`: the thread that talks to Discord and the keyring. The interface
   sends `Command`s and reads what it reports; it never waits on the network.
@@ -83,6 +90,10 @@ serde errors quote the text they failed on: log them through `backend::describe`
 - The conversation lays out every loaded message on each frame (messages are
   parsed once and cached, but laid out each frame). Virtualize it before long
   scroll-back sessions become common.
+- Sending: no attachments, no `@silent`, no upload of over-long messages (Nitro's
+  4,000-character limit is not known either), no timeout (`communication_disabled_until`)
+  check, and Discord-only shortcodes (those the GitHub table lacks) stay as typed.
+  A pending message is dropped if READY replaces the model mid-send.
 - Guilds over 75,000 members only send messages after a guild subscription
   (gateway op 37); smaller guilds are subscribed automatically on connect.
 - Notifications know nothing of threads and forum posts (fastcord does not
