@@ -703,6 +703,29 @@ impl Api {
         self.attempt(token, place, request).await
     }
 
+    /// Changes my message's text, the only part the web client's edit
+    /// sends; once, like [`Self::send_message`].
+    pub async fn edit_message(
+        &self,
+        token: &Token,
+        place: Place,
+        id: Id,
+        content: &str,
+    ) -> Attempt {
+        let url = format!("{BASE}/channels/{}/messages/{id}", place.channel);
+        let request = self
+            .client
+            .patch(url)
+            .json(&serde_json::json!({ "content": content }));
+        self.attempt(token, place, request).await
+    }
+
+    /// Deletes my message, once.
+    pub async fn delete_message(&self, token: &Token, place: Place, id: Id) -> Attempt {
+        let url = format!("{BASE}/channels/{}/messages/{id}", place.channel);
+        self.attempt(token, place, self.client.delete(url)).await
+    }
+
     /// One try at a request that changes something, from the channel's page.
     async fn attempt(&self, token: &Token, place: Place, request: RequestBuilder) -> Attempt {
         let web = self.web().await;

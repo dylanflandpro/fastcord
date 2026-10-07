@@ -38,8 +38,10 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
   nor a held Enter repeating), and keeps every `/command` but `/shrug`, `/tableflip`,
   `/unflip` and `/me` (`\/` sends a literal slash). Tests drive `ui::show` headless on
   the demo app with synthetic keys (`ui::tests::show`).
-- `outbox.rs`: messages leave one at a time, in order; a failure fails the channel's
-  later messages unsent. `api::verdict` reads each attempt, status first: a lost
+- `outbox.rs`: messages, edits and deletions (`backend::Write`) leave one at a time, in
+  order; a failed message fails the channel's later messages unsent. Edits and
+  deletions are not optimistic, as in the web client: the editor shows "Saving…" until
+  Discord answers, a deletion waits for it, and a refusal is told under the message. `api::verdict` reads each attempt, status first: a lost
   answer or a 5xx is `Unsure` (no Retry until the gateway showed life after it: a
   connection, or a heartbeat acknowledged, `Event::Alive`), a 429 is waited out in full
   while the message says so. After a new READY an unsure message waits for its
@@ -117,6 +119,9 @@ serde errors quote the text they failed on: log them through `backend::describe`
   the draft, though it may have been sent: the reloaded history shows whether.
   Retry reuses the nonce, but the web client sends no `enforce_nonce`, so Discord does
   not deduplicate by it: a copy that did arrive confirms the retried one only locally.
+- Editing and deleting cover my own messages only: deleting others' with Manage
+  Messages (moderators) is not offered. "(edited)" sits on its own line, not after
+  the text.
 - Guilds over 75,000 members only send messages after a guild subscription
   (gateway op 37); smaller guilds are subscribed automatically on connect.
 - Notifications know nothing of threads and forum posts (fastcord does not

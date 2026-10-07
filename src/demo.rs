@@ -99,6 +99,7 @@ impl Timeline {
                     embeds: vec![],
                     reactions: vec![],
                     delivery: Delivery::Sent,
+                    edited: false,
                 }
             })
             .collect()
@@ -316,9 +317,7 @@ pub fn model() -> Model {
         ..attachment(3, "SPOILER_paysage.png", "image/png", 6384)
     }];
     model.messages.insert(101, annonces);
-    model.messages.insert(
-        111,
-        timeline.history(&[
+    let mut general = timeline.history(&[
             (95, &marc, "Quelqu'un a déjà testé egui 0.36 ?"),
             (
                 94,
@@ -349,8 +348,10 @@ pub fn model() -> Model {
                 &lea,
                 "> Objectif : ouvrir en moins d'une seconde 🚀\n<@1> j'ai testé : ||0,4 s à froid, pari tenu||",
             ),
-        ]),
-    );
+        ]);
+    // Dylan fixed a typo since.
+    general[8].edited = true;
+    model.messages.insert(111, general);
     model.messages.insert(
         112,
         timeline.history(&[

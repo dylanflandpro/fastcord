@@ -2,7 +2,7 @@
 
 mod sign_in;
 
-use crate::app::{self, App, Composer, HistoryStatus, ScrollAnchor, Selection, View};
+use crate::app::{self, App, Composer, Editing, HistoryStatus, ScrollAnchor, Selection, View};
 use crate::backend::{Command, Link};
 use crate::markdown::{self, Action, Block, Content, Directory, Span, Style};
 use crate::media::{self, Media, Picture, Shown};
@@ -17,7 +17,7 @@ use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Galley, Margin, Rect, Response,
     Sense, Stroke, Vec2,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -33,7 +33,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
     status_bar(app, ui);
     let status = app.selection.channel.map(|c| app.history_status(c));
-    let (request, bottom, send) = {
+    let (request, bottom, composed) = {
         let Some(model) = &app.model else {
             return;
         };
@@ -41,12 +41,23 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         rail(selection, model, &palette, ui);
         sidebar(selection, model, &palette, ui);
         let state = &mut app.composer;
-        let send = selection
+        let composed = selection
             .channel
-            .filter(|&channel| composer(channel, model, state, &palette, ui));
-        let (request, bottom) =
-            conversation(selection, model, &palette, status, &mut app.media, ui);
-        (request, bottom, send)
+            .map(|channel| (channel, composer(channel, model, state, &palette, ui)));
+        let writing = Writing {
+            editing: &mut app.composer.editing,
+            notes: &app.notes,
+        };
+        let (request, bottom) = conversation(
+            selection,
+            model,
+            &palette,
+            status,
+            &mut app.media,
+            writing,
+            ui,
+        );
+        (request, bottom, composed)
     };
     app.report_bottom(bottom);
     let clicked =
@@ -55,14 +66,21 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         app.toggle_reaction(channel, message, emoji);
     }
     viewer(&mut app.media, &palette, ui);
-    if let Some(channel) = send {
-        app.send_draft(channel);
+    confirm_delete(app, &palette, ui);
+    if let Some((channel, composed)) = composed {
+        if composed.send {
+            app.send_draft(channel);
+        }
+        if composed.edit_last
+            && let Some(model) = &app.model
+        {
+            app.composer.edit_last(model, channel);
+        }
     }
     match request {
         Some(Request::Older(channel)) => app.request_history(channel, true),
         Some(Request::Retry(channel)) => app.retry_history(channel),
-        Some(Request::Resend(channel, nonce)) => app.retry_send(channel, nonce),
-        Some(Request::Discard(channel, nonce)) => app.discard_failed(channel, nonce),
+        Some(Request::Message(channel, id, act)) => act_on(app, channel, id, act, ui),
         None => {}
     }
 }
@@ -72,25 +90,107 @@ enum Request {
     /// Scrolled to the top: the page before.
     Older(Id),
     Retry(Id),
-    /// Retry and Delete on a message that failed: channel, nonce.
-    Resend(Id, Id),
-    Discard(Id, Id),
+    /// Something done to one message: channel, id.
+    Message(Id, Id, Act),
 }
+
+/// What is done to a message from its line.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Act {
+    /// On one that failed.
+    Resend,
+    Discard,
+    Edit,
+    /// Delete one of mine; `confirmed` skips the question (Shift held).
+    Delete {
+        confirmed: bool,
+    },
+    /// In its editor.
+    Save,
+    CancelEdit,
+}
+
+fn act_on(app: &mut App, channel: Id, id: Id, act: Act, ui: &egui::Ui) {
+    match act {
+        Act::Resend => app.retry_send(channel, id),
+        Act::Discard => app.discard_failed(channel, id),
+        Act::Edit => {
+            if let Some(model) = &app.model {
+                app.composer.edit(model, channel, id);
+            }
+        }
+        Act::Delete { confirmed } => app.delete(channel, id, confirmed),
+        Act::Save | Act::CancelEdit => {
+            match act {
+                Act::Save => app.save_edit(),
+                _ => app.composer.editing = None,
+            }
+            // The cursor goes back to the composer.
+            ui.data_mut(|d| d.remove::<Id>(egui::Id::new(OPENED)));
+        }
+    }
+}
+
+/// The question before deleting one of my messages, as the official
+/// client asks it. Its buttons are keyed by the message, like the toolbar's.
+fn confirm_delete(app: &mut App, palette: &Palette, ui: &mut egui::Ui) {
+    let Some((channel, id)) = app.confirm_delete else {
+        return;
+    };
+    let mut answer = None;
+    let modal = egui::Modal::new(egui::Id::new(("confirm-delete", channel, id)));
+    let modal = modal.show(ui.ctx(), |ui| {
+        ui.set_width(400.0);
+        let title = egui::RichText::new("Delete Message").font(theme::semibold(18.0));
+        ui.label(title.color(palette.text));
+        ui.add_space(8.0);
+        ui.label("Are you sure you want to delete this message?");
+        ui.add_space(16.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let delete = egui::RichText::new("Delete").color(palette.danger);
+            if keyed_button(ui, ("delete-yes", channel, id), delete).clicked() {
+                answer = Some(true);
+            }
+            if keyed_button(ui, ("delete-no", channel, id), "Cancel").clicked() {
+                answer = Some(false);
+            }
+        });
+    });
+    match answer {
+        Some(true) => app.delete(channel, id, true),
+        Some(false) => app.confirm_delete = None,
+        None if modal.should_close() => app.confirm_delete = None,
+        None => {}
+    }
+}
+
+/// What the composer was asked this frame.
+#[derive(Debug, Default, PartialEq)]
+struct Composed {
+    /// Enter.
+    send: bool,
+    /// Up in an empty draft: edit my last message.
+    edit_last: bool,
+}
+
+/// Where egui's memory keeps the channel whose composer last took the
+/// cursor; removing it gives the cursor back to the composer.
+const OPENED: &str = "composer-channel";
 
 /// Discord's words for a channel where I may not write.
 const NO_PERMISSION: &str = "You do not have permission to send messages in this channel.";
 
 /// The box under the conversation. Enter sends, Shift+Enter starts a new
-/// line, and the counter shows near the limit, as in the official client.
-/// `true` when Enter asks to send.
+/// line, Up in an empty draft edits my last message, and the counter shows
+/// near the limit, as in the official client.
 fn composer(
     channel: Id,
     model: &Model,
     state: &mut Composer,
     palette: &Palette,
     ui: &mut egui::Ui,
-) -> bool {
-    let mut send = false;
+) -> Composed {
+    let mut composed = Composed::default();
     let margin = Margin {
         left: 16,
         right: 16,
@@ -152,7 +252,7 @@ fn composer(
                     })
                     .inner;
                 // Opening a channel puts the cursor in its composer.
-                let opened = egui::Id::new("composer-channel");
+                let opened = egui::Id::new(OPENED);
                 if ui.data(|d| d.get_temp::<Id>(opened)) != Some(channel) {
                     ui.data_mut(|d| d.insert_temp(opened, channel));
                     edit.request_focus();
@@ -162,8 +262,10 @@ fn composer(
                 let held = egui::Id::new(("composer-held", channel));
                 let had_focus = ui.data(|d| d.get_temp::<bool>(held)).unwrap_or(false);
                 let focused = edit.has_focus();
-                send = had_focus && focused && ui.input(|i| enter_sends(&i.events));
+                composed.send = had_focus && focused && ui.input(|i| enter_sends(&i.events));
                 ui.data_mut(|d| d.insert_temp(held, focused));
+                let up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
+                composed.edit_last = had_focus && focused && up && draft.is_empty();
                 if edit.changed() {
                     state.notice = None;
                 }
@@ -183,7 +285,7 @@ fn composer(
                 }
             });
         });
-    send
+    composed
 }
 
 /// The connection's state and the account, along the bottom of the window.
@@ -564,6 +666,7 @@ fn conversation(
     palette: &Palette,
     status: Option<HistoryStatus>,
     media: &mut Media,
+    writing: Writing<'_>,
     ui: &mut egui::Ui,
 ) -> (Option<Request>, Option<Id>) {
     let Some(channel) = selection.channel else {
@@ -685,14 +788,20 @@ fn conversation(
                 for message in messages {
                     let body = red_reader.as_ref().filter(|_| failed(message));
                     let body = body.unwrap_or(&reader);
-                    match message_line(ui, &reader, body, media, previous, message) {
-                        Some(Failure::Retry) => {
-                            request = Some(Request::Resend(channel, message.id));
-                        }
-                        Some(Failure::Delete) => {
-                            request = Some(Request::Discard(channel, message.id));
-                        }
-                        None => {}
+                    let line = Line {
+                        mine: model.is_mine(channel, message.id),
+                        editing: writing
+                            .editing
+                            .as_mut()
+                            .filter(|e| (e.channel, e.id) == (channel, message.id)),
+                        note: writing
+                            .notes
+                            .get(&(channel, message.id))
+                            .map(String::as_str),
+                    };
+                    let act = message_line(ui, &reader, body, media, previous, message, line);
+                    if let Some(act) = act {
+                        request = Some(Request::Message(channel, message.id, act));
                     }
                     previous = Some(message);
                 }
@@ -854,14 +963,38 @@ fn keyed_button(
     response
 }
 
-/// What is asked of a message that failed.
-enum Failure {
-    Retry,
-    Delete,
+/// Any widget, keyed like [`keyed_button`] but in a child Ui of its own:
+/// only outside wrapped rows, where a child Ui would not wrap.
+fn keyed(
+    ui: &mut egui::Ui,
+    key: impl std::hash::Hash + std::fmt::Debug,
+    widget: impl egui::Widget,
+) -> Response {
+    let scope = egui::UiBuilder::new().id(egui::Id::new(key));
+    ui.scope_builder(scope, |ui| ui.add(widget)).inner
+}
+
+/// What the conversation needs of my writing: the message open for
+/// editing, and why my last edits or deletions failed.
+struct Writing<'a> {
+    editing: &'a mut Option<Editing>,
+    notes: &'a HashMap<(Id, Id), String>,
+}
+
+/// What a message's line needs to know of my writing.
+struct Line<'a> {
+    /// Mine, on Discord: I may edit and delete it.
+    mine: bool,
+    /// Open for editing.
+    editing: Option<&'a mut Editing>,
+    /// Why my last edit or deletion of it failed.
+    note: Option<&'a str>,
 }
 
 /// A message, under its author's name when it starts a group. `body` draws
-/// its content: red when it failed. One on its way is dimmed.
+/// its content: red when it failed. One on its way is dimmed; one of mine
+/// may be open for editing. Hovered, one of mine offers Edit and Delete, as
+/// the official client's toolbar.
 fn message_line(
     ui: &mut egui::Ui,
     reader: &Reader<'_>,
@@ -869,8 +1002,137 @@ fn message_line(
     media: &mut Media,
     previous: Option<&Message>,
     message: &Message,
-) -> Option<Failure> {
+    line: Line<'_>,
+) -> Option<Act> {
     let palette = reader.palette;
+    let editing = line.editing.is_some();
+    let drawn = ui.scope(|ui| message_body(ui, reader, body, media, previous, message, line));
+    // The whole row, as wide as the conversation: a short message is
+    // hovered, and its toolbar reached, anywhere along it.
+    let row = Rect::from_x_y_ranges(ui.max_rect().x_range(), drawn.response.rect.y_range());
+    let offers = !editing && message.delivery == Delivery::Sent && ui.rect_contains_pointer(row);
+    let mine = drawn.inner.1;
+    let offered = offers
+        .then(|| toolbar(ui, palette, row, message.id, mine))
+        .flatten();
+    drawn.inner.0.or(offered)
+}
+
+/// Where a message's toolbar floats: over the top right corner of its row.
+fn toolbar_rect(row: Rect, width: f32) -> Rect {
+    let size = egui::vec2(width.min(row.width()), 26.0);
+    Rect::from_min_size(egui::pos2(row.right() - size.x, row.top()), size)
+}
+
+/// The buttons over a hovered message, keyed by it. Shift+Delete skips the
+/// question, as in the official client.
+fn toolbar(ui: &mut egui::Ui, palette: &Palette, row: Rect, id: Id, mine: bool) -> Option<Act> {
+    if !mine {
+        return None;
+    }
+    let area = toolbar_rect(row, 120.0);
+    // A child that takes no room: the toolbar floats over the message.
+    let layout = egui::Layout::right_to_left(egui::Align::Min);
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(area).layout(layout));
+    let mut act = None;
+    let frame = Frame::new()
+        .fill(palette.surface)
+        .stroke(Stroke::new(1.0, palette.outline))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(4, 2));
+    frame.show(&mut child, |ui| {
+        ui.horizontal(|ui| {
+            if keyed_button(ui, ("edit", id), "Edit").clicked() {
+                act = Some(Act::Edit);
+            }
+            let delete = egui::RichText::new("Delete").color(palette.danger);
+            if keyed_button(ui, ("delete", id), delete).clicked() {
+                let confirmed = ui.input(|i| i.modifiers.shift);
+                act = Some(Act::Delete { confirmed });
+            }
+        });
+    });
+    act
+}
+
+/// One of my messages open in place: Enter saves, Shift+Enter breaks the
+/// line, Escape cancels, as in the official client. While Discord has not
+/// answered, it shows the saved text, saving.
+fn editor(ui: &mut egui::Ui, palette: &Palette, editing: &mut Editing) -> Option<Act> {
+    let field = Frame::new()
+        .fill(palette.surface)
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(12, 8));
+    let newline = egui::KeyboardShortcut::new(egui::Modifiers::SHIFT, egui::Key::Enter);
+    let id = editing.id;
+    let saving = editing.saving;
+    let edit = field
+        .show(ui, |ui| {
+            ui.add(
+                egui::TextEdit::multiline(&mut editing.draft)
+                    .id(egui::Id::new(("editor", id)))
+                    .interactive(!saving)
+                    .font(theme::regular(TEXT_SIZE))
+                    .text_color(palette.text)
+                    .frame(Frame::NONE)
+                    .margin(Margin::ZERO)
+                    .desired_rows(1)
+                    .desired_width(f32::INFINITY)
+                    .return_key(newline),
+            )
+        })
+        .inner;
+    let words = |text: &str| egui::RichText::new(text).font(theme::regular(12.0));
+    if saving {
+        ui.label(words("Saving…").color(palette.secondary));
+        return None;
+    }
+    // The cursor goes in once, when it opens.
+    let open = egui::Id::new("editor-open");
+    if ui.data(|d| d.get_temp::<Id>(open)) != Some(id) {
+        ui.data_mut(|d| d.insert_temp(open, id));
+        edit.request_focus();
+    }
+    let mut act = None;
+    if edit.has_focus() && ui.input(|i| enter_sends(&i.events)) {
+        act = Some(Act::Save);
+    }
+    let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+    if escape && (edit.has_focus() || edit.lost_focus()) {
+        act = Some(Act::CancelEdit);
+    }
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.label(words("escape to ").color(palette.secondary));
+        let cancel = egui::Button::new(words("cancel").color(palette.accent)).frame(false);
+        if keyed(ui, ("edit-cancel", id), cancel).clicked() {
+            act = Some(Act::CancelEdit);
+        }
+        ui.label(words(" • enter to ").color(palette.secondary));
+        let save = egui::Button::new(words("save").color(palette.accent)).frame(false);
+        if keyed(ui, ("edit-save", id), save).clicked() {
+            act = Some(Act::Save);
+        }
+    });
+    if act.is_some() {
+        ui.data_mut(|d| d.remove::<Id>(open));
+    }
+    act
+}
+
+/// The inside of a message's line: header, content (or its editor), and
+/// what is owed to it; what is asked of it, and whether it is mine.
+fn message_body(
+    ui: &mut egui::Ui,
+    reader: &Reader<'_>,
+    body: &Reader<'_>,
+    media: &mut Media,
+    previous: Option<&Message>,
+    message: &Message,
+    line: Line<'_>,
+) -> (Option<Act>, bool) {
+    let palette = reader.palette;
+    let mine = line.mine;
     if model::starts_group(previous, message) {
         ui.add_space(14.0);
         ui.horizontal(|ui| {
@@ -886,18 +1148,32 @@ fn message_line(
             );
         });
     }
-    let body = Body {
-        reader: body,
-        message: message.id,
-        part: 0,
-    };
-    ui.scope(|ui| {
-        ui.multiply_opacity(opacity(&message.delivery));
-        body.blocks(ui, &parsed(ui, &message.content));
-        attachments(ui, &body, media, &message.attachments);
-        embeds(ui, &body, media, &message.embeds);
-    });
+    let mut act = None;
+    match line.editing {
+        Some(editing) => act = editor(ui, palette, editing),
+        None => {
+            let body = Body {
+                reader: body,
+                message: message.id,
+                part: 0,
+            };
+            ui.scope(|ui| {
+                ui.multiply_opacity(opacity(&message.delivery));
+                body.blocks(ui, &parsed(ui, &message.content));
+                attachments(ui, &body, media, &message.attachments);
+                embeds(ui, &body, media, &message.embeds);
+            });
+            if message.edited {
+                let text = egui::RichText::new("(edited)").font(theme::regular(11.0));
+                ui.label(text.color(palette.dim));
+            }
+        }
+    }
     reactions(ui, palette, message);
+    if let Some(note) = line.note {
+        let text = egui::RichText::new(note).font(theme::regular(12.0));
+        ui.label(text.color(palette.danger));
+    }
     if let Some(note) = waiting_note(&message.delivery, reader.clock.now) {
         let text = egui::RichText::new(note).font(theme::regular(12.0));
         ui.label(text.color(palette.secondary));
@@ -905,21 +1181,20 @@ fn message_line(
             .request_repaint_after(std::time::Duration::from_millis(500));
     }
     let Delivery::Failed(reason) = &message.delivery else {
-        return None;
+        return (act, mine);
     };
-    let mut failure = None;
     ui.horizontal_wrapped(|ui| {
         let text = egui::RichText::new(failure_text(reason.as_deref()));
         let text = text.font(theme::regular(12.0));
         ui.label(text.color(palette.danger));
         if keyed_button(ui, ("retry", message.id), "Retry").clicked() {
-            failure = Some(Failure::Retry);
+            act = Some(Act::Resend);
         }
         if keyed_button(ui, ("discard", message.id), "Delete").clicked() {
-            failure = Some(Failure::Delete);
+            act = Some(Act::Discard);
         }
     });
-    failure
+    (act, mine)
 }
 
 /// Where a click on a reaction waits for `show`, which can change the app.
@@ -1984,11 +2259,21 @@ mod tests {
         channel: Id,
         events: Vec<egui::Event>,
     ) -> bool {
-        let mut sent = false;
+        compose_all(ctx, model, state, channel, events).send
+    }
+
+    fn compose_all(
+        ctx: &egui::Context,
+        model: &Model,
+        state: &mut Composer,
+        channel: Id,
+        events: Vec<egui::Event>,
+    ) -> Composed {
+        let mut composed = Composed::default();
         frame(ctx, events, |ui| {
-            sent = composer(channel, model, state, &Palette::dark(), ui);
+            composed = composer(channel, model, state, &Palette::dark(), ui);
         });
-        sent
+        composed
     }
 
     #[test]
@@ -2136,6 +2421,109 @@ mod tests {
             pressed: true,
             repeat: true,
             modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn up_in_an_empty_composer_edits_my_last_message() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let model = crate::demo::model();
+        let mut state = Composer::default();
+        let up = || vec![key(egui::Key::ArrowUp, egui::Modifiers::NONE)];
+        compose(&ctx, &model, &mut state, 111, vec![]);
+        assert!(compose_all(&ctx, &model, &mut state, 111, up()).edit_last);
+        state.drafts.insert(111, "brouillon".into());
+        assert!(!compose_all(&ctx, &model, &mut state, 111, up()).edit_last);
+    }
+
+    #[test]
+    fn the_editor_saves_on_enter_and_cancels_on_escape() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let palette = Palette::dark();
+        let mut editing = Editing {
+            channel: 111,
+            id: 5,
+            draft: "salut".into(),
+            saving: false,
+        };
+        let edit = |editing: &mut Editing, events| {
+            let mut act = None;
+            frame(&ctx, events, |ui| act = editor(ui, &palette, editing));
+            act
+        };
+        assert_eq!(
+            edit(&mut editing, vec![]),
+            None,
+            "opens with the cursor in it"
+        );
+        assert_eq!(
+            edit(&mut editing, vec![egui::Event::Text("!".into())]),
+            None
+        );
+        let enter = || key(egui::Key::Enter, egui::Modifiers::NONE);
+        let shift = key(egui::Key::Enter, egui::Modifiers::SHIFT);
+        assert_eq!(edit(&mut editing, vec![shift]), None);
+        assert_eq!(edit(&mut editing, vec![enter()]), Some(Act::Save));
+        assert_eq!(editing.draft, "salut!\n");
+        // Saving: nothing more until Discord answers.
+        editing.saving = true;
+        let typed = vec![egui::Event::Text("x".into()), enter()];
+        assert_eq!(edit(&mut editing, typed), None);
+        assert_eq!(editing.draft, "salut!\n");
+        editing.saving = false;
+        assert_eq!(edit(&mut editing, vec![]), None, "opened again");
+        let escape = key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert_eq!(edit(&mut editing, vec![escape]), Some(Act::CancelEdit));
+    }
+
+    #[test]
+    fn the_toolbar_sits_on_the_rows_right_end() {
+        let row = Rect::from_min_max(egui::pos2(16.0, 100.0), egui::pos2(800.0, 140.0));
+        let bar = toolbar_rect(row, 120.0);
+        assert_eq!((bar.right(), bar.top(), bar.width()), (800.0, 100.0, 120.0));
+        // Never wider than the row.
+        let narrow = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(80.0, 20.0));
+        assert_eq!(toolbar_rect(narrow, 120.0).left(), 0.0);
+    }
+
+    #[test]
+    fn a_conversation_draws_edits_failures_and_the_editor() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut model = crate::demo::model();
+        let mine = model.messages(111)[8].id;
+        let pending = model::next_nonce(0, jiff::Timestamp::now());
+        model.add_pending(111, pending, "en route".into());
+        model.add_pending(111, pending + 1, "refusé".into());
+        model.send_settled(111, pending + 1, Delivery::Failed(None));
+        let mut selection = Selection::initial(Some(&model));
+        selection.open_channel(111);
+        let mut media = Media::new(media::Source::Demo);
+        let draft = "Oui".to_owned();
+        let mut editing = Some(Editing {
+            channel: 111,
+            id: mine,
+            draft,
+            saving: false,
+        });
+        let notes = HashMap::from([((111, mine), "Couldn't edit this message.".to_owned())]);
+        let palette = Palette::dark();
+        // Twice, the pointer over the first message the second time.
+        for events in [
+            vec![],
+            vec![egui::Event::PointerMoved(egui::pos2(400.0, 120.0))],
+        ] {
+            frame(&ctx, events, |ui| {
+                let writing = Writing {
+                    editing: &mut editing,
+                    notes: &notes,
+                };
+                let (request, _) =
+                    conversation(&selection, &model, &palette, None, &mut media, writing, ui);
+                assert!(request.is_none());
+            });
         }
     }
 

@@ -1,7 +1,7 @@
 //! The window: the model, what is open, and the palette it is drawn in.
 
 use crate::api::Place;
-use crate::backend::{Backend, Command, Event, Link, Outgoing, Session};
+use crate::backend::{Backend, Change, Command, Event, Link, Outgoing, Session, Write};
 use crate::compose::Unsent;
 use crate::events::Update;
 use crate::media::{self, Media};
@@ -254,8 +254,33 @@ pub struct Composer {
     pub drafts: HashMap<Id, String>,
     /// Why the channel's draft was not sent, until it changes.
     pub notice: Option<(Id, String)>,
+    /// The message of mine open for editing.
+    pub editing: Option<Editing>,
     posted: HashMap<Id, Posted>,
     last_nonce: Id,
+}
+
+/// One of my messages, open for editing in place.
+#[derive(Debug, PartialEq)]
+pub struct Editing {
+    pub channel: Id,
+    pub id: Id,
+    pub draft: String,
+    /// Saved, waiting for Discord's answer: as in the official client, the
+    /// message changes once Discord has the edit, and the editor closes then.
+    pub saving: bool,
+}
+
+/// What saving an edit comes to.
+#[derive(Debug, PartialEq)]
+pub enum Saved {
+    /// Nothing to send: unchanged (the editor closes), too long or already
+    /// saving (it stays).
+    Nothing,
+    Edit(Write),
+    /// Emptied, with nothing else in it: the official client asks whether
+    /// to delete it instead.
+    ConfirmDelete(Id, Id),
 }
 
 impl Composer {
@@ -302,6 +327,77 @@ impl Composer {
             nonce,
             content,
         })
+    }
+
+    /// Edit on one of my messages: its text opens in place.
+    pub fn edit(&mut self, model: &Model, channel: Id, id: Id) -> bool {
+        let Some(message) = model
+            .message(channel, id)
+            .filter(|_| model.is_mine(channel, id))
+        else {
+            return false;
+        };
+        let draft = message.content.clone();
+        self.editing = Some(Editing {
+            channel,
+            id,
+            draft,
+            saving: false,
+        });
+        true
+    }
+
+    /// Up in an empty composer edits my latest message there.
+    pub fn edit_last(&mut self, model: &Model, channel: Id) -> bool {
+        let empty = self.drafts.get(&channel).is_none_or(String::is_empty);
+        empty
+            && model
+                .last_mine(channel)
+                .is_some_and(|id| self.edit(model, channel, id))
+    }
+
+    /// Enter in the editor.
+    pub fn save_edit(&mut self, model: &Model) -> Saved {
+        let Some(editing) = self.editing.as_mut().filter(|e| !e.saving) else {
+            return Saved::Nothing;
+        };
+        let (channel, id) = (editing.channel, editing.id);
+        let Some(message) = model.message(channel, id) else {
+            self.editing = None;
+            return Saved::Nothing;
+        };
+        // Unchanged comes first: opening and closing a message that is
+        // only a picture deletes nothing.
+        let Ok(content) = crate::compose::prepare_edit(&editing.draft) else {
+            return Saved::Nothing;
+        };
+        if content == message.content.trim() {
+            self.editing = None;
+            return Saved::Nothing;
+        }
+        // Emptied, a message with a file or an embed keeps those.
+        if content.is_empty() && message.attachments.is_empty() && message.embeds.is_empty() {
+            self.editing = None;
+            return Saved::ConfirmDelete(channel, id);
+        }
+        editing.saving = true;
+        Saved::Edit(Write::Edit {
+            place: place(model, channel),
+            id,
+            content,
+        })
+    }
+
+    /// Discord answered an edit: the editor closes, as in the official
+    /// client, whether it saved or not.
+    pub fn edit_done(&mut self, channel: Id, id: Id) {
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|e| (e.channel, e.id) == (channel, id))
+        {
+            self.editing = None;
+        }
     }
 
     /// Retry on a message that failed, while I may still write there.
@@ -476,6 +572,11 @@ pub struct App {
     pub composer: Composer,
     /// Demo runs have no Discord: what they send arrives here, by when.
     demo_outbox: Vec<(std::time::Instant, Outgoing)>,
+    /// My message whose deletion waits for a yes, as channel and id.
+    pub confirm_delete: Option<(Id, Id)>,
+    /// Why an edit or a deletion of mine did not go through, under the
+    /// message, by channel and id, until the next try on it.
+    pub notes: HashMap<(Id, Id), String>,
     /// Messages whose answer was lost, as channel and nonce, since when.
     unsure: HashMap<(Id, Id), Instant>,
     /// When the gateway last showed it was alive (connected, or answered a
@@ -575,6 +676,8 @@ impl App {
             demo_outbox: Vec::new(),
             unsure: HashMap::new(),
             alive_at: None,
+            confirm_delete: None,
+            notes: HashMap::new(),
         }
     }
 
@@ -696,6 +799,8 @@ impl App {
         self.media.clear();
         self.composer = Composer::default();
         self.unsure.clear();
+        self.confirm_delete = None;
+        self.notes.clear();
     }
 
     /// Enter in the composer.
@@ -706,6 +811,56 @@ impl App {
         if let Some(outgoing) = self.composer.send(model, channel, jiff::Timestamp::now()) {
             self.post(outgoing);
         }
+    }
+
+    /// Enter in a message's editor.
+    pub fn save_edit(&mut self) {
+        let Some(model) = &self.model else {
+            return;
+        };
+        match self.composer.save_edit(model) {
+            Saved::Nothing => {}
+            Saved::Edit(write) => self.write(write),
+            Saved::ConfirmDelete(channel, id) => self.confirm_delete = Some((channel, id)),
+        }
+    }
+
+    /// Delete on one of my messages: asked first, unless `confirmed` (the
+    /// dialog's button, or Shift held, as in the official client). It goes
+    /// once Discord has deleted it.
+    pub fn delete(&mut self, channel: Id, id: Id, confirmed: bool) {
+        self.confirm_delete = None;
+        let Some(model) = &self.model else {
+            return;
+        };
+        if !model.is_mine(channel, id) {
+            return;
+        }
+        if confirmed {
+            let place = place(model, channel);
+            self.write(Write::Delete { place, id });
+        } else {
+            self.confirm_delete = Some((channel, id));
+        }
+    }
+
+    /// Discord answered an edit or a deletion of mine.
+    fn changed(&mut self, channel: Id, id: Id, change: Change, result: Result<(), Option<String>>) {
+        if change == Change::Edit {
+            self.composer.edit_done(channel, id);
+        }
+        let Err(reason) = result else {
+            return;
+        };
+        let what = match change {
+            Change::Edit => "Couldn't edit this message",
+            Change::Delete => "Couldn't delete this message",
+        };
+        let note = match reason {
+            Some(reason) => format!("{what}: {reason}"),
+            None => format!("{what}."),
+        };
+        self.notes.insert((channel, id), note);
     }
 
     /// Retry on a message that failed.
@@ -764,12 +919,52 @@ impl App {
     }
 
     fn post(&mut self, outgoing: Outgoing) {
-        match &self.backend {
-            Some(backend) => backend.send(Command::Send(outgoing)),
-            None => self
-                .demo_outbox
-                .push((std::time::Instant::now() + DEMO_DELIVERY, outgoing)),
+        self.write(Write::Send(outgoing));
+    }
+
+    /// Hands a change to the backend. Demo runs make it themselves: a sent
+    /// message after a moment, an edit or a deletion at once.
+    fn write(&mut self, write: Write) {
+        if let Write::Edit { place, id, .. } | Write::Delete { place, id } = &write {
+            self.notes.remove(&(place.channel, *id));
         }
+        if let Some(backend) = &self.backend {
+            backend.send(Command::Write(write));
+            return;
+        }
+        let (channel, update, change) = match write {
+            Write::Send(outgoing) => {
+                let due = std::time::Instant::now() + DEMO_DELIVERY;
+                self.demo_outbox.push((due, outgoing));
+                return;
+            }
+            Write::Edit { place, id, content } => {
+                let channel = place.channel;
+                let content = Some(content);
+                let (attachments, embeds, edited) = (None, None, true);
+                let update = Update::MessageEdit {
+                    channel,
+                    id,
+                    content,
+                    attachments,
+                    embeds,
+                    edited,
+                };
+                (channel, update, (id, Change::Edit))
+            }
+            Write::Delete { place, id } => {
+                let (channel, ids) = (place.channel, vec![id]);
+                (
+                    channel,
+                    Update::MessageDelete { channel, ids },
+                    (id, Change::Delete),
+                )
+            }
+        };
+        if let Some(model) = &mut self.model {
+            model.apply(update);
+        }
+        self.changed(channel, change.0, change.1, Ok(()));
     }
 
     /// Demo runs confirm what was sent, as Discord would, once it is due,
@@ -923,6 +1118,12 @@ impl App {
                 nonce,
                 reason,
             } => self.settled(channel, nonce, Delivery::Failed(reason)),
+            Event::Changed {
+                channel,
+                id,
+                change,
+                result,
+            } => self.changed(channel, id, change, result),
             Event::SendUnsure { channel, nonce } => self.settled(channel, nonce, Delivery::Unsure),
             Event::SendHeld {
                 channel,
@@ -1429,6 +1630,106 @@ mod tests {
         assert_eq!(delivery(&model, 111, nonce), Some(Delivery::Failed(reason)));
         composer.confirmed(nonce);
         assert!(composer.posted.is_empty());
+    }
+
+    /// Dylan's last message in #général, and Sam's question before it.
+    fn general(model: &Model) -> (Id, Id) {
+        let messages = model.messages(111);
+        (messages[8].id, messages[7].id)
+    }
+
+    #[test]
+    fn edits_wait_for_discord_and_an_emptied_one_asks_to_delete() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        let (mine, sam) = general(&model);
+        assert!(!composer.edit(&model, 111, sam), "not mine");
+        composer.drafts.insert(111, "brouillon".into());
+        assert!(!composer.edit_last(&model, 111), "the draft is not empty");
+        composer.drafts.clear();
+        assert!(composer.edit_last(&model, 111));
+        assert_eq!(composer.editing.as_ref().unwrap().id, mine);
+        let original = model.message(111, mine).unwrap().content.clone();
+        // Unchanged: it just closes.
+        assert_eq!(composer.save_edit(&model), Saved::Nothing);
+        assert!(composer.editing.is_none());
+        let draft = |composer: &mut Composer, model: &Model, text: &str| {
+            composer.edit(model, 111, mine);
+            composer.editing.as_mut().unwrap().draft = text.into();
+        };
+        draft(&mut composer, &model, "Oui :tada:");
+        let place = Place {
+            channel: 111,
+            guild: Some(100),
+        };
+        let content = "Oui 🎉".to_owned();
+        let write = Write::Edit {
+            place,
+            id: mine,
+            content,
+        };
+        assert_eq!(composer.save_edit(&model), Saved::Edit(write));
+        // Not shown before Discord has it, and not saved twice.
+        assert_eq!(model.message(111, mine).unwrap().content, original);
+        assert_eq!(composer.save_edit(&model), Saved::Nothing);
+        composer.edit_done(111, mine);
+        assert!(composer.editing.is_none());
+        // Too long: the editor stays open.
+        draft(&mut composer, &model, &"a".repeat(2001));
+        assert_eq!(composer.save_edit(&model), Saved::Nothing);
+        assert!(composer.editing.is_some());
+        draft(&mut composer, &model, " ");
+        assert_eq!(composer.save_edit(&model), Saved::ConfirmDelete(111, mine));
+        // With a file, emptied text leaves the file.
+        let pictured = model.messages.get_mut(&111).unwrap();
+        pictured[8].attachments = model_attachment();
+        draft(&mut composer, &model, "");
+        assert!(matches!(
+            composer.save_edit(&model),
+            Saved::Edit(Write::Edit { content, .. }) if content.is_empty()
+        ));
+    }
+
+    fn model_attachment() -> Vec<crate::model::Attachment> {
+        crate::demo::model().messages(101)[1].attachments.clone()
+    }
+
+    fn demo_app() -> App {
+        App::new(&egui::Context::default(), Some(crate::demo::model()), None)
+    }
+
+    #[test]
+    fn deleting_asks_first_unless_confirmed_and_only_for_mine() {
+        let mut app = demo_app();
+        let (mine, sam) = general(app.model.as_ref().unwrap());
+        app.delete(111, sam, true);
+        assert!(app.model.as_ref().unwrap().message(111, sam).is_some());
+        app.delete(111, mine, false);
+        assert_eq!(app.confirm_delete, Some((111, mine)));
+        assert!(app.model.as_ref().unwrap().message(111, mine).is_some());
+        app.delete(111, mine, true);
+        assert_eq!(app.confirm_delete, None);
+        assert!(app.model.as_ref().unwrap().message(111, mine).is_none());
+    }
+
+    #[test]
+    fn a_refused_edit_or_deletion_is_told_under_its_message() {
+        let mut app = demo_app();
+        let (mine, _) = general(app.model.as_ref().unwrap());
+        app.composer.edit(app.model.as_ref().unwrap(), 111, mine);
+        let reason = Some("Missing Permissions".to_owned());
+        app.changed(111, mine, Change::Edit, Err(reason));
+        assert!(
+            app.composer.editing.is_none(),
+            "closed, as the official client does"
+        );
+        let note = &app.notes[&(111, mine)];
+        assert_eq!(note, "Couldn't edit this message: Missing Permissions");
+        app.changed(111, mine, Change::Delete, Err(None));
+        assert_eq!(app.notes[&(111, mine)], "Couldn't delete this message.");
+        // The next try clears it.
+        app.delete(111, mine, true);
+        assert!(app.notes.is_empty());
     }
 
     #[test]
