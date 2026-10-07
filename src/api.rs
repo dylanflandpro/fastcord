@@ -120,7 +120,7 @@ struct Experiments {
 #[derive(serde::Deserialize)]
 pub struct ApiUser {
     #[serde(deserialize_with = "snowflake")]
-    id: u64,
+    pub id: u64,
     username: String,
     global_name: Option<String>,
 }

@@ -7,7 +7,10 @@
 //! serde skips the rest.
 
 use crate::api::{ApiUser, optional_snowflake, snowflake};
-use crate::model::{Channel, ChannelKind, DmChannel, Guild, Id, Model, User};
+use crate::model::{
+    Channel, ChannelKind, DmChannel, Guild, Id, Model, Overwrite, OverwriteKind, Permissions, Role,
+    User,
+};
 use std::collections::HashMap;
 
 /// A change to the model, in the order the gateway reported it.
@@ -27,6 +30,19 @@ pub enum Update {
         guild: Id,
         channel: Channel,
     },
+    RoleUpsert {
+        guild: Id,
+        role: Role,
+    },
+    RoleRemove {
+        guild: Id,
+        role: Id,
+    },
+    /// The signed-in member's roles in a guild changed.
+    MyRoles {
+        guild: Id,
+        roles: Vec<Id>,
+    },
     ChannelRemove {
         guild: Id,
         channel: Id,
@@ -42,6 +58,10 @@ struct Ready {
     users: Vec<ApiUser>,
     #[serde(default)]
     guilds: Vec<WireGuild>,
+    /// Per guild, in `guilds`' order: the members READY describes, the
+    /// signed-in one among them.
+    #[serde(default)]
+    merged_members: Vec<Vec<WireMember>>,
     #[serde(default)]
     private_channels: Vec<WireChannel>,
     /// A refreshed token, when Discord rotates it.
@@ -66,11 +86,124 @@ struct WireGuild {
     name: Option<String>,
     #[serde(default)]
     channels: Vec<WireChannel>,
+    #[serde(default)]
+    roles: Vec<WireRole>,
+    /// GUILD_CREATE's members: the signed-in one is there.
+    #[serde(default)]
+    members: Vec<WireMember>,
 }
 
 #[derive(serde::Deserialize)]
 struct GuildProperties {
     name: String,
+    #[serde(deserialize_with = "snowflake")]
+    owner_id: Id,
+}
+
+#[derive(serde::Deserialize)]
+struct WireRole {
+    #[serde(deserialize_with = "snowflake")]
+    id: Id,
+    #[serde(default)]
+    position: i32,
+    #[serde(deserialize_with = "permissions")]
+    permissions: Permissions,
+}
+
+#[derive(serde::Deserialize)]
+struct WireOverwrite {
+    #[serde(deserialize_with = "snowflake")]
+    id: Id,
+    #[serde(rename = "type")]
+    kind: u8,
+    #[serde(deserialize_with = "permissions")]
+    allow: Permissions,
+    #[serde(deserialize_with = "permissions")]
+    deny: Permissions,
+}
+
+#[derive(serde::Deserialize)]
+struct WireMember {
+    /// READY's merged members carry the id alone.
+    #[serde(default, deserialize_with = "optional_snowflake")]
+    user_id: Option<Id>,
+    /// Other events nest the user.
+    user: Option<WireMemberUser>,
+    #[serde(default)]
+    roles: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct WireMemberUser {
+    #[serde(deserialize_with = "snowflake")]
+    id: Id,
+}
+
+impl WireMember {
+    fn id(&self) -> Option<Id> {
+        self.user_id.or(self.user.as_ref().map(|u| u.id))
+    }
+
+    fn roles(&self) -> Vec<Id> {
+        self.roles.iter().filter_map(|r| r.parse().ok()).collect()
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RoleEvent {
+    #[serde(deserialize_with = "snowflake")]
+    guild_id: Id,
+    role: WireRole,
+}
+
+#[derive(serde::Deserialize)]
+struct RoleDelete {
+    #[serde(deserialize_with = "snowflake")]
+    guild_id: Id,
+    #[serde(deserialize_with = "snowflake")]
+    role_id: Id,
+}
+
+#[derive(serde::Deserialize)]
+struct MemberUpdate {
+    #[serde(deserialize_with = "snowflake")]
+    guild_id: Id,
+    #[serde(flatten)]
+    member: WireMember,
+}
+
+/// Permission bitfields arrive as decimal strings: they outgrow JavaScript
+/// numbers.
+fn permissions<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Permissions, D::Error> {
+    let text: String = serde::Deserialize::deserialize(deserializer)?;
+    text.parse()
+        .map(Permissions)
+        .map_err(serde::de::Error::custom)
+}
+
+impl From<WireRole> for Role {
+    fn from(role: WireRole) -> Self {
+        Role {
+            id: role.id,
+            position: role.position,
+            permissions: role.permissions,
+        }
+    }
+}
+
+/// An overwrite, unless its type is one this client does not know.
+fn overwrite(wire: WireOverwrite) -> Option<Overwrite> {
+    let kind = match wire.kind {
+        0 => OverwriteKind::Role,
+        1 => OverwriteKind::Member,
+        _ => return None,
+    };
+    Some(Overwrite {
+        id: wire.id,
+        kind,
+        allow: wire.allow,
+        deny: wire.deny,
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -88,6 +221,8 @@ struct WireChannel {
     position: i32,
     #[serde(default, deserialize_with = "optional_snowflake")]
     last_message_id: Option<Id>,
+    #[serde(default)]
+    permission_overwrites: Vec<WireOverwrite>,
     /// DMs in READY: users by id, resolved through READY's `users`.
     #[serde(default)]
     recipient_ids: Vec<String>,
@@ -125,6 +260,8 @@ const GROUP_DM: u8 = 3;
 #[derive(Default)]
 pub struct Decoder {
     users: HashMap<Id, User>,
+    /// The signed-in user, from READY.
+    me: Id,
 }
 
 impl Decoder {
@@ -143,6 +280,11 @@ impl Decoder {
             id: wire.id,
             parent: wire.parent_id,
             position: wire.position,
+            overwrites: wire
+                .permission_overwrites
+                .into_iter()
+                .filter_map(overwrite)
+                .collect(),
         })
     }
 
@@ -170,14 +312,27 @@ impl Decoder {
         })
     }
 
-    fn guild(wire: WireGuild) -> Option<Guild> {
+    /// A guild with my roles in it: READY's merged members (`my_roles`), or
+    /// the members a GUILD_CREATE lists.
+    fn guild(&self, wire: WireGuild, my_roles: Option<Vec<Id>>) -> Option<Guild> {
         if wire.unavailable {
             return None;
         }
-        let name = wire.properties.map(|p| p.name).or(wire.name)?;
+        let properties = wire.properties?;
+        let my_roles = my_roles
+            .or_else(|| {
+                wire.members
+                    .iter()
+                    .find(|m| m.id() == Some(self.me))
+                    .map(WireMember::roles)
+            })
+            .unwrap_or_default();
         Some(Guild {
             id: wire.id,
-            name,
+            name: properties.name,
+            owner_id: properties.owner_id,
+            roles: wire.roles.into_iter().map(Role::from).collect(),
+            my_roles,
             channels: wire
                 .channels
                 .into_iter()
@@ -189,6 +344,7 @@ impl Decoder {
     /// READY: the whole model, and a refreshed token if Discord sent one.
     pub fn ready(&mut self, data: &str) -> serde_json::Result<(Model, Option<String>)> {
         let ready: Ready = serde_json::from_str(data)?;
+        self.me = ready.user.id;
         self.users = ready
             .users
             .into_iter()
@@ -198,8 +354,22 @@ impl Decoder {
                 (user.id, user)
             })
             .collect();
+        let me = self.me;
+        let mut members = ready.merged_members.into_iter();
+        let guilds = ready
+            .guilds
+            .into_iter()
+            .filter_map(|wire| {
+                let my_roles = members
+                    .next()
+                    .and_then(|members| members.into_iter().find(|m| m.id() == Some(me)))
+                    .map(|m| m.roles());
+                self.guild(wire, Some(my_roles.unwrap_or_default()))
+            })
+            .collect();
         let model = Model {
-            guilds: ready.guilds.into_iter().filter_map(Self::guild).collect(),
+            me,
+            guilds,
             dms: ready
                 .private_channels
                 .into_iter()
@@ -224,7 +394,7 @@ impl Decoder {
             }
             "GUILD_CREATE" => {
                 let wire: WireGuild = serde_json::from_str(data)?;
-                Self::guild(wire)
+                self.guild(wire, None)
                     .map(Update::GuildUpsert)
                     .into_iter()
                     .collect()
@@ -255,6 +425,31 @@ impl Decoder {
                         .into_iter()
                         .collect(),
                     None => self.dm(wire).map(Update::DmUpsert).into_iter().collect(),
+                }
+            }
+            "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" => {
+                let event: RoleEvent = serde_json::from_str(data)?;
+                vec![Update::RoleUpsert {
+                    guild: event.guild_id,
+                    role: event.role.into(),
+                }]
+            }
+            "GUILD_ROLE_DELETE" => {
+                let event: RoleDelete = serde_json::from_str(data)?;
+                vec![Update::RoleRemove {
+                    guild: event.guild_id,
+                    role: event.role_id,
+                }]
+            }
+            "GUILD_MEMBER_UPDATE" => {
+                let event: MemberUpdate = serde_json::from_str(data)?;
+                if event.member.id() == Some(self.me) {
+                    vec![Update::MyRoles {
+                        guild: event.guild_id,
+                        roles: event.member.roles(),
+                    }]
+                } else {
+                    Vec::new()
                 }
             }
             "CHANNEL_DELETE" => {
@@ -297,6 +492,98 @@ mod tests {
         assert_eq!(general.position, 0);
         // The forum channel is not shown yet.
         assert!(guild.channel(2009).is_none());
+    }
+
+    #[test]
+    fn reads_permissions_and_my_roles() {
+        let (_, model, _) = ready();
+        assert_eq!(model.me, 9000);
+        let guild = model.guild(1001).unwrap();
+        assert_eq!(guild.owner_id, 9001);
+        assert_eq!(guild.my_roles, [1001]);
+        assert_eq!(guild.roles[0].permissions, Permissions(104324673));
+        let general = guild.channel(2002).unwrap();
+        assert_eq!(
+            general.overwrites,
+            [Overwrite {
+                id: 1001,
+                kind: OverwriteKind::Role,
+                allow: Permissions(0),
+                deny: Permissions(1024),
+            }]
+        );
+        assert!(!guild.can_view(general, model.me), "@everyone is denied");
+        assert!(guild.can_view(guild.channel(2004).unwrap(), model.me));
+        // I own the second guild.
+        let omarchy = model.guild(1002).unwrap();
+        assert!(omarchy.can_view(omarchy.channel(2101).unwrap(), model.me));
+    }
+
+    #[test]
+    fn role_and_member_events() {
+        let (mut decoder, _, _) = ready();
+        assert_eq!(
+            decoder
+                .event(
+                    "GUILD_ROLE_UPDATE",
+                    r#"{"guild_id":"1001","role":{"id":"1050","name":"mod","position":3,"permissions":"8"}}"#,
+                )
+                .unwrap(),
+            [Update::RoleUpsert {
+                guild: 1001,
+                role: Role {
+                    id: 1050,
+                    position: 3,
+                    permissions: Permissions::ADMINISTRATOR,
+                },
+            }]
+        );
+        assert_eq!(
+            decoder
+                .event(
+                    "GUILD_ROLE_DELETE",
+                    r#"{"guild_id":"1001","role_id":"1050"}"#
+                )
+                .unwrap(),
+            [Update::RoleRemove {
+                guild: 1001,
+                role: 1050
+            }]
+        );
+        assert_eq!(
+            decoder
+                .event(
+                    "GUILD_MEMBER_UPDATE",
+                    r#"{"guild_id":"1001","user":{"id":"9000","username":"imbu"},"roles":["1050"]}"#,
+                )
+                .unwrap(),
+            [Update::MyRoles {
+                guild: 1001,
+                roles: vec![1050]
+            }]
+        );
+        // Someone else's roles are not mine.
+        assert_eq!(
+            decoder
+                .event(
+                    "GUILD_MEMBER_UPDATE",
+                    r#"{"guild_id":"1001","user":{"id":"9001","username":"marc"},"roles":["1050"]}"#,
+                )
+                .unwrap(),
+            []
+        );
+    }
+
+    #[test]
+    fn a_joined_guild_finds_me_among_its_members() {
+        let (mut decoder, _, _) = ready();
+        let joined = decoder
+            .event(
+                "GUILD_CREATE",
+                r#"{"id":"1004","properties":{"name":"New","owner_id":"9001"},"roles":[],"channels":[],"members":[{"user":{"id":"9000","username":"imbu"},"roles":["1077"]}]}"#,
+            )
+            .unwrap();
+        assert!(matches!(&joined[..], [Update::GuildUpsert(g)] if g.my_roles == [1077]));
     }
 
     #[test]

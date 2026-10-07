@@ -345,6 +345,25 @@ impl Model {
                     }
                 }
             }
+            Update::RoleUpsert { guild, role } => {
+                if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
+                    match guild.roles.iter_mut().find(|r| r.id == role.id) {
+                        Some(existing) => *existing = role,
+                        None => guild.roles.push(role),
+                    }
+                }
+            }
+            Update::RoleRemove { guild, role } => {
+                if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
+                    guild.roles.retain(|r| r.id != role);
+                    guild.my_roles.retain(|&r| r != role);
+                }
+            }
+            Update::MyRoles { guild, roles } => {
+                if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
+                    guild.my_roles = roles;
+                }
+            }
             Update::ChannelRemove { guild, channel } => {
                 if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
                     guild.channels.retain(|c| c.id != channel);
@@ -643,38 +662,79 @@ mod tests {
     fn applies_guild_and_channel_changes() {
         use crate::events::Update;
         let mut model = Model {
-            guilds: vec![Guild {
-                id: 1,
-                name: "g".into(),
-                channels: vec![channel(10, ChannelKind::Text, None, 0)],
-            }],
+            guilds: vec![guild(vec![channel(10, ChannelKind::Text, None, 0)])],
             ..Model::default()
         };
         model.apply(Update::ChannelUpsert {
-            guild: 1,
+            guild: GUILD,
             channel: Channel {
                 name: "renamed".into(),
                 ..channel(10, ChannelKind::Text, None, 0)
             },
         });
         model.apply(Update::ChannelUpsert {
-            guild: 1,
+            guild: GUILD,
             channel: channel(11, ChannelKind::Voice, None, 1),
         });
-        assert_eq!(model.guild(1).unwrap().channels.len(), 2);
-        assert_eq!(model.guild(1).unwrap().channel(10).unwrap().name, "renamed");
+        let g = model.guild(GUILD).unwrap();
+        assert_eq!(g.channels.len(), 2);
+        assert_eq!(g.channel(10).unwrap().name, "renamed");
         model.apply(Update::ChannelRemove {
-            guild: 1,
+            guild: GUILD,
             channel: 10,
         });
-        assert!(model.guild(1).unwrap().channel(10).is_none());
+        assert!(model.guild(GUILD).unwrap().channel(10).is_none());
         model.apply(Update::GuildRename {
-            id: 1,
+            id: GUILD,
             name: "h".into(),
         });
-        assert_eq!(model.guild(1).unwrap().name, "h");
-        model.apply(Update::GuildRemove(1));
+        assert_eq!(model.guild(GUILD).unwrap().name, "h");
+        model.apply(Update::GuildRemove(GUILD));
         assert!(model.guilds.is_empty());
+    }
+
+    #[test]
+    fn role_changes_reach_what_i_can_see() {
+        use crate::events::Update;
+        let hidden = Channel {
+            overwrites: vec![Overwrite {
+                id: GUILD,
+                kind: OverwriteKind::Role,
+                allow: Permissions::default(),
+                deny: Permissions::VIEW_CHANNEL,
+            }],
+            ..channel(10, ChannelKind::Text, None, 0)
+        };
+        let mut model = Model {
+            me: ME,
+            guilds: vec![guild(vec![hidden])],
+            ..Model::default()
+        };
+        let visible = |model: &Model| {
+            let g = model.guild(GUILD).unwrap();
+            g.can_view(g.channel(10).unwrap(), ME)
+        };
+        assert!(!visible(&model));
+        model.apply(Update::RoleUpsert {
+            guild: GUILD,
+            role: Role {
+                id: 50,
+                position: 1,
+                permissions: Permissions::ADMINISTRATOR,
+            },
+        });
+        assert!(!visible(&model), "a role I do not have changes nothing");
+        model.apply(Update::MyRoles {
+            guild: GUILD,
+            roles: vec![50],
+        });
+        assert!(visible(&model));
+        model.apply(Update::RoleRemove {
+            guild: GUILD,
+            role: 50,
+        });
+        assert!(!visible(&model));
+        assert!(model.guild(GUILD).unwrap().my_roles.is_empty());
     }
 
     #[test]
