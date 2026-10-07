@@ -3,6 +3,7 @@
 use crate::backend::{Backend, Command, Session};
 use crate::model::{Id, Model};
 use crate::theme::{self, Catalog, Palette};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Which list the middle column shows.
@@ -15,10 +16,13 @@ pub enum View {
 /// What is open: the list in the middle column and the conversation. Kept
 /// apart from the model so the interface can change it while drawing from
 /// the model.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selection {
     pub view: View,
     pub channel: Option<Id>,
+    /// The channel last opened in each guild during this session, which
+    /// opening the guild again brings back, as the official client does.
+    last_channels: HashMap<Id, Id>,
 }
 
 impl Selection {
@@ -27,6 +31,7 @@ impl Selection {
         let mut selection = Self {
             view: View::DirectMessages,
             channel: None,
+            last_channels: HashMap::new(),
         };
         if let Some(model) = model {
             match model.guilds.first() {
@@ -37,9 +42,33 @@ impl Selection {
         selection
     }
 
+    /// Opens a guild on the channel last opened there, while it can still be
+    /// viewed, or else on its first channel, which then counts as opened.
     pub fn open_guild(&mut self, model: &Model, id: Id) {
         self.view = View::Guild(id);
-        self.channel = model.guild(id).and_then(|g| g.first_text_channel());
+        let Some(guild) = model.guild(id) else {
+            self.channel = None;
+            return;
+        };
+        let last = self
+            .last_channels
+            .get(&id)
+            .and_then(|&c| guild.channel(c))
+            .filter(|c| guild.can_view(c, model.me));
+        self.channel = last
+            .map(|c| c.id)
+            .or_else(|| guild.first_text_channel(model.me));
+        if let Some(channel) = self.channel {
+            self.last_channels.insert(id, channel);
+        }
+    }
+
+    /// Opens a conversation from the list in the middle column.
+    pub fn open_channel(&mut self, id: Id) {
+        self.channel = Some(id);
+        if let View::Guild(guild) = self.view {
+            self.last_channels.insert(guild, id);
+        }
     }
 
     pub fn open_direct_messages(&mut self, model: &Model) {
@@ -192,6 +221,57 @@ mod tests {
         selection.open_direct_messages(&model);
         assert_eq!(selection.view, View::DirectMessages);
         assert_eq!(selection.channel, Some(900));
+    }
+
+    #[test]
+    fn a_guild_reopens_on_its_last_channel() {
+        let model = crate::demo::model();
+        let mut selection = Selection::initial(Some(&model));
+        selection.open_channel(112);
+        selection.open_guild(&model, 200);
+        assert_eq!(selection.channel, Some(201));
+        selection.open_direct_messages(&model);
+        selection.open_guild(&model, 100);
+        assert_eq!(selection.channel, Some(112));
+    }
+
+    #[test]
+    fn a_guild_skips_its_last_channel_once_hidden_or_deleted() {
+        use crate::model::{Overwrite, OverwriteKind, Permissions};
+        let mut model = crate::demo::model();
+        let mut selection = Selection::initial(Some(&model));
+        selection.open_channel(112);
+        let rust = &mut model.guilds[0];
+        rust.channels
+            .iter_mut()
+            .find(|c| c.id == 112)
+            .unwrap()
+            .overwrites
+            .push(Overwrite {
+                id: model.me,
+                kind: OverwriteKind::Member,
+                allow: Permissions::default(),
+                deny: Permissions::VIEW_CHANNEL,
+            });
+        selection.open_guild(&model, 100);
+        assert_eq!(selection.channel, Some(101));
+
+        selection.open_channel(113);
+        model.guilds[0].channels.retain(|c| c.id != 113);
+        selection.open_guild(&model, 100);
+        assert_eq!(selection.channel, Some(101));
+    }
+
+    #[test]
+    fn a_guild_first_opened_remembers_its_first_channel() {
+        let mut model = crate::demo::model();
+        let mut selection = Selection::initial(Some(&model));
+        // A channel ahead of #annonces appears: the open one stays.
+        let mut new = model.guilds[0].channel(111).unwrap().clone();
+        (new.id, new.parent, new.position) = (99, None, -1);
+        model.guilds[0].channels.push(new);
+        selection.open_guild(&model, 100);
+        assert_eq!(selection.channel, Some(101));
     }
 
     #[test]
