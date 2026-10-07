@@ -61,5 +61,8 @@ serde errors quote the text they failed on: log them through `backend::describe`
 
 ## Known gaps
 
-- The conversation lays out every message on each frame. Virtualize it once
-  history loading arrives.
+- The conversation lays out every loaded message on each frame (messages are
+  parsed once and cached, but laid out each frame). Virtualize it before long
+  scroll-back sessions become common.
+- Guilds over 75,000 members only send messages after a guild subscription
+  (gateway op 37); smaller guilds are subscribed automatically on connect.

@@ -7,7 +7,7 @@
 //! fingerprint Discord hands out before sign-in, and the page they come from.
 
 use crate::credentials::Token;
-use crate::model::User;
+use crate::model::{Id, User};
 use crate::remote_auth;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -34,6 +34,8 @@ pub const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36
 pub enum Error {
     #[error("the session is no longer valid")]
     Unauthorized,
+    #[error("this account cannot read here")]
+    Forbidden,
     #[error("unable to reach Discord")]
     Network,
     #[error("Discord sent something this version cannot read")]
@@ -383,6 +385,43 @@ impl Api {
             reqwest::StatusCode::UNAUTHORIZED => Err(Error::Unauthorized),
             status => {
                 log::warn!("reading the account failed with HTTP {status}");
+                Err(Error::Protocol)
+            }
+        }
+    }
+
+    /// A page of a channel's history, newest first as Discord sends it:
+    /// the latest messages, or those just before `before`.
+    pub async fn messages(
+        &self,
+        token: &Token,
+        channel: Id,
+        before: Option<Id>,
+    ) -> Result<String, Error> {
+        let mut url = format!(
+            "{BASE}/channels/{channel}/messages?limit={}",
+            crate::events::PAGE
+        );
+        if let Some(before) = before {
+            url.push_str(&format!("&before={before}"));
+        }
+        let web = self.web().await;
+        let response = Self::dress(
+            self.client
+                .get(url)
+                .header(reqwest::header::AUTHORIZATION, token.expose()),
+            &web,
+            &format!("/channels/@me/{channel}"),
+        )
+        .send()
+        .await
+        .map_err(|_| Error::Network)?;
+        match response.status() {
+            status if status.is_success() => response.text().await.map_err(|_| Error::Network),
+            reqwest::StatusCode::UNAUTHORIZED => Err(Error::Unauthorized),
+            reqwest::StatusCode::FORBIDDEN => Err(Error::Forbidden),
+            status => {
+                log::warn!("loading history failed with HTTP {status}");
                 Err(Error::Protocol)
             }
         }

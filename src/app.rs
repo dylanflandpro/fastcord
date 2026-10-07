@@ -1,9 +1,10 @@
 //! The window: the model, what is open, and the palette it is drawn in.
 
 use crate::backend::{Backend, Command, Event, Link, Session};
+use crate::events::Update;
 use crate::model::{Id, Model};
 use crate::theme::{self, Catalog, Palette};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Which list the middle column shows.
@@ -124,6 +125,29 @@ pub struct App {
     /// Whether a desktop palette has arrived yet: the first one is applied at
     /// once, later ones are revealed as Omarchy does.
     first_palette: bool,
+    /// History pages on their way, by channel.
+    loading_history: HashSet<Id>,
+    /// Channels whose last page failed; they wait for Try again.
+    failed_history: HashSet<Id>,
+}
+
+/// What the conversation shows above or instead of its messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryStatus {
+    Idle,
+    Loading,
+    Failed,
+}
+
+/// The page `channel` needs, if any: the latest when nothing is loaded
+/// (`Some(None)`), or with `older`, the one before the oldest loaded
+/// message until the first message is in.
+pub fn history_wanted(model: &Model, channel: Id, older: bool) -> Option<Option<Id>> {
+    match model.messages.get(&channel) {
+        None => Some(None),
+        Some(_) if !older || model.complete.contains(&channel) => None,
+        Some(loaded) => loaded.first().map(|oldest| Some(oldest.id)),
+    }
 }
 
 impl App {
@@ -157,6 +181,8 @@ impl App {
             transition: fastframe_theme::Transition::default(),
             wanted: palette,
             first_palette: true,
+            loading_history: HashSet::new(),
+            failed_history: HashSet::new(),
         }
     }
 
@@ -194,8 +220,9 @@ impl App {
         }
     }
 
-    /// Sends a button's command and shows the spinner until the backend
-    /// answers, so the button cannot be pressed twice.
+    /// Sends a sign-in screen's command (Retry, Log out) and shows the
+    /// spinner until the backend answers, so the button cannot be pressed
+    /// twice.
     pub fn send(&mut self, command: Command) {
         if let Some(backend) = &self.backend {
             // Logging out takes the account off screen at once, not once
@@ -207,6 +234,40 @@ impl App {
             self.session = Session::Checking;
             self.qr = None;
         }
+    }
+
+    /// Where the open channel's history stands.
+    pub fn history_status(&self, channel: Id) -> HistoryStatus {
+        if self.loading_history.contains(&channel) {
+            HistoryStatus::Loading
+        } else if self.failed_history.contains(&channel) {
+            HistoryStatus::Failed
+        } else {
+            HistoryStatus::Idle
+        }
+    }
+
+    /// Asks for a page of `channel`'s history when `wanted` says one is
+    /// missing and none is on its way. Demo runs have it all already.
+    pub fn request_history(&mut self, channel: Id, older: bool) {
+        let Some(backend) = &self.backend else {
+            return;
+        };
+        let Some(model) = &self.model else {
+            return;
+        };
+        if self.loading_history.contains(&channel) || self.failed_history.contains(&channel) {
+            return;
+        }
+        if let Some(before) = history_wanted(model, channel, older) {
+            backend.send(Command::LoadHistory { channel, before });
+            self.loading_history.insert(channel);
+        }
+    }
+
+    /// Clears a failure so the next frame asks again.
+    pub fn retry_history(&mut self, channel: Id) {
+        self.failed_history.remove(&channel);
     }
 
     fn follow_backend(&mut self) {
@@ -240,7 +301,14 @@ impl App {
                     }
                     self.model = Some(model);
                 }
+                Event::HistoryFailed { channel } => {
+                    self.loading_history.remove(&channel);
+                    self.failed_history.insert(channel);
+                }
                 Event::Update(update) => {
+                    if let Update::History { channel, .. } = &update {
+                        self.loading_history.remove(channel);
+                    }
                     if let Some(model) = &mut self.model {
                         model.apply(update);
                         self.selection.repair(model);
@@ -260,6 +328,9 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.follow_theme(ctx);
         self.follow_backend();
+        if let Some(channel) = self.selection.channel {
+            self.request_history(channel, false);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -271,7 +342,29 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::Update;
+
+    #[test]
+    fn history_is_asked_for_once_then_page_by_page_to_the_start() {
+        let mut model = Model::default();
+        assert_eq!(history_wanted(&model, 7, false), Some(None));
+        model.apply(Update::History {
+            channel: 7,
+            messages: crate::demo::model().messages[&111].clone(),
+            complete: false,
+        });
+        assert_eq!(history_wanted(&model, 7, false), None);
+        let oldest = model.messages(7)[0].id;
+        assert_eq!(history_wanted(&model, 7, true), Some(Some(oldest)));
+        model.complete.insert(7);
+        assert_eq!(history_wanted(&model, 7, true), None);
+        // An empty channel, once loaded, has nothing older either.
+        model.apply(Update::History {
+            channel: 8,
+            messages: vec![],
+            complete: false,
+        });
+        assert_eq!(history_wanted(&model, 8, true), None);
+    }
 
     #[test]
     fn opens_on_the_first_guild_and_its_first_text_channel() {

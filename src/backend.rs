@@ -7,8 +7,10 @@ use crate::api::{self, Api};
 use crate::credentials::{self, Token};
 use crate::events::{Decoder, Update};
 use crate::gateway::{self, End, Gateway};
-use crate::model::{Model, User};
+use crate::model::{Id, Model, User};
 use crate::remote_auth::{self, Progress};
+use futures_util::StreamExt as _;
+use futures_util::stream::FuturesUnordered;
 use std::cell::RefCell;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -19,6 +21,12 @@ pub enum Command {
     /// Try again after a failure.
     Retry,
     LogOut,
+    /// Load a page of a channel's history: the latest, or the one before
+    /// `before`.
+    LoadHistory {
+        channel: Id,
+        before: Option<Id>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -56,6 +64,10 @@ pub enum Event {
     /// Everything at once, from READY.
     Ready(Model),
     Update(Update),
+    /// A history page could not be loaded; the interface offers to retry.
+    HistoryFailed {
+        channel: Id,
+    },
 }
 
 pub struct Backend {
@@ -130,7 +142,7 @@ async fn session(mut commands: UnboundedReceiver<Command>, emit: Emit<'_>) {
         let token = RefCell::new(token);
         let ended = tokio::select! {
             ended = stay_connected(&api, &keyring, &token, emit) => Some(ended),
-            logged_out = wait_for(&mut commands, |c| matches!(c, Command::LogOut)) => {
+            logged_out = serve(&mut commands, &api, &token, emit) => {
                 if !logged_out {
                     return;
                 }
@@ -275,6 +287,66 @@ async fn stay_connected(
         emit(Event::Link(Link::Reconnecting));
         log::info!("gateway reconnecting in {}s", delay.as_secs());
         tokio::time::sleep(delay).await;
+    }
+}
+
+/// Answers the interface's requests while signed in, until Log out (`true`)
+/// or the window closes (`false`). History pages load side by side.
+async fn serve(
+    commands: &mut UnboundedReceiver<Command>,
+    api: &Api,
+    token: &RefCell<Token>,
+    emit: Emit<'_>,
+) -> bool {
+    while commands.try_recv().is_ok() {}
+    let mut loading = FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            command = commands.recv() => match command {
+                None => return false,
+                Some(Command::LogOut) => return true,
+                Some(Command::LoadHistory { channel, before }) => {
+                    let token = Token::new(token.borrow().expose().to_owned());
+                    loading.push(async move {
+                        load_history(api, &token, channel, before, emit).await;
+                    });
+                }
+                Some(Command::Retry) => {}
+            },
+            Some(()) = loading.next(), if !loading.is_empty() => {}
+        }
+    }
+}
+
+async fn load_history(api: &Api, token: &Token, channel: Id, before: Option<Id>, emit: Emit<'_>) {
+    let started = std::time::Instant::now();
+    let page = match api.messages(token, channel, before).await {
+        Ok(body) => crate::events::history(channel, &body).map_err(|error| {
+            log::warn!("unreadable history page: {}", describe(&error));
+        }),
+        // Nothing to read here for this account: an empty, complete history.
+        Err(api::Error::Forbidden) => Ok(Update::History {
+            channel,
+            messages: Vec::new(),
+            complete: true,
+        }),
+        Err(error) => {
+            log::warn!("loading history failed: {error}");
+            Err(())
+        }
+    };
+    match page {
+        Ok(update) => {
+            if let Update::History { messages, .. } = &update {
+                log::debug!(
+                    "history for channel {channel}: {} messages in {} ms",
+                    messages.len(),
+                    started.elapsed().as_millis()
+                );
+            }
+            emit(Event::Update(update));
+        }
+        Err(()) => emit(Event::HistoryFailed { channel }),
     }
 }
 
