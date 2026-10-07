@@ -57,6 +57,16 @@ pub fn prepare(draft: &str) -> Result<String, Unsent> {
     Ok(shortcodes(&text))
 }
 
+/// The text an edit saves: like [`prepare`], without commands, which the
+/// web client runs only from the composer. Blank is for the caller: it may
+/// mean deleting the message, or keeping only its attachments.
+pub fn prepare_edit(draft: &str) -> Result<String, Unsent> {
+    if remaining(draft) < 0 {
+        return Err(Unsent::TooLong);
+    }
+    Ok(shortcodes(draft.trim()))
+}
+
 /// A draft the web client would act on instead of sending, as it would
 /// send it, or why it stays. Any `/command` but the four the web client
 /// turns into text stays: posted as text it could ping (`/msg @Sam…`).
@@ -269,6 +279,13 @@ mod tests {
         // Not commands the web client knows: text.
         assert_eq!(prepare("/home/dylan").as_deref(), Ok("/home/dylan"));
         assert_eq!(prepare("+1 pour moi").as_deref(), Ok("+1 pour moi"));
+    }
+
+    #[test]
+    fn an_edit_keeps_its_slashes_but_not_its_length() {
+        assert_eq!(prepare_edit(" /shrug :tada: ").as_deref(), Ok("/shrug 🎉"));
+        assert_eq!(prepare_edit("  ").as_deref(), Ok(""));
+        assert_eq!(prepare_edit(&"a".repeat(2001)), Err(Unsent::TooLong));
     }
 
     #[test]

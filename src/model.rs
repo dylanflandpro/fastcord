@@ -295,6 +295,8 @@ pub struct Message {
     /// In the order they were first added, as Discord lists them.
     pub reactions: Vec<Reaction>,
     pub delivery: Delivery,
+    /// Changed by its author since: the official client marks it "(edited)".
+    pub edited: bool,
 }
 
 /// An emoji as reactions carry it: a Unicode one by its text, or a
@@ -634,9 +636,26 @@ impl Model {
             embeds: Vec::new(),
             reactions: Vec::new(),
             delivery: Delivery::Sending,
+            edited: false,
         });
         loaded.sort_by_key(|m| m.id);
         true
+    }
+
+    pub fn message(&self, channel: Id, id: Id) -> Option<&Message> {
+        self.messages(channel).iter().find(|m| m.id == id)
+    }
+
+    /// Whether I may edit or delete this message: mine, and on Discord.
+    pub fn is_mine(&self, channel: Id, id: Id) -> bool {
+        self.message(channel, id)
+            .is_some_and(|m| m.author.id == self.me && m.delivery == Delivery::Sent)
+    }
+
+    /// What Up in an empty composer edits: my latest message there.
+    pub fn last_mine(&self, channel: Id) -> Option<Id> {
+        let loaded = self.messages(channel).iter().rev();
+        loaded.map(|m| m.id).find(|&id| self.is_mine(channel, id))
     }
 
     /// My message still waiting for Discord, or refused, by its nonce.
@@ -821,12 +840,14 @@ impl Model {
                 content,
                 attachments,
                 embeds,
+                edited,
             } => {
                 if let Some(message) = self
                     .messages
                     .get_mut(&channel)
                     .and_then(|loaded| loaded.iter_mut().find(|m| m.id == id))
                 {
+                    message.edited |= edited;
                     if let Some(content) = content {
                         message.content = content;
                     }
@@ -1725,6 +1746,7 @@ mod tests {
             embeds: vec![],
             reactions: vec![],
             delivery: Delivery::Sent,
+            edited: false,
         }
     }
 
@@ -1920,6 +1942,7 @@ mod tests {
             content: Some("edited".into()),
             attachments: None,
             embeds: None,
+            edited: true,
         });
         // A link preview resolving later: the text stays.
         let preview = Embed {
@@ -1941,8 +1964,10 @@ mod tests {
             content: None,
             attachments: None,
             embeds: Some(vec![preview.clone()]),
+            edited: false,
         });
         assert_eq!(model.messages(8)[1].content, "edited");
+        assert!(model.messages(8)[1].edited, "a preview does not unmark it");
         assert_eq!(model.messages(8)[1].embeds, [preview]);
         model.apply(Update::MessageDelete {
             channel: 8,
@@ -2098,6 +2123,19 @@ mod tests {
         model.messages.clear();
         assert!(!model.add_pending(8, 100, "ok".into()));
         assert!(model.messages.is_empty());
+    }
+
+    #[test]
+    fn i_edit_and_delete_only_my_own_sent_messages() {
+        let mut model = conversation();
+        model.messages.get_mut(&8).unwrap().push(said(6, ME, "moi"));
+        model.messages.get_mut(&8).unwrap().push(said(7, 2, "toi"));
+        model.add_pending(8, 100, "en route".into());
+        assert!(model.is_mine(8, 6));
+        assert!(!model.is_mine(8, 7) && !model.is_mine(8, 100));
+        assert_eq!(model.last_mine(8), Some(6));
+        model.messages.get_mut(&8).unwrap().retain(|m| m.id != 6);
+        assert_eq!(model.last_mine(8), None);
     }
 
     #[test]

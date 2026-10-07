@@ -80,6 +80,8 @@ pub enum Update {
         content: Option<String>,
         attachments: Option<Vec<Attachment>>,
         embeds: Option<Vec<Embed>>,
+        /// The author changed it (rather than a preview resolving).
+        edited: bool,
     },
     MessageDelete {
         channel: Id,
@@ -191,6 +193,7 @@ struct WireMessage {
     reactions: Vec<WireReaction>,
     #[serde(default, deserialize_with = "nonce")]
     nonce: Option<Id>,
+    edited_timestamp: Option<String>,
 }
 
 /// A message's nonce: a snowflake string from Discord's clients, but bots
@@ -415,6 +418,7 @@ impl From<WireMessage> for Message {
             embeds: wire.embeds.into_iter().map(Into::into).collect(),
             reactions: wire.reactions.into_iter().map(Into::into).collect(),
             delivery: crate::model::Delivery::Sent,
+            edited: wire.edited_timestamp.is_some(),
         }
     }
 }
@@ -464,6 +468,29 @@ struct MessageChange {
     attachments: Option<Vec<WireAttachment>>,
     #[serde(default, deserialize_with = "lenient_some")]
     embeds: Option<Vec<WireEmbed>>,
+    edited_timestamp: Option<String>,
+}
+
+impl From<MessageChange> for Update {
+    fn from(change: MessageChange) -> Self {
+        Update::MessageEdit {
+            channel: change.channel_id,
+            id: change.id,
+            content: change.content,
+            attachments: change
+                .attachments
+                .map(|list| list.into_iter().map(Into::into).collect()),
+            embeds: change
+                .embeds
+                .map(|list| list.into_iter().map(Into::into).collect()),
+            edited: change.edited_timestamp.is_some(),
+        }
+    }
+}
+
+/// The API's answer to an edit of mine: the message as Discord stored it.
+pub fn edited(body: &str) -> serde_json::Result<Update> {
+    serde_json::from_str::<MessageChange>(body).map(Update::from)
 }
 
 #[derive(serde::Deserialize)]
@@ -1437,17 +1464,7 @@ impl Decoder {
             }
             "MESSAGE_UPDATE" => {
                 let change: MessageChange = serde_json::from_str(data)?;
-                vec![Update::MessageEdit {
-                    channel: change.channel_id,
-                    id: change.id,
-                    content: change.content,
-                    attachments: change
-                        .attachments
-                        .map(|list| list.into_iter().map(Into::into).collect()),
-                    embeds: change
-                        .embeds
-                        .map(|list| list.into_iter().map(Into::into).collect()),
-                }]
+                vec![change.into()]
             }
             "MESSAGE_DELETE" | "MESSAGE_DELETE_BULK" => {
                 let deleted: MessageDelete = serde_json::from_str(data)?;
@@ -2194,6 +2211,7 @@ mod tests {
                 content: None,
                 attachments: None,
                 embeds: Some(vec![]),
+                edited: false,
             }]
         );
         assert_eq!(
@@ -2748,6 +2766,37 @@ mod tests {
             r#"{"channel_id":"2002","message_id":"50","emoji":{"id":null,"name":"👍"}}"#,
         );
         assert_eq!(one, ReactionChange::ClearEmoji(thumbs));
+    }
+
+    #[test]
+    fn edits_carry_their_timestamp() {
+        let mut decoder = Decoder::default();
+        let author = r#""author":{"id":"5","username":"sam"}"#;
+        let message = |edited: &str| {
+            format!(r#"{{"id":"41","channel_id":"7","type":0,"content":"oui",{author}{edited}}}"#)
+        };
+        for (extra, edited) in [
+            ("", false),
+            (r#","edited_timestamp":null"#, false),
+            (r#","edited_timestamp":"2026-10-07T12:00:00+00:00""#, true),
+        ] {
+            let created = decoder.event("MESSAGE_CREATE", &message(extra)).unwrap();
+            assert!(
+                matches!(&created[..], [.., Update::MessageCreate { message, .. }] if message.edited == edited),
+                "{extra}"
+            );
+        }
+        let change = r#"{"id":"41","channel_id":"7","content":"non","edited_timestamp":"2026-10-07T12:01:00+00:00"}"#;
+        assert!(matches!(
+            &decoder.event("MESSAGE_UPDATE", change).unwrap()[..],
+            [Update::MessageEdit { edited: true, content: Some(c), .. }] if c == "non"
+        ));
+        // The API's answer to my edit is the whole message.
+        let answer = message(r#","edited_timestamp":"2026-10-07T12:01:00+00:00""#);
+        assert!(matches!(
+            edited(&answer).unwrap(),
+            Update::MessageEdit { channel: 7, id: 41, edited: true, content: Some(c), .. } if c == "oui"
+        ));
     }
 
     #[test]

@@ -47,7 +47,40 @@ pub enum Command {
     React(ReactionRequest),
     /// Post a message I wrote. Messages leave one at a time, in the order
     /// they were written, as the official client's queue sends them.
+    Write(Write),
+}
+
+/// A change I make on Discord. Writes leave one at a time, in the order
+/// they were made, as the official client's queue sends messages and edits.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Write {
     Send(Outgoing),
+    /// My message's new text.
+    Edit {
+        place: Place,
+        id: Id,
+        content: String,
+    },
+    Delete {
+        place: Place,
+        id: Id,
+    },
+}
+
+impl Write {
+    pub fn place(&self) -> Place {
+        match self {
+            Write::Send(outgoing) => outgoing.place,
+            Write::Edit { place, .. } | Write::Delete { place, .. } => *place,
+        }
+    }
+}
+
+/// What an edit or a deletion of mine was.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Change {
+    Edit,
+    Delete,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,6 +154,14 @@ pub enum Event {
     SendUnsure {
         channel: Id,
         nonce: Id,
+    },
+    /// An edit or a deletion of mine came back: done, or not, with
+    /// Discord's reason when it gave one.
+    Changed {
+        channel: Id,
+        id: Id,
+        change: Change,
+        result: Result<(), Option<String>>,
     },
     /// Discord asked to slow down: the message goes in `wait`.
     SendHeld {
@@ -217,7 +258,7 @@ impl Backend {
 
     pub fn send(&self, command: Command) {
         // Closing waits for a message from the moment it is handed over.
-        if matches!(command, Command::Send(_)) {
+        if matches!(command, Command::Write(Write::Send(_))) {
             self.acking.handed.fetch_add(1, Ordering::Relaxed);
         }
         let _ = self.commands.send(command);
@@ -301,18 +342,21 @@ async fn session(
             notifications: RefCell::new(Notifications::new(alerts.shared.clone())),
             notify: alerts.notify,
         };
-        let post = |outgoing: Outgoing, token: Token| {
+        let post = |write: Write, token: Token| {
             let api = &api;
             async move {
-                let Outgoing {
-                    place,
-                    nonce,
-                    content,
-                } = &outgoing;
-                (
-                    api.send_message(&token, *place, *nonce, content).await,
-                    token,
-                )
+                let attempt = match &write {
+                    Write::Send(Outgoing {
+                        place,
+                        nonce,
+                        content,
+                    }) => api.send_message(&token, *place, *nonce, content).await,
+                    Write::Edit { place, id, content } => {
+                        api.edit_message(&token, *place, *id, content).await
+                    }
+                    Write::Delete { place, id } => api.delete_message(&token, *place, *id).await,
+                };
+                (attempt, token)
             }
         };
         let ended = tokio::select! {
@@ -561,12 +605,12 @@ async fn serve<S, F, P, G>(
 where
     S: Fn(Ack, Token) -> F,
     F: Future<Output = (Delivery, Token)>,
-    P: Fn(Outgoing, Token) -> G,
+    P: Fn(Write, Token) -> G,
     G: Future<Output = (Attempt, Token)>,
 {
     // Left from an earlier screen: dropped (see `wait_for`).
     while let Ok(command) = commands.try_recv() {
-        if matches!(command, Command::Send(_)) {
+        if matches!(command, Command::Write(Write::Send(_))) {
             busy.taken();
         }
     }
@@ -595,8 +639,8 @@ where
     let mut outbox = Outbox::default();
     let mut writing = FuturesUnordered::new();
     let served = loop {
-        if let Some(outgoing) = outbox.next() {
-            writing.push(send_one(&post, token, emit, outgoing));
+        if let Some(write) = outbox.next() {
+            writing.push(send_one(&post, token, emit, write));
         }
         let working = !acks.borrow().is_empty() || !outbox.is_idle();
         busy.working.store(working, Ordering::Relaxed);
@@ -618,14 +662,16 @@ where
                 Some(Command::React(reaction)) => {
                     reacting.extend(reactions.request(reaction).map(&fly));
                 }
-                Some(Command::Send(outgoing)) => {
-                    outbox.push(outgoing);
-                    busy.taken();
+                Some(Command::Write(write)) => {
+                    if matches!(write, Write::Send(_)) {
+                        busy.taken();
+                    }
+                    outbox.push(write);
                 }
                 Some(Command::Retry) => {}
             },
-            Some((outgoing, verdict, used)) = writing.next(), if !writing.is_empty() => {
-                if posted(&mut outbox, acks, token, emit, outgoing, verdict, &used) {
+            Some((write, verdict, used)) = writing.next(), if !writing.is_empty() => {
+                if posted(&mut outbox, acks, token, emit, write, verdict, &used) {
                     break Served::Revoked;
                 }
             }
@@ -670,13 +716,13 @@ where
             return;
         }
         loop {
-            if let Some(outgoing) = outbox.next() {
-                writing.push(send_one(&post, token, emit, outgoing));
+            if let Some(write) = outbox.next() {
+                writing.push(send_one(&post, token, emit, write));
             }
-            let Some((outgoing, verdict, used)) = writing.next().await else {
+            let Some((write, verdict, used)) = writing.next().await else {
                 break;
             };
-            posted(&mut outbox, acks, token, emit, outgoing, verdict, &used);
+            posted(&mut outbox, acks, token, emit, write, verdict, &used);
         }
     };
     let _ = tokio::time::timeout(ACK_FLUSH, async { tokio::join!(drain, flush) }).await;
@@ -689,92 +735,151 @@ where
 /// messages) still to send.
 const ACK_FLUSH: Duration = Duration::from_secs(2);
 
-/// One message, sent with the token in force at each try, rate limits
-/// waited out in full and reported (the window says Discord asked to slow
-/// down); what its last try came to.
+/// One write, made with the token in force at each try, rate limits
+/// waited out in full (for a message, the window says Discord asked to
+/// slow down); what its last try came to.
 async fn send_one<P, G>(
     post: &P,
     token: &RefCell<Token>,
     emit: Emit<'_>,
-    outgoing: Outgoing,
-) -> (Outgoing, Verdict, Token)
+    write: Write,
+) -> (Write, Verdict, Token)
 where
-    P: Fn(Outgoing, Token) -> G,
+    P: Fn(Write, Token) -> G,
     G: Future<Output = (Attempt, Token)>,
 {
     let mut retries = 0;
     loop {
         let used = Token::new(token.borrow().expose().to_owned());
-        let (attempt, used) = post(outgoing.clone(), used).await;
+        let (attempt, used) = post(write.clone(), used).await;
         match api::verdict(&attempt, retries) {
             Verdict::Wait(wait) => {
                 retries += 1;
-                let (channel, nonce) = (outgoing.place.channel, outgoing.nonce);
-                log::info!("rate limited; sending again in {} ms", wait.as_millis());
-                emit(Event::SendHeld {
-                    channel,
-                    nonce,
-                    wait,
-                });
+                log::info!("rate limited; trying again in {} ms", wait.as_millis());
+                if let Write::Send(Outgoing { place, nonce, .. }) = &write {
+                    let (channel, nonce) = (place.channel, *nonce);
+                    emit(Event::SendHeld {
+                        channel,
+                        nonce,
+                        wait,
+                    });
+                }
                 tokio::time::sleep(wait).await;
             }
-            verdict => return (outgoing, verdict, used),
+            verdict => return (write, verdict, used),
         }
     }
 }
 
-/// Reports what a message came to. A failure takes the channel's messages
-/// queued after it along, unsent. `true` when Discord refused the token in
-/// force; a token rotated meanwhile sends the message again.
+/// Reports what a write came to. A failed message takes the channel's
+/// messages queued after it along, unsent. `true` when Discord refused the
+/// token in force; a token rotated meanwhile makes the write again.
 fn posted(
     outbox: &mut Outbox,
     acks: &RefCell<AckQueue>,
     token: &RefCell<Token>,
     emit: Emit<'_>,
-    outgoing: Outgoing,
+    write: Write,
     verdict: Verdict,
     used: &Token,
 ) -> bool {
-    let Place { channel, guild } = outgoing.place;
-    let nonce = outgoing.nonce;
-    match verdict {
+    let Place { channel, guild } = write.place();
+    let refused = match verdict {
+        Verdict::Unauthorized if used.expose() == token.borrow().expose() => return true,
+        Verdict::Unauthorized => {
+            outbox.again(write);
+            return false;
+        }
         Verdict::Sent(body) => {
             outbox.landed(channel, false);
-            // My message reads the channel: no ack is owed for it.
-            acks.borrow_mut().cancel(channel);
-            // Unreadable, it still went through: the gateway's copy confirms it.
-            match body.as_deref().map(|body| crate::events::sent(body, guild)) {
-                Some(Ok(update)) => emit(Event::Update(update)),
-                Some(Err(error)) => log::warn!("unreadable sent message: {}", describe(&error)),
-                None => log::warn!("a sent message's answer could not be read"),
+            done(acks, emit, &write, guild, body.as_deref());
+            return false;
+        }
+        // Lost: if it went through, the gateway says so.
+        Verdict::Unsure => None,
+        Verdict::Refused(reason) => Some(reason),
+        Verdict::Wait(_) => unreachable!("waited out in `send_one`"),
+    };
+    let (id, change) = match write {
+        Write::Send(Outgoing { nonce, .. }) => {
+            emit(match refused {
+                Some(reason) => Event::SendFailed {
+                    channel,
+                    nonce,
+                    reason,
+                },
+                None => {
+                    log::warn!("a message's answer was lost; waiting for the gateway");
+                    Event::SendUnsure { channel, nonce }
+                }
+            });
+            for later in outbox.landed(channel, true) {
+                let reason = None;
+                emit(Event::SendFailed {
+                    channel,
+                    nonce: later,
+                    reason,
+                });
             }
             return false;
         }
-        Verdict::Unauthorized if used.expose() == token.borrow().expose() => return true,
-        Verdict::Unauthorized => {
-            outbox.again(outgoing);
-            return false;
-        }
-        Verdict::Unsure => {
-            log::warn!("a message's answer was lost; waiting for the gateway");
-            emit(Event::SendUnsure { channel, nonce });
-        }
-        Verdict::Refused(reason) => emit(Event::SendFailed {
-            channel,
-            nonce,
-            reason,
-        }),
-        Verdict::Wait(_) => unreachable!("waited out in `send_one`"),
-    }
-    for later in outbox.landed(channel, true) {
-        let reason = None;
-        emit(Event::SendFailed {
-            channel,
-            nonce: later,
-            reason,
-        });
-    }
+        Write::Edit { id, .. } => (id, Change::Edit),
+        Write::Delete { id, .. } => (id, Change::Delete),
+    };
+    outbox.landed(channel, false);
+    let result = Err(refused.flatten());
+    emit(Event::Changed {
+        channel,
+        id,
+        change,
+        result,
+    });
     false
+}
+
+/// A write Discord did, reported with the answer's message when it could
+/// be read (else the gateway's copy confirms it).
+fn done(
+    acks: &RefCell<AckQueue>,
+    emit: Emit<'_>,
+    write: &Write,
+    guild: Option<Id>,
+    body: Option<&str>,
+) {
+    let channel = write.place().channel;
+    let read = |update: serde_json::Result<Update>| match update {
+        Ok(update) => emit(Event::Update(update)),
+        Err(error) => log::warn!("unreadable answer: {}", describe(&error)),
+    };
+    let (id, change) = match write {
+        Write::Send(_) => {
+            // My message reads the channel: no ack is owed for it.
+            acks.borrow_mut().cancel(channel);
+            match body {
+                Some(body) => read(crate::events::sent(body, guild)),
+                None => log::warn!("a sent message's answer could not be read"),
+            }
+            return;
+        }
+        Write::Edit { id, .. } => {
+            if let Some(body) = body {
+                read(crate::events::edited(body));
+            }
+            (*id, Change::Edit)
+        }
+        Write::Delete { id, .. } => {
+            let ids = vec![*id];
+            emit(Event::Update(Update::MessageDelete { channel, ids }));
+            (*id, Change::Delete)
+        }
+    };
+    let result = Ok(());
+    emit(Event::Changed {
+        channel,
+        id,
+        change,
+        result,
+    });
 }
 
 async fn sleep_until(due: Option<Instant>) {
@@ -1448,8 +1553,11 @@ mod tests {
                 (answer, used)
             }
         };
-        let post = |outgoing: Outgoing, used: Token| {
-            posted.borrow_mut().push(outgoing.nonce);
+        let post = |write: Write, used: Token| {
+            posted.borrow_mut().push(match &write {
+                Write::Send(outgoing) => outgoing.nonce,
+                Write::Edit { id, .. } | Write::Delete { id, .. } => *id,
+            });
             let attempt = posts.borrow_mut().next().expect("an answer to a message");
             flying.set(flying.get() + 1);
             let (token, flying) = (&token, &flying);
@@ -1484,15 +1592,17 @@ mod tests {
         }
     }
 
+    const PLACE: fn(Id) -> Place = |channel| Place {
+        channel,
+        guild: Some(1),
+    };
+
     fn message(channel: Id, nonce: Id) -> Command {
-        Command::Send(Outgoing {
-            place: Place {
-                channel,
-                guild: Some(1),
-            },
+        Command::Write(Write::Send(Outgoing {
+            place: PLACE(channel),
             nonce,
             content: "salut".into(),
-        })
+        }))
     }
 
     fn answered(status: u16, body: Option<&str>) -> Attempt {
@@ -1630,6 +1740,66 @@ mod tests {
     }
 
     #[test]
+    fn edits_and_deletions_report_what_became_of_them() {
+        let edit = |id| {
+            Command::Write(Write::Edit {
+                place: PLACE(7),
+                id,
+                content: "non".into(),
+            })
+        };
+        let delete = |id| {
+            Command::Write(Write::Delete {
+                place: PLACE(7),
+                id,
+            })
+        };
+        let answer = r#"{"id":"40","channel_id":"7","content":"non","edited_timestamp":"2026-10-07T12:00:00+00:00"}"#;
+        let forbidden =
+            r#"{"message":"Cannot edit a message authored by another user","code":50005}"#;
+        let outcome = paused(session_with(
+            vec![edit(40), message(7, 1), edit(41), delete(42), delete(43)],
+            vec![],
+            vec![
+                answered(200, Some(answer)),
+                answered(200, None),
+                answered(403, Some(forbidden)),
+                answered(204, None),
+                Attempt::Lost,
+            ],
+            false,
+        ));
+        assert_eq!(outcome.posted, [40, 1, 41, 42, 43]);
+        let changed = |id, change, result| Event::Changed {
+            channel: 7,
+            id,
+            change,
+            result,
+        };
+        let events = &outcome.events;
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Update(Update::MessageEdit {
+                id: 40,
+                edited: true,
+                ..
+            })
+        )));
+        assert!(events.contains(&changed(40, Change::Edit, Ok(()))));
+        let refused = Some("Cannot edit a message authored by another user".into());
+        assert!(events.contains(&changed(41, Change::Edit, Err(refused))));
+        let deleted = Update::MessageDelete {
+            channel: 7,
+            ids: vec![42],
+        };
+        assert!(events.contains(&Event::Update(deleted)));
+        assert!(events.contains(&changed(42, Change::Delete, Ok(()))));
+        assert!(events.contains(&changed(43, Change::Delete, Err(None))));
+        // A failed edit takes no message along.
+        assert!(failures(events).is_empty());
+    }
+
+    #[test]
     fn logging_out_drops_the_messages_still_waiting() {
         let outcome = paused(session_with(
             vec![message(7, 1), message(7, 2), Command::LogOut],
@@ -1711,7 +1881,7 @@ mod tests {
                 sent.set(sent.get() + 1);
                 async move { (Delivery::Saved, used) }
             };
-            let post = |_: Outgoing, used: Token| async move { (Attempt::Lost, used) };
+            let post = |_: Write, used: Token| async move { (Attempt::Lost, used) };
             let (sender, mut receiver) = unbounded_channel();
             tokio::select! {
                 _ = serve(&mut receiver, &api, &token, &emit, &acks, &busy, send, post) => {

@@ -272,6 +272,7 @@ mod tests {
             embeds: vec![],
             reactions: vec![],
             delivery: crate::model::Delivery::Sent,
+            edited: false,
         };
         let marked = |channel| Update::Acked {
             channel,
