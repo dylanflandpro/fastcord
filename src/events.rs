@@ -8,8 +8,8 @@
 
 use crate::api::{ApiUser, optional_snowflake, snowflake};
 use crate::model::{
-    Channel, ChannelKind, DmChannel, Guild, Id, Model, Overwrite, OverwriteKind, Permissions, Role,
-    User,
+    Channel, ChannelKind, DmChannel, Guild, Id, Message, Model, Overwrite, OverwriteKind,
+    Permissions, Role, User,
 };
 use serde_json::value::RawValue;
 use std::collections::HashMap;
@@ -50,6 +50,118 @@ pub enum Update {
     },
     DmUpsert(DmChannel),
     DmRemove(Id),
+    /// A page of a channel's history, oldest first, older than anything
+    /// loaded (or the latest page when nothing was). `complete` once the
+    /// channel's first message is in.
+    History {
+        channel: Id,
+        messages: Vec<Message>,
+        /// The oldest message the page held, shown or not: where the next
+        /// page starts.
+        oldest: Option<Id>,
+        complete: bool,
+    },
+    MessageCreate {
+        channel: Id,
+        message: Message,
+    },
+    /// An edit; `content` is `None` when the edit left the text alone (an
+    /// embed resolving, a pin).
+    MessageEdit {
+        channel: Id,
+        id: Id,
+        content: Option<String>,
+    },
+    MessageDelete {
+        channel: Id,
+        ids: Vec<Id>,
+    },
+}
+
+/// How many messages a history page asks for, as the official client does.
+pub const PAGE: usize = 50;
+
+#[derive(serde::Deserialize)]
+struct WireMessage {
+    #[serde(deserialize_with = "snowflake")]
+    id: Id,
+    #[serde(deserialize_with = "snowflake")]
+    channel_id: Id,
+    author: ApiUser,
+    #[serde(default)]
+    content: String,
+    #[serde(rename = "type", default)]
+    kind: u8,
+}
+
+/// The message types shown as conversation: regular messages, replies and
+/// command invocations. Joins, pins, boosts and the other system messages
+/// come later.
+fn shown(kind: u8) -> bool {
+    matches!(kind, 0 | 19 | 20 | 23)
+}
+
+impl From<WireMessage> for Message {
+    fn from(wire: WireMessage) -> Self {
+        Message {
+            id: wire.id,
+            author: wire.author.into(),
+            content: wire.content,
+        }
+    }
+}
+
+/// A page of history as the API returns it (newest first), oldest first.
+///
+/// Completeness and where the next page starts count every entry Discord
+/// sent: system messages and entries this version cannot read are left
+/// out of `messages` but still move the cursor, or a run of joins would
+/// ask for the same page forever.
+pub fn history(channel: Id, body: &str) -> serde_json::Result<Update> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        #[serde(deserialize_with = "snowflake")]
+        id: Id,
+    }
+    let raw: Vec<Box<RawValue>> = serde_json::from_str(body)?;
+    let complete = raw.len() < PAGE;
+    let oldest = raw
+        .iter()
+        .filter_map(|entry| serde_json::from_str::<Entry>(entry.get()).ok())
+        .map(|entry| entry.id)
+        .min();
+    let mut messages: Vec<Message> = raw
+        .iter()
+        .filter_map(|entry| serde_json::from_str::<WireMessage>(entry.get()).ok())
+        .filter(|wire| shown(wire.kind))
+        .map(Message::from)
+        .collect();
+    messages.sort_by_key(|m| m.id);
+    Ok(Update::History {
+        channel,
+        messages,
+        oldest,
+        complete,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct MessageChange {
+    #[serde(deserialize_with = "snowflake")]
+    id: Id,
+    #[serde(deserialize_with = "snowflake")]
+    channel_id: Id,
+    content: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct MessageDelete {
+    #[serde(default, deserialize_with = "optional_snowflake")]
+    id: Option<Id>,
+    #[serde(default)]
+    ids: Vec<String>,
+    #[serde(deserialize_with = "snowflake")]
+    channel_id: Id,
 }
 
 #[derive(serde::Deserialize)]
@@ -157,6 +269,8 @@ struct WireRole {
     #[serde(deserialize_with = "snowflake")]
     id: Id,
     #[serde(default)]
+    name: String,
+    #[serde(default)]
     position: i32,
     #[serde(deserialize_with = "permissions")]
     permissions: Permissions,
@@ -237,6 +351,7 @@ impl From<WireRole> for Role {
     fn from(role: WireRole) -> Self {
         Role {
             id: role.id,
+            name: role.name,
             position: role.position,
             permissions: role.permissions,
         }
@@ -435,6 +550,7 @@ impl Decoder {
         let model = Model {
             me,
             guilds,
+            users: self.users.clone(),
             dms: ready
                 .private_channels
                 .into_iter()
@@ -519,6 +635,36 @@ impl Decoder {
                     Vec::new()
                 }
             }
+            "MESSAGE_CREATE" => {
+                let wire: WireMessage = serde_json::from_str(data)?;
+                if !shown(wire.kind) {
+                    return Ok(Vec::new());
+                }
+                let channel = wire.channel_id;
+                let message = Message::from(wire);
+                self.users.insert(message.author.id, message.author.clone());
+                vec![Update::MessageCreate { channel, message }]
+            }
+            "MESSAGE_UPDATE" => {
+                let change: MessageChange = serde_json::from_str(data)?;
+                vec![Update::MessageEdit {
+                    channel: change.channel_id,
+                    id: change.id,
+                    content: change.content,
+                }]
+            }
+            "MESSAGE_DELETE" | "MESSAGE_DELETE_BULK" => {
+                let deleted: MessageDelete = serde_json::from_str(data)?;
+                let ids = deleted
+                    .id
+                    .into_iter()
+                    .chain(deleted.ids.iter().filter_map(|id| id.parse().ok()))
+                    .collect();
+                vec![Update::MessageDelete {
+                    channel: deleted.channel_id,
+                    ids,
+                }]
+            }
             "CHANNEL_DELETE" => {
                 let wire: WireChannel = serde_json::from_str(data)?;
                 match wire.guild_id {
@@ -600,6 +746,7 @@ mod tests {
                 guild: 1001,
                 role: Role {
                     id: 1050,
+                    name: "mod".into(),
                     position: 3,
                     permissions: Permissions::ADMINISTRATOR,
                 },
@@ -800,6 +947,97 @@ mod tests {
         assert_eq!(model.guild(3).unwrap().my_roles, [33]);
         assert_eq!(model.dms.len(), 1);
         assert_eq!(model.dms[0].title(), "lea");
+    }
+
+    #[test]
+    fn a_history_page_reads_oldest_first_and_skips_system_messages() {
+        let body = r#"[
+            {"id":"30","channel_id":"7","type":0,"content":"third","author":{"id":"2","username":"lea","global_name":"Léa"}},
+            {"id":"20","channel_id":"7","type":7,"content":"","author":{"id":"3","username":"marc","global_name":null}},
+            {"id":"10","channel_id":"7","type":19,"content":"first","author":{"id":"3","username":"marc","global_name":null}},
+            {"id":"5","channel_id":"7","type":0,"author":{"id":"4"}}
+        ]"#;
+        let Update::History {
+            channel,
+            messages,
+            oldest,
+            complete,
+        } = history(7, body).unwrap()
+        else {
+            panic!("expected history");
+        };
+        assert_eq!(channel, 7);
+        let ids: Vec<Id> = messages.iter().map(|m| m.id).collect();
+        // The join (type 7) is left out; the author without a username too.
+        assert_eq!(ids, [10, 30]);
+        assert_eq!(messages[1].author.display_name(), "Léa");
+        assert!(complete, "fewer than a page means the start is reached");
+        assert_eq!(oldest, Some(5), "the cursor counts what is not shown");
+    }
+
+    #[test]
+    fn a_full_page_with_unreadable_entries_is_not_the_start() {
+        let entry = |id: usize| {
+            format!(
+                r#"{{"id":"{id}","channel_id":"7","type":7,"content":"","author":{{"id":"3","username":"m"}}}}"#
+            )
+        };
+        let mut entries: Vec<String> = (100..100 + PAGE - 1).map(entry).collect();
+        entries.push(r#"{"id":"99","odd":true}"#.into());
+        let body = format!("[{}]", entries.join(","));
+        let Update::History {
+            messages,
+            oldest,
+            complete,
+            ..
+        } = history(7, &body).unwrap()
+        else {
+            panic!("expected history");
+        };
+        assert!(messages.is_empty(), "joins only");
+        assert!(!complete, "a full page, readable or not");
+        assert_eq!(oldest, Some(99));
+    }
+
+    #[test]
+    fn message_events() {
+        let mut decoder = Decoder::default();
+        let created = decoder
+            .event(
+                "MESSAGE_CREATE",
+                r#"{"id":"40","channel_id":"7","guild_id":"1","type":0,"content":"salut","author":{"id":"5","username":"sam","global_name":"Sam"},"mentions":[],"attachments":[],"embeds":[]}"#,
+            )
+            .unwrap();
+        assert!(matches!(
+            &created[..],
+            [Update::MessageCreate { channel: 7, message }] if message.content == "salut"
+        ));
+        assert_eq!(decoder.user(5).display_name(), "Sam");
+        assert_eq!(
+            decoder
+                .event(
+                    "MESSAGE_UPDATE",
+                    r#"{"id":"40","channel_id":"7","embeds":[]}"#
+                )
+                .unwrap(),
+            [Update::MessageEdit {
+                channel: 7,
+                id: 40,
+                content: None
+            }]
+        );
+        assert_eq!(
+            decoder
+                .event(
+                    "MESSAGE_DELETE_BULK",
+                    r#"{"ids":["40","41"],"channel_id":"7","guild_id":"1"}"#
+                )
+                .unwrap(),
+            [Update::MessageDelete {
+                channel: 7,
+                ids: vec![40, 41]
+            }]
+        );
     }
 
     #[test]

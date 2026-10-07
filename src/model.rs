@@ -3,7 +3,7 @@
 //! The shapes follow Discord's own objects closely enough that the gateway
 //! can fill them later, and no further than the interface needs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A Discord snowflake: guilds, channels, users and messages all use one.
 pub type Id = u64;
@@ -69,6 +69,8 @@ impl Permissions {
 pub struct Role {
     /// The @everyone role has the guild's id.
     pub id: Id,
+    /// What role mentions show.
+    pub name: String,
     pub position: i32,
     pub permissions: Permissions,
 }
@@ -299,8 +301,17 @@ pub struct Model {
     pub me: Id,
     pub guilds: Vec<Guild>,
     pub dms: Vec<DmChannel>,
-    /// Loaded history per channel, oldest first.
+    /// The people the client knows by id: READY's users, DM recipients and
+    /// message authors, for mentions and DM titles.
+    pub users: HashMap<Id, User>,
+    /// Loaded history per channel, oldest first. A channel is absent until
+    /// its history has been asked for and arrived.
     pub messages: HashMap<Id, Vec<Message>>,
+    /// Channels whose history is loaded back to the first message.
+    pub complete: HashSet<Id>,
+    /// Per channel, the oldest message fetched, shown or not: where the next
+    /// page of history starts.
+    pub cursors: HashMap<Id, Id>,
 }
 
 impl Model {
@@ -322,6 +333,25 @@ impl Model {
     pub fn messages(&self, channel: Id) -> &[Message] {
         self.messages.get(&channel).map_or(&[], Vec::as_slice)
     }
+
+    /// The guild a channel belongs to; `None` for DMs and unknown channels.
+    pub fn guild_of(&self, channel: Id) -> Option<Id> {
+        self.guilds
+            .iter()
+            .find(|g| g.channel(channel).is_some())
+            .map(|g| g.id)
+    }
+
+    fn knows_channel(&self, channel: Id) -> bool {
+        self.guild_of(channel).is_some() || self.dm(channel).is_some()
+    }
+
+    /// Drops what was loaded for a channel that went away.
+    fn forget_history(&mut self, channel: Id) {
+        self.messages.remove(&channel);
+        self.complete.remove(&channel);
+        self.cursors.remove(&channel);
+    }
     /// Applies a change the gateway reported after READY.
     pub fn apply(&mut self, update: crate::events::Update) {
         use crate::events::Update;
@@ -340,7 +370,13 @@ impl Model {
                     }
                 }
             }
-            Update::GuildRemove(id) => self.guilds.retain(|g| g.id != id),
+            Update::GuildRemove(id) => {
+                if let Some(guild) = self.guild(id) {
+                    let channels: Vec<Id> = guild.channels.iter().map(|c| c.id).collect();
+                    channels.into_iter().for_each(|c| self.forget_history(c));
+                }
+                self.guilds.retain(|g| g.id != id);
+            }
             Update::ChannelUpsert { guild, channel } => {
                 if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
                     match guild.channels.iter_mut().find(|c| c.id == channel.id) {
@@ -372,15 +408,73 @@ impl Model {
                 if let Some(guild) = self.guilds.iter_mut().find(|g| g.id == guild) {
                     guild.channels.retain(|c| c.id != channel);
                 }
-                self.messages.remove(&channel);
+                self.forget_history(channel);
             }
             Update::DmUpsert(dm) => match self.dms.iter_mut().find(|d| d.id == dm.id) {
                 Some(existing) => *existing = dm,
                 None => self.dms.push(dm),
             },
+            Update::History {
+                channel,
+                messages,
+                oldest,
+                complete,
+            } => {
+                // A page for a channel deleted while it loaded.
+                if !self.knows_channel(channel) {
+                    return;
+                }
+                if let Some(oldest) = oldest {
+                    let cursor = self.cursors.entry(channel).or_insert(oldest);
+                    *cursor = (*cursor).min(oldest);
+                }
+                for message in &messages {
+                    self.users.insert(message.author.id, message.author.clone());
+                }
+                let loaded = self.messages.entry(channel).or_default();
+                loaded.extend(messages);
+                loaded.sort_by_key(|m| m.id);
+                loaded.dedup_by_key(|m| m.id);
+                if complete {
+                    self.complete.insert(channel);
+                }
+            }
+            Update::MessageCreate { channel, message } => {
+                self.users.insert(message.author.id, message.author.clone());
+                if let Some(dm) = self.dms.iter_mut().find(|d| d.id == channel) {
+                    dm.last_message_id = dm.last_message_id.max(Some(message.id));
+                }
+                // A channel whose history was never asked for gets it, this
+                // message included, when it is opened.
+                if let Some(loaded) = self.messages.get_mut(&channel)
+                    && !loaded.iter().any(|m| m.id == message.id)
+                {
+                    let at = loaded.partition_point(|m| m.id < message.id);
+                    loaded.insert(at, message);
+                }
+            }
+            Update::MessageEdit {
+                channel,
+                id,
+                content,
+            } => {
+                if let Some(content) = content
+                    && let Some(message) = self
+                        .messages
+                        .get_mut(&channel)
+                        .and_then(|loaded| loaded.iter_mut().find(|m| m.id == id))
+                {
+                    message.content = content;
+                }
+            }
+            Update::MessageDelete { channel, ids } => {
+                if let Some(loaded) = self.messages.get_mut(&channel) {
+                    loaded.retain(|m| !ids.contains(&m.id));
+                }
+            }
             Update::DmRemove(id) => {
                 self.dms.retain(|d| d.id != id);
-                self.messages.remove(&id);
+                self.forget_history(id);
             }
         }
     }
@@ -413,6 +507,7 @@ mod tests {
             owner_id: 2,
             roles: vec![Role {
                 id: GUILD,
+                name: "@everyone".into(),
                 position: 0,
                 permissions: Permissions::VIEW_CHANNEL,
             }],
@@ -593,6 +688,7 @@ mod tests {
         let mut administered = hidden();
         administered.roles.push(Role {
             id: 50,
+            name: "admin".into(),
             position: 1,
             permissions: Permissions::ADMINISTRATOR,
         });
@@ -725,6 +821,7 @@ mod tests {
             guild: GUILD,
             role: Role {
                 id: 50,
+                name: "admin".into(),
                 position: 1,
                 permissions: Permissions::ADMINISTRATOR,
             },
@@ -741,6 +838,106 @@ mod tests {
         });
         assert!(!visible(&model));
         assert!(model.guild(GUILD).unwrap().my_roles.is_empty());
+    }
+
+    fn said(id: Id, author: Id, content: &str) -> Message {
+        Message {
+            content: content.into(),
+            ..message(id, author)
+        }
+    }
+
+    #[test]
+    fn history_pages_merge_in_order() {
+        use crate::events::Update;
+        let mut model = Model {
+            dms: vec![DmChannel {
+                id: 7,
+                recipients: vec![],
+                last_message_id: None,
+            }],
+            ..Model::default()
+        };
+        assert!(!model.messages.contains_key(&7));
+        model.apply(Update::History {
+            channel: 7,
+            messages: vec![said(30, 1, "c"), said(40, 2, "d")],
+            oldest: Some(30),
+            complete: false,
+        });
+        // An older page, overlapping by one message.
+        model.apply(Update::History {
+            channel: 7,
+            messages: vec![said(10, 1, "a"), said(30, 1, "c")],
+            oldest: Some(10),
+            complete: true,
+        });
+        let ids: Vec<Id> = model.messages(7).iter().map(|m| m.id).collect();
+        assert_eq!(ids, [10, 30, 40]);
+        assert!(model.complete.contains(&7));
+        assert_eq!(model.cursors[&7], 10);
+        model.apply(Update::DmRemove(7));
+        assert!(!model.complete.contains(&7) && !model.cursors.contains_key(&7));
+        // A page landing after its channel went away is dropped.
+        model.apply(Update::History {
+            channel: 7,
+            messages: vec![said(1, 1, "late")],
+            oldest: Some(1),
+            complete: true,
+        });
+        assert!(!model.messages.contains_key(&7));
+        assert!(model.users.contains_key(&2), "authors become known users");
+    }
+
+    #[test]
+    fn live_messages_join_loaded_history_only() {
+        use crate::events::Update;
+        let mut model = Model {
+            dms: vec![DmChannel {
+                id: 8,
+                recipients: vec![],
+                last_message_id: Some(5),
+            }],
+            ..Model::default()
+        };
+        model.apply(Update::MessageCreate {
+            channel: 7,
+            message: said(50, 1, "unseen"),
+        });
+        assert!(!model.messages.contains_key(&7), "not loaded, not started");
+        model.apply(Update::History {
+            channel: 8,
+            messages: vec![said(5, 1, "old")],
+            oldest: Some(5),
+            complete: true,
+        });
+        model.apply(Update::MessageCreate {
+            channel: 8,
+            message: said(60, 2, "new"),
+        });
+        model.apply(Update::MessageCreate {
+            channel: 8,
+            message: said(60, 2, "new"),
+        });
+        assert_eq!(model.messages(8).len(), 2, "a repeated event adds nothing");
+        assert_eq!(model.dm(8).unwrap().last_message_id, Some(60));
+
+        model.apply(Update::MessageEdit {
+            channel: 8,
+            id: 60,
+            content: Some("edited".into()),
+        });
+        model.apply(Update::MessageEdit {
+            channel: 8,
+            id: 60,
+            content: None,
+        });
+        assert_eq!(model.messages(8)[1].content, "edited");
+        model.apply(Update::MessageDelete {
+            channel: 8,
+            ids: vec![5],
+        });
+        assert_eq!(model.messages(8).len(), 1);
     }
 
     #[test]

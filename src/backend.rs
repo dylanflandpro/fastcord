@@ -7,8 +7,10 @@ use crate::api::{self, Api};
 use crate::credentials::{self, Token};
 use crate::events::{Decoder, Update};
 use crate::gateway::{self, End, Gateway};
-use crate::model::{Model, User};
+use crate::model::{Id, Model, User};
 use crate::remote_auth::{self, Progress};
+use futures_util::StreamExt as _;
+use futures_util::stream::FuturesUnordered;
 use std::cell::RefCell;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -19,6 +21,14 @@ pub enum Command {
     /// Try again after a failure.
     Retry,
     LogOut,
+    /// Load a page of a channel's history: the latest, or the one before
+    /// `before`.
+    LoadHistory {
+        channel: Id,
+        /// The channel's guild, `None` for a DM: the page it is read from.
+        guild: Option<Id>,
+        before: Option<Id>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -56,6 +66,10 @@ pub enum Event {
     /// Everything at once, from READY.
     Ready(Model),
     Update(Update),
+    /// A history page could not be loaded; the interface offers to retry.
+    HistoryFailed {
+        channel: Id,
+    },
 }
 
 pub struct Backend {
@@ -130,11 +144,11 @@ async fn session(mut commands: UnboundedReceiver<Command>, emit: Emit<'_>) {
         let token = RefCell::new(token);
         let ended = tokio::select! {
             ended = stay_connected(&api, &keyring, &token, emit) => Some(ended),
-            logged_out = wait_for(&mut commands, |c| matches!(c, Command::LogOut)) => {
-                if !logged_out {
-                    return;
-                }
-                None
+            served = serve(&mut commands, &api, &token, emit) => match served {
+                Served::Closed => return,
+                Served::LoggedOut => None,
+                // A history request found the token revoked.
+                Served::Revoked => Some(Ended::Revoked),
             }
         };
         match ended {
@@ -276,6 +290,94 @@ async fn stay_connected(
         log::info!("gateway reconnecting in {}s", delay.as_secs());
         tokio::time::sleep(delay).await;
     }
+}
+
+/// How the signed-in phase ended on the interface's side.
+enum Served {
+    LoggedOut,
+    /// The window closed.
+    Closed,
+    /// Discord answered a request with 401: the token is gone.
+    Revoked,
+}
+
+/// Answers the interface's requests while signed in. History pages load
+/// side by side.
+async fn serve(
+    commands: &mut UnboundedReceiver<Command>,
+    api: &Api,
+    token: &RefCell<Token>,
+    emit: Emit<'_>,
+) -> Served {
+    while commands.try_recv().is_ok() {}
+    let mut loading = FuturesUnordered::new();
+    loop {
+        tokio::select! {
+            command = commands.recv() => match command {
+                None => return Served::Closed,
+                Some(Command::LogOut) => return Served::LoggedOut,
+                Some(Command::LoadHistory { channel, guild, before }) => {
+                    let token = Token::new(token.borrow().expose().to_owned());
+                    loading.push(async move {
+                        load_history(api, &token, channel, guild, before, emit).await
+                    });
+                }
+                Some(Command::Retry) => {}
+            },
+            Some(revoked) = loading.next(), if !loading.is_empty() => {
+                if revoked {
+                    return Served::Revoked;
+                }
+            }
+        }
+    }
+}
+
+/// Loads one page and reports it. `true` when Discord says the token is no
+/// longer valid.
+async fn load_history(
+    api: &Api,
+    token: &Token,
+    channel: Id,
+    guild: Option<Id>,
+    before: Option<Id>,
+    emit: Emit<'_>,
+) -> bool {
+    let started = std::time::Instant::now();
+    let page = match api.messages(token, channel, guild, before).await {
+        Ok(body) => crate::events::history(channel, &body).map_err(|error| {
+            log::warn!("unreadable history page: {}", describe(&error));
+        }),
+        // Nothing to read here for this account: an empty, complete history.
+        Err(api::Error::Forbidden) => Ok(Update::History {
+            channel,
+            messages: Vec::new(),
+            oldest: None,
+            complete: true,
+        }),
+        Err(api::Error::Unauthorized) => {
+            emit(Event::HistoryFailed { channel });
+            return true;
+        }
+        Err(error) => {
+            log::warn!("loading history failed: {error}");
+            Err(())
+        }
+    };
+    match page {
+        Ok(update) => {
+            if let Update::History { messages, .. } = &update {
+                log::debug!(
+                    "history for channel {channel}: {} messages in {} ms",
+                    messages.len(),
+                    started.elapsed().as_millis()
+                );
+            }
+            emit(Event::Update(update));
+        }
+        Err(()) => emit(Event::HistoryFailed { channel }),
+    }
+    false
 }
 
 /// Waits for a command matching `wanted`, ignoring others. `false` once the

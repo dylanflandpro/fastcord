@@ -8,7 +8,7 @@
 //! (`***a***` is italic around bold); and the same wording for mentions it
 //! cannot resolve and for timestamps.
 
-use crate::model::{Id, Model};
+use crate::model::{Id, Model, User};
 use std::collections::HashMap;
 
 /// A message's text, block by block.
@@ -188,10 +188,12 @@ pub struct Directory<'a> {
 }
 
 impl<'a> Directory<'a> {
-    /// The people the client has met there: DM recipients and the channel's
-    /// authors. The official client also reads each message's `mentions`
-    /// and the guild's members, which arrive with the gateway.
+    /// The people the client knows: the model's users (READY's, DM
+    /// recipients, authors seen so far), DM recipients and the channel's
+    /// authors. The official client also reads each message's `mentions`.
     pub fn new(model: &'a Model, channel: Id) -> Self {
+        // The model's users are looked up in place; only the few people
+        // the model may not list yet are gathered here.
         let users = model
             .dms
             .iter()
@@ -205,7 +207,11 @@ impl<'a> Directory<'a> {
 
 impl Names for Directory<'_> {
     fn user(&self, id: Id) -> Option<&str> {
-        self.users.get(&id).copied()
+        self.model
+            .users
+            .get(&id)
+            .map(User::display_name)
+            .or_else(|| self.users.get(&id).copied())
     }
 
     fn channel(&self, id: Id) -> Option<&str> {
@@ -216,9 +222,13 @@ impl Names for Directory<'_> {
             .map(|channel| channel.name.as_str())
     }
 
-    /// The model does not hold role names yet.
-    fn role(&self, _: Id) -> Option<&str> {
-        None
+    fn role(&self, id: Id) -> Option<&str> {
+        self.model
+            .guilds
+            .iter()
+            .flat_map(|guild| &guild.roles)
+            .find(|role| role.id == id)
+            .map(|role| role.name.as_str())
     }
 }
 
@@ -1824,8 +1834,9 @@ mod tests {
         assert_eq!(general.user(2), Some("Léa"));
         assert_eq!(general.channel(111), Some("général"));
         assert_eq!(general.user(999), None);
-        // Dylan never writes in #aide and has no DM with himself.
-        assert_eq!(Directory::new(&model, 112).user(1), None);
+        // Known from the model's users wherever he writes.
+        assert_eq!(Directory::new(&model, 112).user(1), Some("Dylan"));
+        assert_eq!(general.role(150), Some("role-150"));
     }
 
     #[test]

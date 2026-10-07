@@ -2,7 +2,7 @@
 
 mod sign_in;
 
-use crate::app::{App, Selection, View};
+use crate::app::{self, App, HistoryStatus, ScrollAnchor, Selection, View};
 use crate::backend::{Command, Link};
 use crate::markdown::{self, Action, Block, Content, Directory, Span, Style};
 use crate::model::{self, ChannelKind, Entry, Id, Message, Model};
@@ -28,13 +28,28 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         return;
     }
     status_bar(app, ui);
-    let Some(model) = &app.model else {
-        return;
+    let status = app.selection.channel.map(|c| app.history_status(c));
+    let request = {
+        let Some(model) = &app.model else {
+            return;
+        };
+        let selection = &mut app.selection;
+        rail(selection, model, &palette, ui);
+        sidebar(selection, model, &palette, ui);
+        conversation(selection, model, &palette, status, ui)
     };
-    let selection = &mut app.selection;
-    rail(selection, model, &palette, ui);
-    sidebar(selection, model, &palette, ui);
-    conversation(selection, model, &palette, ui);
+    match request {
+        Some(HistoryRequest::Older(channel)) => app.request_history(channel, true),
+        Some(HistoryRequest::Retry(channel)) => app.retry_history(channel),
+        None => {}
+    }
+}
+
+/// What the conversation asks of its history.
+enum HistoryRequest {
+    /// Scrolled to the top: the page before.
+    Older(Id),
+    Retry(Id),
 }
 
 /// The connection's state and the account, along the bottom of the window.
@@ -306,13 +321,21 @@ fn row(
 }
 
 /// The open channel: its name, then its messages, newest at the bottom.
-fn conversation(selection: &Selection, model: &Model, palette: &Palette, ui: &mut egui::Ui) {
+fn conversation(
+    selection: &Selection,
+    model: &Model,
+    palette: &Palette,
+    status: Option<HistoryStatus>,
+    ui: &mut egui::Ui,
+) -> Option<HistoryRequest> {
     let Some(channel) = selection.channel else {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(palette.window))
             .show(ui, |_| {});
-        return;
+        return None;
     };
+    let status = status.unwrap_or(HistoryStatus::Idle);
+    let mut request = None;
     egui::Panel::top("conversation-header")
         .exact_size(48.0)
         .show_separator_line(true)
@@ -337,13 +360,24 @@ fn conversation(selection: &Selection, model: &Model, palette: &Palette, ui: &mu
                 .inner_margin(Margin::symmetric(16, 8)),
         )
         .show(ui, |ui| {
-            let messages = model.messages(channel);
-            if messages.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("No messages yet").color(palette.dim));
+            let Some(messages) = model.messages.get(&channel) else {
+                // Nothing loaded yet: the first page is on its way, or failed.
+                ui.centered_and_justified(|ui| match status {
+                    HistoryStatus::Loading => {
+                        ui.spinner();
+                    }
+                    HistoryStatus::Failed => {
+                        if failed(ui, palette, "Couldn't load messages.") {
+                            request = Some(HistoryRequest::Retry(channel));
+                        }
+                    }
+                    HistoryStatus::Idle => {
+                        ui.label(egui::RichText::new("No messages yet").color(palette.dim));
+                    }
                 });
                 return;
-            }
+            };
+            let complete = model.complete.contains(&channel);
             let reader = Reader {
                 palette,
                 clock: Clock::now(),
@@ -352,19 +386,104 @@ fn conversation(selection: &Selection, model: &Model, palette: &Palette, ui: &mu
                     .data(|d| d.get_temp::<Arc<RevealedSpoilers>>(egui::Id::new(REVEALED)))
                     .unwrap_or_default(),
             };
-            // One scroll position per channel, so each opens where it was left.
-            egui::ScrollArea::vertical()
+            // An older page lands above what is on screen: keep what was on
+            // screen in place, as the official client does, instead of
+            // jumping to the new page's last message.
+            let anchor = egui::Id::new(("history-anchor", channel));
+            let mut area = egui::ScrollArea::vertical()
                 .id_salt(channel)
                 .auto_shrink(false)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    let mut previous: Option<&Message> = None;
-                    for message in messages {
-                        message_line(ui, &reader, previous, message);
-                        previous = Some(message);
-                    }
-                });
+                .stick_to_bottom(true);
+            if let Some(offset) = ui.data_mut(|d| d.remove_temp::<f32>(anchor.with("offset"))) {
+                area = area.vertical_scroll_offset(offset);
+            }
+            let first = messages.first().map(|m| m.id);
+            // One scroll position per channel, so each opens where it was left.
+            let output = area.show(ui, |ui| {
+                // One row of fixed height for the beginning, the spinner or
+                // a failure, so they never change the height the anchor
+                // compares.
+                let row = egui::vec2(ui.available_width(), TOP_ROW);
+                ui.allocate_ui_with_layout(
+                    row,
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.set_min_size(row);
+                        if complete {
+                            beginning(ui, palette, &channel_title(model, selection.view, channel));
+                        } else {
+                            match status {
+                                HistoryStatus::Loading => {
+                                    ui.spinner();
+                                }
+                                HistoryStatus::Failed => {
+                                    if failed(ui, palette, "Couldn't load older messages.") {
+                                        request = Some(HistoryRequest::Retry(channel));
+                                    }
+                                }
+                                HistoryStatus::Idle => {}
+                            }
+                        }
+                    },
+                );
+                if messages.is_empty() && complete {
+                    return;
+                }
+                let mut previous: Option<&Message> = None;
+                for message in messages {
+                    message_line(ui, &reader, previous, message);
+                    previous = Some(message);
+                }
+            });
+            let height = output.content_size.y;
+            let at_top = output.state.offset.y <= 1.0;
+            if let Some(before) = ui.data(|d| d.get_temp::<ScrollAnchor>(anchor))
+                && let Some(offset) = app::anchored_offset(before, first, height)
+            {
+                ui.data_mut(|d| d.insert_temp(anchor.with("offset"), offset));
+            }
+            ui.data_mut(|d| {
+                d.insert_temp(
+                    anchor,
+                    ScrollAnchor {
+                        first,
+                        height,
+                        offset: output.state.offset.y,
+                    },
+                )
+            });
+            // At the top, or a first page too short to scroll: the page
+            // before, until the channel's first message is in.
+            let fills = height > output.inner_rect.height();
+            if !complete && status == HistoryStatus::Idle && (at_top || !fills) {
+                request = Some(HistoryRequest::Older(channel));
+            }
         });
+    request
+}
+
+/// The height of the row above the messages: the beginning, a spinner or a
+/// failure with its button.
+const TOP_ROW: f32 = 56.0;
+
+/// Where a channel's history begins, as the official client marks it.
+fn beginning(ui: &mut egui::Ui, palette: &Palette, title: &str) {
+    ui.add_space(16.0);
+    ui.label(
+        egui::RichText::new(format!("This is the beginning of {title}."))
+            .font(theme::regular(14.0))
+            .color(palette.dim),
+    );
+    ui.add_space(8.0);
+}
+
+/// A failure line with a Try again button; `true` when pressed.
+fn failed(ui: &mut egui::Ui, palette: &Palette, text: &str) -> bool {
+    ui.vertical_centered(|ui| {
+        ui.label(egui::RichText::new(text).color(palette.danger));
+        ui.button("Try again").clicked()
+    })
+    .inner
 }
 
 fn channel_title(model: &Model, view: View, channel: Id) -> String {

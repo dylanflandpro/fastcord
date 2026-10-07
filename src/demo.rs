@@ -27,8 +27,14 @@ fn channel(id: Id, name: &str, kind: ChannelKind, parent: Option<Id>, position: 
 
 /// A guild where @everyone may view channels; `extra` lists the other roles.
 fn guild(id: Id, name: &str, owner_id: Id, extra: &[Id], my_roles: &[Id]) -> Guild {
+    let guild_id = id;
     let role = |id, permissions| Role {
         id,
+        name: if id == guild_id {
+            "@everyone".into()
+        } else {
+            format!("role-{id}")
+        },
         position: 0,
         permissions,
     };
@@ -262,6 +268,12 @@ pub fn model() -> Model {
             dm
         })
         .collect();
+    model.users = [me, lea, marc, sam]
+        .into_iter()
+        .map(|user| (user.id, user))
+        .collect();
+    // The demo's histories are whole: nothing older to load.
+    model.complete = model.messages.keys().copied().collect();
     model
 }
 
