@@ -203,6 +203,10 @@ pub fn semibold(size: f32) -> FontId {
     fastframe_fonts::Weight::SemiBold.font_id(size)
 }
 
+pub fn bold(size: f32) -> FontId {
+    fastframe_fonts::Weight::Bold.font_id(size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

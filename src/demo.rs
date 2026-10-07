@@ -155,13 +155,25 @@ pub fn model() -> Model {
         sequence: 0,
     };
 
+    // Timestamps show in each reader's time zone, so the meetup sits two
+    // days ahead of whenever the demo runs.
+    let meetup = (timeline.now + jiff::SignedDuration::from_hours(48)).as_second();
+    let programme = format!(
+        "## Meetup de rentrée\n<t:{meetup}:F> (<t:{meetup}:R>), salle B. Au programme :\n\
+         - **egui 0.36** en pratique, par <@2>\n\
+         - un client Discord *natif*, par <@1>\n\
+         -# Inscriptions dans <#111> ou sur [la page du meetup](https://www.rust-lang.org/community). @everyone"
+    );
     model.messages.insert(
         101,
-        timeline.history(&[(
-            1440,
-            &marc,
-            "Le meetup de jeudi est confirmé : 19 h, salle B. Pensez à vous inscrire dans #général.",
-        )]),
+        timeline.history(&[
+            (
+                1440,
+                &marc,
+                "Le meetup de jeudi est confirmé : 19 h, salle B. Pensez à vous inscrire dans #général.",
+            ),
+            (30, &marc, &programme),
+        ]),
     );
     model.messages.insert(
         111,
@@ -179,6 +191,11 @@ pub fn model() -> Model {
                 "Le plus long c'est de passer de `update` à `logic` + `ui` sur `eframe::App`.",
             ),
             (
+                78,
+                &lea,
+                "```rust\nimpl eframe::App for Client {\n    fn logic(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {}\n    fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {}\n}\n```",
+            ),
+            (
                 42,
                 &me,
                 "Je démarre un client Discord natif dessus, sans navigateur embarqué.",
@@ -186,6 +203,11 @@ pub fn model() -> Model {
             (41, &me, "Objectif : ouvrir en moins d'une seconde 🚀"),
             (12, &sam, "Ça m'intéresse, tu publies le repo ?"),
             (3, &me, "Oui, il est public dès aujourd'hui."),
+            (
+                2,
+                &lea,
+                "> Objectif : ouvrir en moins d'une seconde 🚀\nJ'ai testé : ||0,4 s à froid, pari tenu||",
+            ),
         ]),
     );
     model.messages.insert(
