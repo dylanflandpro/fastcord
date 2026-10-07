@@ -40,7 +40,8 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
   the demo app with synthetic keys (`ui::tests::show`).
 - Replies: `model::Reply` keeps what a reply answers (`Original`: shown, deleted when
   Discord sends null, unknown when it sends nothing) and whether it pinged, which an
-  edit (quiet `allowed_mentions`) and a retry keep. `markdown::reply_snippet` is the
+  edit (quiet `allowed_mentions`, also when the original is not loaded: never a ping by
+  guess), a retry and a draft put back keep. `markdown::reply_snippet` is the
   line above it.
 - `outbox.rs`: messages, edits and deletions (`backend::Write`) leave one at a time, in
   order; a failed message fails the channel's later messages unsent. Edits and

@@ -6,7 +6,7 @@ use crate::compose::Unsent;
 use crate::events::Update;
 use crate::media::{self, Media};
 use crate::model::{
-    Ack, ChannelKind, Delivery, Emoji, Id, Message, Model, Original, ReactionRequest, ReplyTo,
+    Ack, ChannelKind, Delivery, Emoji, Id, Message, Model, ReactionRequest, ReplyTo,
 };
 use crate::notify::{self, Attention};
 use crate::theme::{self, Catalog, Palette};
@@ -424,9 +424,10 @@ impl Composer {
             return Saved::ConfirmDelete(channel, id);
         }
         editing.saving = true;
-        // A reply that did not ping stays quiet, as the web client keeps it.
-        let reply = message.reply.as_deref();
-        let quiet = reply.is_some_and(|r| matches!(r.original, Original::Shown(..)) && !r.ping);
+        // A reply that did not ping stays quiet, as the web client keeps
+        // it. Whatever is not known of it (an original not loaded) counts
+        // as not pinged: an edit never pings by guess.
+        let quiet = message.reply.as_deref().is_some_and(|r| !r.ping);
         Saved::Edit(Write::Edit {
             place: place(model, channel),
             id,
@@ -452,12 +453,14 @@ impl Composer {
         if !model.can_send(channel) {
             return None;
         }
-        // A reply goes again as it went, pinging or not.
+        // A reply goes again as it went, pinging or not; one whose original
+        // is gone meanwhile goes as a plain message, as `send` does.
         let failed = model.message(channel, nonce).and_then(|m| m.reply.as_ref());
         let reply = failed.map(|r| ReplyTo {
             message: r.id,
             ping: r.ping,
         });
+        let reply = reply.filter(|r| model.message(channel, r.message).is_some());
         let content = model.resend(channel, nonce)?;
         Some(self.posting(model, channel, nonce, content, reply))
     }
@@ -555,6 +558,10 @@ impl Composer {
             draft.push('\n');
         }
         draft.push_str(&posted.content);
+        // It answered a message: the draft answers it again, as it did.
+        if let Some(reply) = posted.reply {
+            self.replies.entry(posted.channel).or_insert(reply);
+        }
     }
 
     fn next_id(&mut self, now: jiff::Timestamp) -> Id {
@@ -1325,6 +1332,7 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Original;
 
     #[test]
     fn history_is_asked_for_once_then_page_by_page_to_the_start() {
@@ -1772,6 +1780,38 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_put_back_or_retried_keeps_what_it_answers() {
+        let mut model = crate::demo::model();
+        let mut composer = Composer::default();
+        let (_, sam) = general(&model);
+        let quiet = ReplyTo {
+            message: sam,
+            ping: false,
+        };
+        composer.replies.insert(111, quiet);
+        composer.drafts.insert(111, "oui".into());
+        let first = composer.send(&mut model, 111, now()).unwrap().nonce;
+        composer.settled(&mut model, 111, first, Delivery::Failed(None));
+        // Put back in the draft by a new READY: it answers Sam again.
+        let history = model.messages.remove(&111).unwrap();
+        composer.after_ready();
+        assert_eq!(composer.drafts[&111], "oui");
+        assert_eq!(composer.replies[&111], quiet);
+        // Retried after Sam's message went: a plain message, as send does.
+        model.messages.insert(111, history);
+        composer.replies.clear();
+        composer.drafts.insert(111, "encore".into());
+        composer.replies.insert(111, quiet);
+        let second = composer.send(&mut model, 111, now()).unwrap().nonce;
+        composer.settled(&mut model, 111, second, Delivery::Failed(None));
+        model.apply(Update::MessageDelete {
+            channel: 111,
+            ids: vec![sam],
+        });
+        assert_eq!(composer.retry(&mut model, 111, second).unwrap().reply, None);
+    }
+
+    #[test]
     fn editing_a_quiet_reply_keeps_it_quiet() {
         let mut model = crate::demo::model();
         let mut composer = Composer::default();
@@ -1794,13 +1834,13 @@ mod tests {
         reply.ping = false;
         assert!(edited(&mut composer, &model));
         composer.editing = None;
-        // Unless its original is not known: as the web client, no guess.
+        // Its original not loaded: still quiet, never a ping by guess.
         let reply = model.messages.get_mut(&111).unwrap()[8]
             .reply
             .as_mut()
             .unwrap();
         reply.original = Original::Unknown;
-        assert!(!edited(&mut composer, &model));
+        assert!(edited(&mut composer, &model));
     }
 
     #[test]
