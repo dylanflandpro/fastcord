@@ -8,6 +8,7 @@ mod credentials;
 mod demo;
 mod events;
 mod gateway;
+mod markdown;
 mod model;
 mod remote_auth;
 mod theme;
