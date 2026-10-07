@@ -2,7 +2,7 @@
 
 mod sign_in;
 
-use crate::app::{self, App, HistoryStatus, ScrollAnchor, Selection, View};
+use crate::app::{self, App, Composer, HistoryStatus, ScrollAnchor, Selection, View};
 use crate::backend::{Command, Link};
 use crate::markdown::{self, Action, Block, Content, Directory, Span, Style};
 use crate::media::{self, Media, Picture, Shown};
@@ -17,7 +17,7 @@ use egui::{
     Align2, Color32, CornerRadius, CursorIcon, FontId, Frame, Galley, Margin, Rect, Response,
     Sense, Stroke, Vec2,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -40,10 +40,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         let selection = &mut app.selection;
         rail(selection, model, &palette, ui);
         sidebar(selection, model, &palette, ui);
-        let drafts = &mut app.composer.drafts;
+        let state = &mut app.composer;
         let send = selection
             .channel
-            .filter(|&channel| composer(channel, model, drafts, &palette, ui));
+            .filter(|&channel| composer(channel, model, state, &palette, ui));
         let (request, bottom) =
             conversation(selection, model, &palette, status, &mut app.media, ui);
         (request, bottom, send)
@@ -86,7 +86,7 @@ const NO_PERMISSION: &str = "You do not have permission to send messages in this
 fn composer(
     channel: Id,
     model: &Model,
-    drafts: &mut HashMap<Id, String>,
+    state: &mut Composer,
     palette: &Palette,
     ui: &mut egui::Ui,
 ) -> bool {
@@ -112,7 +112,12 @@ fn composer(
                     ui.label(text.font(theme::regular(15.0)));
                     return;
                 }
-                let draft = drafts.entry(channel).or_default();
+                // Why the draft was not sent (a command fastcord lacks).
+                if let Some((_, notice)) = state.notice.as_ref().filter(|(c, _)| *c == channel) {
+                    let text = egui::RichText::new(notice).font(theme::regular(13.0));
+                    ui.label(text.color(palette.warning));
+                }
+                let draft = state.drafts.entry(channel).or_default();
                 let id = egui::Id::new(("composer", channel));
                 let hint = egui::RichText::new(model.placeholder(channel)).color(palette.dim);
                 // Grows with the draft up to a part of the window, then
@@ -146,6 +151,9 @@ fn composer(
                     edit.request_focus();
                 }
                 send = edit.has_focus() && ui.input(|i| enter_sends(&i.events));
+                if edit.changed() {
+                    state.notice = None;
+                }
                 if let Some(left) = crate::compose::counter(draft) {
                     let color = if left < 0 {
                         palette.danger
@@ -750,11 +758,27 @@ fn enter_sends(events: &[egui::Event]) -> bool {
     })
 }
 
-/// How opaque a message's content is drawn: half while on its way.
+/// How opaque a message's content is drawn: half until Discord has it.
 fn opacity(delivery: &Delivery) -> f32 {
     match delivery {
-        Delivery::Sending => 0.5,
+        Delivery::Sending | Delivery::Held(_) | Delivery::Unsure => 0.5,
         Delivery::Sent | Delivery::Failed(_) => 1.0,
+    }
+}
+
+/// The line under a message that waits: Discord asked to slow down, or its
+/// answer was lost.
+fn waiting_note(delivery: &Delivery, now: jiff::Timestamp) -> Option<String> {
+    match delivery {
+        Delivery::Held(until) => {
+            let left = until.duration_since(now).as_secs_f64().ceil().max(0.0);
+            Some(match left {
+                0.0 => "Discord asked to slow down: sending…".into(),
+                _ => format!("Discord asked to slow down: sending in {left} s."),
+            })
+        }
+        Delivery::Unsure => Some("Not sure it went through: waiting for Discord to say.".into()),
+        _ => None,
     }
 }
 
@@ -762,6 +786,47 @@ fn opacity(delivery: &Delivery) -> f32 {
 /// client's words when it gave none (the network was down).
 fn failure_text(reason: Option<&str>) -> &str {
     reason.unwrap_or("Message failed to send.")
+}
+
+/// A small button whose id comes from `key` (what it acts on), never from
+/// its place in the drawing order. egui credits a click to the widget
+/// pressed, by id: a layout that shifts between press and release (a page
+/// landing above, a message going) must not hand it to another message's.
+fn keyed_button(
+    ui: &mut egui::Ui,
+    key: impl std::hash::Hash + std::fmt::Debug,
+    text: impl Into<egui::WidgetText>,
+) -> Response {
+    // Placed in the row like any widget (a child Ui would not wrap with a
+    // wrapped row), then made clickable under its own id, and painted as
+    // egui paints a small button.
+    let galley = text.into().into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+    let padding = egui::vec2(ui.spacing().button_padding.x, 0.0);
+    let (rect, _) = ui.allocate_exact_size(galley.size() + 2.0 * padding, Sense::hover());
+    let response = ui.interact(rect, egui::Id::new(key), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let frame = rect.expand(visuals.expansion);
+        let painter = ui.painter();
+        painter.rect(
+            frame,
+            visuals.corner_radius,
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(
+            rect.center() - galley.size() / 2.0,
+            galley,
+            visuals.text_color(),
+        );
+    }
+    response
 }
 
 /// What is asked of a message that failed.
@@ -808,6 +873,12 @@ fn message_line(
         embeds(ui, &body, media, &message.embeds);
     });
     reactions(ui, palette, message);
+    if let Some(note) = waiting_note(&message.delivery, reader.clock.now) {
+        let text = egui::RichText::new(note).font(theme::regular(12.0));
+        ui.label(text.color(palette.secondary));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(500));
+    }
     let Delivery::Failed(reason) = &message.delivery else {
         return None;
     };
@@ -816,10 +887,10 @@ fn message_line(
         let text = egui::RichText::new(failure_text(reason.as_deref()));
         let text = text.font(theme::regular(12.0));
         ui.label(text.color(palette.danger));
-        if ui.small_button("Retry").clicked() {
+        if keyed_button(ui, ("retry", message.id), "Retry").clicked() {
             failure = Some(Failure::Retry);
         }
-        if ui.small_button("Delete").clicked() {
+        if keyed_button(ui, ("discard", message.id), "Delete").clicked() {
             failure = Some(Failure::Delete);
         }
     });
@@ -1832,6 +1903,172 @@ mod tests {
         assert_eq!(
             clock.label("2026-10-06T12:05:00Z".parse().unwrap()),
             "06/10/2026 14:05"
+        );
+    }
+
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// Draws one frame, headless, with these events.
+    fn frame(ctx: &egui::Context, events: Vec<egui::Event>, draw: impl FnMut(&mut egui::Ui)) {
+        let input = egui::RawInput {
+            events,
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 700.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, draw);
+        // Nothing renders: the font atlas is never uploaded.
+        output.textures_delta.clear();
+    }
+
+    /// Draws the composer for one frame, headless, with these events.
+    fn compose(
+        ctx: &egui::Context,
+        model: &Model,
+        state: &mut Composer,
+        channel: Id,
+        events: Vec<egui::Event>,
+    ) -> bool {
+        let mut sent = false;
+        frame(ctx, events, |ui| {
+            sent = composer(channel, model, state, &Palette::dark(), ui);
+        });
+        sent
+    }
+
+    #[test]
+    fn the_composer_sends_on_enter_and_breaks_lines_on_shift_enter() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let model = crate::demo::model();
+        let mut state = Composer::default();
+        // Opening the channel focuses the composer: typing goes there.
+        assert!(!compose(&ctx, &model, &mut state, 111, vec![]));
+        let typed = vec![egui::Event::Text("salut".into())];
+        assert!(!compose(&ctx, &model, &mut state, 111, typed));
+        let shift = key(egui::Key::Enter, egui::Modifiers::SHIFT);
+        assert!(!compose(&ctx, &model, &mut state, 111, vec![shift]));
+        assert_eq!(state.drafts[&111], "salut\n");
+        let enter = key(egui::Key::Enter, egui::Modifiers::NONE);
+        assert!(compose(&ctx, &model, &mut state, 111, vec![enter.clone()]));
+        // A notice goes once the draft changes.
+        state.notice = Some((111, "/nick is not available in fastcord yet.".into()));
+        compose(&ctx, &model, &mut state, 111, vec![]);
+        assert!(state.notice.is_some());
+        compose(
+            &ctx,
+            &model,
+            &mut state,
+            111,
+            vec![egui::Event::Text("!".into())],
+        );
+        assert_eq!(state.notice, None);
+        // Where I may not write, there is nothing to type in.
+        assert!(!compose(&ctx, &model, &mut state, 101, vec![]));
+        assert!(!compose(&ctx, &model, &mut state, 101, vec![enter]));
+        assert!(!state.drafts.contains_key(&101));
+    }
+
+    #[test]
+    fn enter_sends_but_shift_enter_does_not() {
+        assert!(enter_sends(&[key(egui::Key::Enter, egui::Modifiers::NONE)]));
+        assert!(!enter_sends(&[key(
+            egui::Key::Enter,
+            egui::Modifiers::SHIFT
+        )]));
+        assert!(!enter_sends(&[key(egui::Key::A, egui::Modifiers::NONE)]));
+    }
+
+    #[test]
+    fn a_keyed_button_keeps_its_id_whatever_is_drawn_before_it() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let ids = |before: usize| {
+            let mut ids = None;
+            frame(&ctx, vec![], |ui| {
+                for _ in 0..before {
+                    let _ = ui.small_button("autre");
+                }
+                let keyed = keyed_button(ui, ("retry", 5_u64), "Retry").id;
+                let plain = ui.small_button("Retry").id;
+                ids = Some((keyed, plain));
+            });
+            ids.unwrap()
+        };
+        let (keyed, plain) = ids(0);
+        let (moved_keyed, moved_plain) = ids(2);
+        assert_eq!(keyed, moved_keyed);
+        assert_ne!(plain, moved_plain, "an auto id follows the drawing order");
+    }
+
+    #[test]
+    fn keyed_buttons_wrap_with_their_row() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let mut rects = None;
+        frame(&ctx, vec![], |ui| {
+            ui.allocate_ui(egui::vec2(140.0, 200.0), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let bound = ui.max_rect().right();
+                    let note = ui.label("Message failed to send.").rect;
+                    let retry = keyed_button(ui, ("retry", 5_u64), "Retry").rect;
+                    let delete = keyed_button(ui, ("discard", 5_u64), "Delete").rect;
+                    rects = Some((bound, note, retry, delete));
+                });
+            });
+        });
+        let (bound, note, retry, delete) = rects.unwrap();
+        // Narrow: the buttons go to the next line rather than off the edge.
+        assert!(retry.right() <= bound + 0.5 && delete.right() <= bound + 0.5);
+        assert!(delete.top() > note.top(), "wrapped");
+        assert!(
+            retry.width() > 10.0 && delete.width() > 10.0,
+            "not squashed"
+        );
+    }
+
+    #[test]
+    fn waiting_messages_say_why() {
+        let now: jiff::Timestamp = "2026-10-07T12:00:00Z".parse().unwrap();
+        let held = |s| Delivery::Held(now + jiff::SignedDuration::from_millis(s));
+        let note = |delivery| waiting_note(&delivery, now);
+        assert_eq!(
+            note(held(12_300)).unwrap(),
+            "Discord asked to slow down: sending in 13 s."
+        );
+        assert_eq!(
+            note(held(-1)).unwrap(),
+            "Discord asked to slow down: sending…"
+        );
+        assert!(
+            note(Delivery::Unsure)
+                .unwrap()
+                .starts_with("Not sure it went through")
+        );
+        assert_eq!(note(Delivery::Sending), None);
+        assert_eq!(opacity(&held(0)), 0.5);
+        assert_eq!(opacity(&Delivery::Unsure), 0.5);
+    }
+
+    #[test]
+    fn pending_messages_are_dimmed_and_failures_explained() {
+        assert_eq!(opacity(&Delivery::Sending), 0.5);
+        assert_eq!(opacity(&Delivery::Failed(None)), 1.0);
+        assert_eq!(opacity(&Delivery::Sent), 1.0);
+        assert_eq!(failure_text(None), "Message failed to send.");
+        assert_eq!(
+            failure_text(Some("Slowmode is enabled.")),
+            "Slowmode is enabled."
         );
     }
 }

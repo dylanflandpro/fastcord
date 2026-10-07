@@ -138,6 +138,24 @@ struct NewMessage<'a> {
     flags: u64,
 }
 
+/// A channel, and its guild (`None` for a DM): where a request is made
+/// from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Place {
+    pub channel: Id,
+    pub guild: Option<Id>,
+}
+
+impl Place {
+    /// The page the web client would be on.
+    fn page(self) -> String {
+        match self.guild {
+            Some(guild) => format!("/channels/{guild}/{}", self.channel),
+            None => format!("/channels/@me/{}", self.channel),
+        }
+    }
+}
+
 fn new_message(content: &str, nonce: Id) -> NewMessage<'_> {
     NewMessage {
         mobile_network_type: "unknown",
@@ -148,15 +166,79 @@ fn new_message(content: &str, nonce: Id) -> NewMessage<'_> {
     }
 }
 
-/// Why a message was not sent.
+/// How far one try at a request that changes something got.
 #[derive(Debug, PartialEq)]
-pub enum SendError {
-    /// The token is no longer valid.
+pub enum Attempt {
+    /// Discord answered; its body, when it could be read.
+    Answered { status: u16, body: Option<String> },
+    /// No connection: the request never reached Discord.
+    Unreachable,
+    /// It left, but no answer came back: it may have arrived.
+    Lost,
+}
+
+/// What an attempt means, as the web client's message queue reads it.
+#[derive(Debug, PartialEq)]
+pub enum Verdict {
+    /// Done; the stored message, when the answer could be read.
+    Sent(Option<String>),
+    /// Rate limited: try again after this long, the wait Discord asked for.
+    Wait(Duration),
+    /// The token was refused.
     Unauthorized,
-    /// No answer, or one that could not be read.
-    Network,
-    /// Discord said no, in its own words when it gave some.
+    /// Not done, in Discord's words when it gave some (slowmode, a missing
+    /// permission).
     Refused(Option<String>),
+    /// Maybe done: the answer was lost.
+    Unsure,
+}
+
+/// How many times a rate-limited write is tried again, and the longest wait
+/// taken: longer than that, Discord's refusal stands.
+const WRITE_RETRIES: u32 = 3;
+const LONGEST_WAIT: Duration = Duration::from_secs(5 * 60);
+
+/// The status comes first: a success is one whatever its body.
+pub fn verdict(attempt: &Attempt, retries: u32) -> Verdict {
+    let (status, body) = match attempt {
+        Attempt::Answered { status, body } => (*status, body.as_deref()),
+        Attempt::Unreachable => return Verdict::Refused(None),
+        Attempt::Lost => return Verdict::Unsure,
+    };
+    if (200..300).contains(&status) {
+        return Verdict::Sent(body.map(str::to_owned));
+    }
+    if status == 401 {
+        return Verdict::Unauthorized;
+    }
+    let refusal = body.and_then(|body| serde_json::from_str::<Refusal>(body).ok());
+    let code = refusal.as_ref().map_or(0, |r| r.code);
+    let wait = body
+        .and_then(|body| serde_json::from_str::<RateLimited>(body).ok())
+        .map(|limited| server_wait(limited.retry_after));
+    if status == 429 && code != SLOWMODE && retries < WRITE_RETRIES {
+        let wait = wait.unwrap_or(Duration::from_secs(1));
+        if wait <= LONGEST_WAIT {
+            return Verdict::Wait(wait);
+        }
+    }
+    // Status and code only: the reason may quote what was sent.
+    log::warn!("a write failed with HTTP {status} (code {code})");
+    if body.is_some_and(|body| serde_json::from_str::<Challenge>(body).is_ok()) {
+        return Verdict::Refused(Some(
+            "Discord asked for a captcha, which fastcord cannot show here yet.".into(),
+        ));
+    }
+    Verdict::Refused(refusal.and_then(|r| r.message))
+}
+
+/// The wait Discord asked for, in full.
+fn server_wait(seconds: f64) -> Duration {
+    if seconds.is_finite() && seconds > 0.0 {
+        Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX)
+    } else {
+        Duration::from_millis(500)
+    }
 }
 
 /// Discord's error body (`{"code": 50013, "message": "Missing Permissions"}`).
@@ -601,65 +683,31 @@ impl Api {
         reacted(status.as_u16(), wait)
     }
 
-    /// Posts a message as the web client does, from the channel's page.
-    /// Rate limits are waited out like [`Self::messages`]; slowmode is not,
-    /// as the official client does. The answer is the message as stored.
+    /// Posts a message as the web client does, once: the caller reads the
+    /// attempt with [`verdict`] and waits out rate limits.
     pub async fn send_message(
         &self,
         token: &Token,
-        channel: Id,
-        guild: Option<Id>,
+        place: Place,
         nonce: Id,
         content: &str,
-    ) -> Result<String, SendError> {
+    ) -> Attempt {
+        let url = format!("{BASE}/channels/{}/messages", place.channel);
+        let request = self.client.post(url).json(&new_message(content, nonce));
+        self.attempt(token, place, request).await
+    }
+
+    /// One try at a request that changes something, from the channel's page.
+    async fn attempt(&self, token: &Token, place: Place, request: RequestBuilder) -> Attempt {
         let web = self.web().await;
-        let page = match guild {
-            Some(guild) => format!("/channels/{guild}/{channel}"),
-            None => format!("/channels/@me/{channel}"),
-        };
-        let body = new_message(content, nonce);
-        let mut retries = 0;
-        loop {
-            let response = Self::dress(
-                self.client
-                    .post(format!("{BASE}/channels/{channel}/messages"))
-                    .header(reqwest::header::AUTHORIZATION, token.expose())
-                    .json(&body),
-                &web,
-                &page,
-            )
-            .send()
-            .await
-            .map_err(|_| SendError::Network)?;
-            let status = response.status();
-            let text = response.text().await.map_err(|_| SendError::Network)?;
-            if status.is_success() {
-                return Ok(text);
-            }
-            if status == reqwest::StatusCode::UNAUTHORIZED {
-                return Err(SendError::Unauthorized);
-            }
-            let refusal = serde_json::from_str::<Refusal>(&text).ok();
-            let code = refusal.as_ref().map_or(0, |r| r.code);
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                && code != SLOWMODE
-                && retries < RATE_LIMIT_RETRIES
-            {
-                retries += 1;
-                let wait = serde_json::from_str::<RateLimited>(&text)
-                    .map_or(MAX_RETRY_AFTER, |limited| retry_after(limited.retry_after));
-                log::info!("rate limited; retrying in {} ms", wait.as_millis());
-                tokio::time::sleep(wait).await;
-                continue;
-            }
-            // Status and code only: the reason may quote what was sent.
-            log::warn!("sending a message failed with HTTP {status} (code {code})");
-            if serde_json::from_str::<Challenge>(&text).is_ok() {
-                return Err(SendError::Refused(Some(
-                    "Discord asked for a captcha, which fastcord cannot show here yet.".into(),
-                )));
-            }
-            return Err(SendError::Refused(refusal.and_then(|r| r.message)));
+        let request = request.header(reqwest::header::AUTHORIZATION, token.expose());
+        match Self::dress(request, &web, &place.page()).send().await {
+            Err(error) if error.is_connect() => Attempt::Unreachable,
+            Err(_) => Attempt::Lost,
+            Ok(response) => Attempt::Answered {
+                status: response.status().as_u16(),
+                body: response.text().await.ok(),
+            },
         }
     }
 
@@ -913,6 +961,80 @@ mod tests {
         assert_eq!(
             body,
             r#"{"mobile_network_type":"unknown","content":"salut :)","nonce":"1425000000000000000","tts":false,"flags":0}"#
+        );
+    }
+
+    #[test]
+    fn verdicts_read_the_status_first() {
+        let answered = |status, body: &str| Attempt::Answered {
+            status,
+            body: Some(body.to_owned()),
+        };
+        let sent = Attempt::Answered {
+            status: 200,
+            body: None,
+        };
+        assert_eq!(
+            verdict(&sent, 0),
+            Verdict::Sent(None),
+            "an unreadable body still sent it"
+        );
+        assert_eq!(
+            verdict(&answered(200, "{}"), 0),
+            Verdict::Sent(Some("{}".into()))
+        );
+        assert_eq!(verdict(&answered(401, "{}"), 0), Verdict::Unauthorized);
+        assert_eq!(verdict(&Attempt::Lost, 0), Verdict::Unsure);
+        assert_eq!(verdict(&Attempt::Unreachable, 0), Verdict::Refused(None));
+        let limited = answered(
+            429,
+            r#"{"message":"You are being rate limited.","retry_after":42.5,"global":false}"#,
+        );
+        assert_eq!(
+            verdict(&limited, 0),
+            Verdict::Wait(Duration::from_millis(42_500)),
+            "in full"
+        );
+        let refused = Verdict::Refused(Some("You are being rate limited.".into()));
+        assert_eq!(verdict(&limited, WRITE_RETRIES), refused);
+        let slowmode = answered(
+            429,
+            r#"{"message":"Slowmode is enabled.","code":20016,"retry_after":3}"#,
+        );
+        assert_eq!(
+            verdict(&slowmode, 0),
+            Verdict::Refused(Some("Slowmode is enabled.".into()))
+        );
+        let forbidden = answered(403, r#"{"message":"Missing Permissions","code":50013}"#);
+        assert_eq!(
+            verdict(&forbidden, 0),
+            Verdict::Refused(Some("Missing Permissions".into()))
+        );
+        let captcha = answered(
+            400,
+            r#"{"captcha_key":["captcha-required"],"captcha_sitekey":"x"}"#,
+        );
+        assert!(matches!(verdict(&captcha, 0), Verdict::Refused(Some(r)) if r.contains("captcha")));
+        assert_eq!(verdict(&answered(502, "<html>"), 0), Verdict::Refused(None));
+    }
+
+    #[test]
+    fn places_are_their_pages() {
+        assert_eq!(
+            Place {
+                channel: 7,
+                guild: None
+            }
+            .page(),
+            "/channels/@me/7"
+        );
+        assert_eq!(
+            Place {
+                channel: 7,
+                guild: Some(1)
+            }
+            .page(),
+            "/channels/1/7"
         );
     }
 

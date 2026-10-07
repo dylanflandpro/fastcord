@@ -409,9 +409,21 @@ pub enum Delivery {
     /// Written here and on its way, shown dimmed. Until Discord confirms it,
     /// its id is the nonce it was sent with.
     Sending,
+    /// On its way, after Discord asked to slow down: it goes at this time.
+    Held(jiff::Timestamp),
+    /// The answer was lost, so it may have arrived: no Retry until the
+    /// gateway has had the chance to say (a duplicate would follow).
+    Unsure,
     /// Not sent: shown in red with Retry and Delete, with Discord's reason
     /// when it gave one (slowmode, a missing permission).
     Failed(Option<String>),
+}
+
+impl Delivery {
+    /// On its way: dimmed, and nothing to do yet.
+    pub fn in_flight(&self) -> bool {
+        matches!(self, Self::Sending | Self::Held(_))
+    }
 }
 
 /// The nonce for a message sent at `now`: a snowflake for that moment, as
@@ -635,28 +647,48 @@ impl Model {
             .find(|m| m.id == nonce && m.delivery != Delivery::Sent)
     }
 
-    /// Discord did not take the message sent with `nonce`. One it confirmed
-    /// meanwhile (through the gateway) stays sent.
-    pub fn send_failed(&mut self, channel: Id, nonce: Id, reason: Option<String>) {
-        if let Some(message) = self.unconfirmed(channel, nonce)
-            && message.delivery == Delivery::Sending
-        {
-            message.delivery = Delivery::Failed(reason);
+    /// What became of the message sent with `nonce`, unless Discord
+    /// confirmed it meanwhile (it stays sent) or it already failed. `false`
+    /// when there is no copy of it to show it on.
+    pub fn send_settled(&mut self, channel: Id, nonce: Id, delivery: Delivery) -> bool {
+        let Some(message) = self.unconfirmed(channel, nonce) else {
+            return false;
+        };
+        let failed = matches!(message.delivery, Delivery::Failed(_));
+        if !failed {
+            message.delivery = delivery;
         }
+        true
     }
 
-    /// Removes a message that failed (Delete) and hands back its text, so
-    /// Retry can send it again.
-    pub fn discard(&mut self, channel: Id, nonce: Id) -> Option<String> {
+    /// Discord did not take the message sent with `nonce`.
+    #[cfg(test)]
+    pub fn send_failed(&mut self, channel: Id, nonce: Id, reason: Option<String>) -> bool {
+        self.send_settled(channel, nonce, Delivery::Failed(reason))
+    }
+
+    /// Retry: a failed message goes again, under the same nonce, so a copy
+    /// that did arrive after all confirms it rather than doubling it. Its
+    /// text, to send.
+    pub fn resend(&mut self, channel: Id, nonce: Id) -> Option<String> {
         let message = self.unconfirmed(channel, nonce)?;
-        if message.delivery == Delivery::Sending {
+        if !matches!(message.delivery, Delivery::Failed(_)) {
             return None;
         }
-        let content = std::mem::take(&mut message.content);
-        self.messages
-            .get_mut(&channel)?
-            .retain(|m| m.id != nonce || m.delivery == Delivery::Sent);
-        Some(content)
+        message.delivery = Delivery::Sending;
+        Some(message.content.clone())
+    }
+
+    /// Delete on a message that failed: it goes.
+    pub fn discard(&mut self, channel: Id, nonce: Id) -> bool {
+        let failed = self.unconfirmed(channel, nonce);
+        if !failed.is_some_and(|m| matches!(m.delivery, Delivery::Failed(_))) {
+            return false;
+        }
+        if let Some(loaded) = self.messages.get_mut(&channel) {
+            loaded.retain(|m| m.id != nonce || m.delivery == Delivery::Sent);
+        }
+        true
     }
 
     /// Drops what was loaded for a channel that went away.
@@ -2011,14 +2043,53 @@ mod tests {
     fn a_failed_message_can_be_retried_or_deleted() {
         let mut model = conversation();
         model.add_pending(8, 100, "ok".into());
-        assert_eq!(model.discard(8, 100), None, "still on its way");
+        assert!(!model.discard(8, 100), "still on its way");
+        assert_eq!(model.resend(8, 100), None, "still on its way");
         let reason = Some("Slowmode is enabled.".to_owned());
-        model.send_failed(8, 100, reason.clone());
+        assert!(model.send_failed(8, 100, reason.clone()));
         assert_eq!(model.messages(8)[1].delivery, Delivery::Failed(reason));
-        assert_eq!(model.discard(8, 100).as_deref(), Some("ok"));
+        // Retry: the same message, the same nonce, on its way again.
+        assert_eq!(model.resend(8, 100).as_deref(), Some("ok"));
+        assert_eq!(deliveries(&model)[1], (100, Delivery::Sending));
+        model.send_failed(8, 100, None);
+        assert!(model.discard(8, 100));
         assert_eq!(deliveries(&model), [(5, Delivery::Sent)]);
-        // A sent message is never discarded.
-        assert_eq!(model.discard(8, 5), None);
+        // A sent message is never discarded; a gone one reports it.
+        assert!(!model.discard(8, 5));
+        assert!(!model.send_failed(8, 100, None));
+    }
+
+    #[test]
+    fn a_lost_answer_or_a_wait_keeps_it_unconfirmed() {
+        let mut model = conversation();
+        model.add_pending(8, 100, "ok".into());
+        let at: jiff::Timestamp = "2026-10-07T12:00:00Z".parse().unwrap();
+        model.send_settled(8, 100, Delivery::Held(at));
+        assert!(model.messages(8)[1].delivery.in_flight());
+        model.send_settled(8, 100, Delivery::Unsure);
+        assert_eq!(model.messages(8)[1].delivery, Delivery::Unsure);
+        assert!(
+            !model.discard(8, 100) && model.resend(8, 100).is_none(),
+            "no Retry yet"
+        );
+        // The gateway's copy confirms it.
+        use crate::events::Update;
+        model.apply(Update::MessageCreate {
+            channel: 8,
+            guild: None,
+            ping: Ping::default(),
+            message: said(101, ME, "ok"),
+            nonce: Some(100),
+        });
+        assert_eq!(
+            deliveries(&model),
+            [(5, Delivery::Sent), (101, Delivery::Sent)]
+        );
+        // A failure then changes nothing; one before settles it.
+        model.add_pending(8, 102, "deux".into());
+        model.send_failed(8, 102, None);
+        model.send_settled(8, 102, Delivery::Unsure);
+        assert_eq!(deliveries(&model)[2], (102, Delivery::Failed(None)));
     }
 
     #[test]

@@ -4,12 +4,13 @@
 //! never waits on the network. Each event asks the window for a repaint.
 
 use crate::acks::{AckQueue, Delivery, backoff};
-use crate::api::{self, Api};
+use crate::api::{self, Api, Attempt, Place, Verdict};
 use crate::credentials::{self, Token};
 use crate::events::{Decoder, Update};
 use crate::gateway::{self, End, Gateway};
 use crate::model::{Ack, Id, Model, ReactionRequest, User};
 use crate::notify::{self, Notice, Notifications};
+use crate::outbox::Outbox;
 use crate::remote_auth::{self, Progress};
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
@@ -49,11 +50,9 @@ pub enum Command {
     Send(Outgoing),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Outgoing {
-    pub channel: Id,
-    /// The channel's guild, `None` for a DM: the page it is sent from.
-    pub guild: Option<Id>,
+    pub place: Place,
     pub nonce: Id,
     pub content: String,
 }
@@ -114,13 +113,26 @@ pub enum Event {
         nonce: Id,
         reason: Option<String>,
     },
+    /// The answer to the message sent with `nonce` was lost: it may have
+    /// arrived, which the gateway will tell.
+    SendUnsure {
+        channel: Id,
+        nonce: Id,
+    },
+    /// Discord asked to slow down: the message goes in `wait`.
+    SendHeld {
+        channel: Id,
+        nonce: Id,
+        wait: Duration,
+    },
 }
 
 pub struct Backend {
     commands: UnboundedSender<Command>,
     events: mpsc::Receiver<Event>,
     thread: std::thread::JoinHandle<()>,
-    /// Whether acks wait or are on their way, which closing waits for.
+    /// Whether acks or messages wait or are on their way, which closing
+    /// waits for, a little while.
     acking: Arc<AtomicBool>,
     notifier: notify::Notifier,
 }
@@ -183,9 +195,10 @@ impl Backend {
         self.notifier.send(notice);
     }
 
-    /// Ends the backend as the window closes. Acks still waiting are sent
-    /// first: closing the commands ends the session, which sends them, and
-    /// the thread is given a little longer than that to finish.
+    /// Ends the backend as the window closes. Acks and messages still
+    /// waiting are sent first, for [`ACK_FLUSH`] at most: closing the
+    /// commands ends the session, which sends them, and the thread is given
+    /// a little longer than that to finish. What is left then is lost.
     pub fn close(self) {
         let Self {
             commands,
@@ -260,9 +273,23 @@ async fn session(
             notifications: RefCell::new(Notifications::new(alerts.shared.clone())),
             notify: alerts.notify,
         };
+        let post = |outgoing: Outgoing, token: Token| {
+            let api = &api;
+            async move {
+                let Outgoing {
+                    place,
+                    nonce,
+                    content,
+                } = &outgoing;
+                (
+                    api.send_message(&token, *place, *nonce, content).await,
+                    token,
+                )
+            }
+        };
         let ended = tokio::select! {
             ended = stay_connected(&api, &keyring, &token, &connection) => Some(ended),
-            served = serve(&mut commands, &api, &token, emit, &acks, busy, send) => match served {
+            served = serve(&mut commands, &api, &token, emit, &acks, busy, send, post) => match served {
                 Served::Closed => {
                     // The window is gone: so are the notifications it
                     // would open.
@@ -468,9 +495,13 @@ enum Served {
 }
 
 /// Answers the interface's requests while signed in. History pages load
-/// side by side; acks wait in `acks` and go out through `send`. Logging
-/// out or closing sends what still waits, giving it [`ACK_FLUSH`].
-async fn serve<S, F>(
+/// side by side; acks wait in `acks` and go out through `send`; messages
+/// wait in an [`Outbox`] and go out through `post`, one at a time. Logging
+/// out or closing sends the acks still waiting, and closing the messages
+/// too, giving them [`ACK_FLUSH`]; logging out drops the messages with the
+/// account.
+#[allow(clippy::too_many_arguments)]
+async fn serve<S, F, P, G>(
     commands: &mut UnboundedReceiver<Command>,
     api: &Api,
     token: &RefCell<Token>,
@@ -478,10 +509,13 @@ async fn serve<S, F>(
     acks: &RefCell<AckQueue>,
     busy: &AtomicBool,
     send: S,
+    post: P,
 ) -> Served
 where
     S: Fn(Ack, Token) -> F,
     F: Future<Output = (Delivery, Token)>,
+    P: Fn(Outgoing, Token) -> G,
+    G: Future<Output = (Attempt, Token)>,
 {
     while commands.try_recv().is_ok() {}
     let mut loading = FuturesUnordered::new();
@@ -506,26 +540,26 @@ where
             (ack, attempt, delivery, used)
         }
     };
-    let mut outbox = std::collections::VecDeque::new();
-    // One message in flight at most: see `Command::Send`.
+    let mut outbox = Outbox::default();
     let mut writing = FuturesUnordered::new();
     let served = loop {
-        if writing.is_empty()
-            && let Some(outgoing) = outbox.pop_front()
-        {
-            let token = Token::new(token.borrow().expose().to_owned());
-            writing.push(async move { post_message(api, &token, outgoing, emit).await });
+        if let Some(outgoing) = outbox.next() {
+            writing.push(send_one(&post, token, emit, outgoing));
         }
-        busy.store(!acks.borrow().is_empty(), Ordering::Relaxed);
+        busy.store(
+            !acks.borrow().is_empty() || !outbox.is_idle(),
+            Ordering::Relaxed,
+        );
         let due = acks.borrow().next_due();
         tokio::select! {
             command = commands.recv() => match command {
                 None => break Served::Closed,
                 Some(Command::LogOut) => break Served::LoggedOut,
                 Some(Command::LoadHistory { channel, guild, before }) => {
-                    let token = Token::new(token.borrow().expose().to_owned());
+                    let used = Token::new(token.borrow().expose().to_owned());
                     loading.push(async move {
-                        load_history(api, &token, channel, guild, before, emit).await
+                        let revoked = load_history(api, &used, channel, guild, before, emit).await;
+                        (revoked, used)
                     });
                 }
                 Some(Command::Ack(ack)) => acks.borrow_mut().push(ack, Instant::now()),
@@ -533,16 +567,17 @@ where
                 Some(Command::React(reaction)) => {
                     reacting.extend(reactions.request(reaction).map(&fly));
                 }
-                Some(Command::Send(outgoing)) => outbox.push_back(outgoing),
+                Some(Command::Send(outgoing)) => outbox.push(outgoing),
                 Some(Command::Retry) => {}
             },
-            Some(revoked) = writing.next(), if !writing.is_empty() => {
-                if revoked {
+            Some((outgoing, verdict, used)) = writing.next(), if !writing.is_empty() => {
+                if posted(&mut outbox, acks, token, emit, outgoing, verdict, &used) {
                     return Served::Revoked;
                 }
             }
-            Some(revoked) = loading.next(), if !loading.is_empty() => {
-                if revoked {
+            // Only the token in force: one rotated meanwhile is fine.
+            Some((revoked, used)) = loading.next(), if !loading.is_empty() => {
+                if revoked && used.expose() == token.borrow().expose() {
                     return Served::Revoked;
                 }
             }
@@ -570,13 +605,117 @@ where
             landed(acks, token, emit, ack, attempt, delivery, &used);
         }
     };
-    let _ = tokio::time::timeout(ACK_FLUSH, drain).await;
+    let closing = matches!(served, Served::Closed);
+    let flush = async {
+        if !closing {
+            return;
+        }
+        loop {
+            if let Some(outgoing) = outbox.next() {
+                writing.push(send_one(&post, token, emit, outgoing));
+            }
+            let Some((outgoing, verdict, used)) = writing.next().await else {
+                break;
+            };
+            posted(&mut outbox, acks, token, emit, outgoing, verdict, &used);
+        }
+    };
+    let _ = tokio::time::timeout(ACK_FLUSH, async { tokio::join!(drain, flush) }).await;
     busy.store(false, Ordering::Relaxed);
     served
 }
 
-/// How long logging out or closing waits for the acks still to send.
+/// How long logging out or closing waits for the acks (and, closing, the
+/// messages) still to send.
 const ACK_FLUSH: Duration = Duration::from_secs(2);
+
+/// One message, sent with the token in force at each try, rate limits
+/// waited out in full and reported (the window says Discord asked to slow
+/// down); what its last try came to.
+async fn send_one<P, G>(
+    post: &P,
+    token: &RefCell<Token>,
+    emit: Emit<'_>,
+    outgoing: Outgoing,
+) -> (Outgoing, Verdict, Token)
+where
+    P: Fn(Outgoing, Token) -> G,
+    G: Future<Output = (Attempt, Token)>,
+{
+    let mut retries = 0;
+    loop {
+        let used = Token::new(token.borrow().expose().to_owned());
+        let (attempt, used) = post(outgoing.clone(), used).await;
+        match api::verdict(&attempt, retries) {
+            Verdict::Wait(wait) => {
+                retries += 1;
+                let (channel, nonce) = (outgoing.place.channel, outgoing.nonce);
+                log::info!("rate limited; sending again in {} ms", wait.as_millis());
+                emit(Event::SendHeld {
+                    channel,
+                    nonce,
+                    wait,
+                });
+                tokio::time::sleep(wait).await;
+            }
+            verdict => return (outgoing, verdict, used),
+        }
+    }
+}
+
+/// Reports what a message came to. A failure takes the channel's messages
+/// queued after it along, unsent. `true` when Discord refused the token in
+/// force; a token rotated meanwhile sends the message again.
+fn posted(
+    outbox: &mut Outbox,
+    acks: &RefCell<AckQueue>,
+    token: &RefCell<Token>,
+    emit: Emit<'_>,
+    outgoing: Outgoing,
+    verdict: Verdict,
+    used: &Token,
+) -> bool {
+    let Place { channel, guild } = outgoing.place;
+    let nonce = outgoing.nonce;
+    match verdict {
+        Verdict::Sent(body) => {
+            outbox.landed(channel, false);
+            // My message reads the channel: no ack is owed for it.
+            acks.borrow_mut().cancel(channel);
+            // Unreadable, it still went through: the gateway's copy confirms it.
+            match body.as_deref().map(|body| crate::events::sent(body, guild)) {
+                Some(Ok(update)) => emit(Event::Update(update)),
+                Some(Err(error)) => log::warn!("unreadable sent message: {}", describe(&error)),
+                None => log::warn!("a sent message's answer could not be read"),
+            }
+            return false;
+        }
+        Verdict::Unauthorized if used.expose() == token.borrow().expose() => return true,
+        Verdict::Unauthorized => {
+            outbox.again(outgoing);
+            return false;
+        }
+        Verdict::Unsure => {
+            log::warn!("a message's answer was lost; waiting for the gateway");
+            emit(Event::SendUnsure { channel, nonce });
+        }
+        Verdict::Refused(reason) => emit(Event::SendFailed {
+            channel,
+            nonce,
+            reason,
+        }),
+        Verdict::Wait(_) => unreachable!("waited out in `send_one`"),
+    }
+    for later in outbox.landed(channel, true) {
+        let reason = None;
+        emit(Event::SendFailed {
+            channel,
+            nonce: later,
+            reason,
+        });
+    }
+    false
+}
 
 async fn sleep_until(due: Option<Instant>) {
     if let Some(due) = due {
@@ -811,42 +950,6 @@ async fn load_history(
             emit(Event::Update(update));
         }
         Err(()) => emit(Event::HistoryFailed { channel }),
-    }
-    false
-}
-
-/// Sends one message and reports how it went: the message as Discord stored
-/// it, or the failure. `true` when Discord says the token is no longer valid.
-async fn post_message(api: &Api, token: &Token, outgoing: Outgoing, emit: Emit<'_>) -> bool {
-    let Outgoing {
-        channel,
-        guild,
-        nonce,
-        content,
-    } = outgoing;
-    let failed = |reason| Event::SendFailed {
-        channel,
-        nonce,
-        reason,
-    };
-    match api
-        .send_message(token, channel, guild, nonce, &content)
-        .await
-    {
-        // Unreadable, it still went through: the gateway's copy confirms it.
-        Ok(body) => match crate::events::sent(&body, guild) {
-            Ok(update) => emit(Event::Update(update)),
-            Err(error) => log::warn!("unreadable sent message: {}", describe(&error)),
-        },
-        Err(api::SendError::Unauthorized) => {
-            emit(failed(None));
-            return true;
-        }
-        Err(api::SendError::Network) => {
-            log::warn!("sending a message failed: unable to reach Discord");
-            emit(failed(None));
-        }
-        Err(api::SendError::Refused(reason)) => emit(failed(reason)),
     }
     false
 }
@@ -1242,13 +1345,25 @@ mod tests {
             .block_on(test)
     }
 
-    /// A signed-in phase whose acks get `answers`, in turn, after
-    /// `commands` arrive; how it ended, the acks sent, and what it reported.
+    /// What a signed-in phase came to.
+    struct Phase {
+        served: Served,
+        /// Acks sent.
+        sent: usize,
+        /// Messages posted, by nonce, in order.
+        posted: Vec<Id>,
+        events: Vec<Event>,
+    }
+
+    /// A signed-in phase whose acks get `answers` and messages `posts`, in
+    /// turn, after `commands` arrive; the window closes two minutes later.
+    /// With `rotate`, the first token is replaced while a request flies.
     async fn session_with(
         commands: Vec<Command>,
         answers: Vec<Delivery>,
+        posts: Vec<Attempt>,
         rotate: bool,
-    ) -> (Served, usize, Vec<Event>) {
+    ) -> Phase {
         let api = Api::new();
         let token = RefCell::new(Token::new("first".into()));
         let acks = RefCell::new(AckQueue::default());
@@ -1256,7 +1371,10 @@ mod tests {
         let events = Mutex::new(Vec::new());
         let emit = |event: Event| events.lock().unwrap().push(event);
         let answers = RefCell::new(answers.into_iter());
+        let posts = RefCell::new(posts.into_iter());
         let sent = Cell::new(0);
+        let posted = RefCell::new(Vec::new());
+        let flying = Cell::new(0);
         let send = |_: Ack, used: Token| {
             sent.set(sent.get() + 1);
             let answer = answers.borrow_mut().next().expect("an answer");
@@ -1268,25 +1386,186 @@ mod tests {
                 (answer, used)
             }
         };
+        let post = |outgoing: Outgoing, used: Token| {
+            posted.borrow_mut().push(outgoing.nonce);
+            let attempt = posts.borrow_mut().next().expect("an answer to a message");
+            flying.set(flying.get() + 1);
+            let (token, flying) = (&token, &flying);
+            async move {
+                assert_eq!(flying.get(), 1, "one message at a time");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                flying.set(flying.get() - 1);
+                if rotate && used.expose() == "first" {
+                    *token.borrow_mut() = Token::new("second".into());
+                }
+                (attempt, used)
+            }
+        };
         let (sender, mut receiver) = unbounded_channel();
         let (served, ()) = tokio::join!(
-            serve(&mut receiver, &api, &token, &emit, &acks, &busy, send),
-            async {
+            serve(&mut receiver, &api, &token, &emit, &acks, &busy, send, post),
+            async move {
                 tokio::task::yield_now().await;
                 for command in commands {
                     sender.send(command).unwrap();
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
+                tokio::time::sleep(Duration::from_secs(120)).await;
             }
         );
-        (served, sent.get(), events.into_inner().unwrap())
+        Phase {
+            served,
+            sent: sent.get(),
+            posted: posted.into_inner(),
+            events: events.into_inner().unwrap(),
+        }
+    }
+
+    fn message(channel: Id, nonce: Id) -> Command {
+        Command::Send(Outgoing {
+            place: Place {
+                channel,
+                guild: Some(1),
+            },
+            nonce,
+            content: "salut".into(),
+        })
+    }
+
+    fn answered(status: u16, body: Option<&str>) -> Attempt {
+        let body = body.map(str::to_owned);
+        Attempt::Answered { status, body }
+    }
+
+    fn failures(events: &[Event]) -> Vec<(Id, Option<String>)> {
+        let failed = events.iter().filter_map(|event| match event {
+            Event::SendFailed { nonce, reason, .. } => Some((*nonce, reason.clone())),
+            _ => None,
+        });
+        failed.collect()
+    }
+
+    #[test]
+    fn messages_leave_one_at_a_time_in_order() {
+        let outcome = paused(session_with(
+            vec![message(7, 1), message(8, 2), message(7, 3)],
+            vec![],
+            vec![
+                answered(200, None),
+                answered(200, None),
+                answered(200, None),
+            ],
+            false,
+        ));
+        assert!(matches!(outcome.served, Served::Closed));
+        assert_eq!(outcome.posted, [1, 2, 3]);
+        // Sent, even with an answer that could not be read: no failure, and
+        // the gateway's copy will confirm them.
+        assert!(failures(&outcome.events).is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_message_reads_its_channel() {
+        let body = r#"{"id":"500","channel_id":"7","content":"salut","author":{"id":"1","username":"me"},"nonce":"1"}"#;
+        let outcome = paused(session_with(
+            vec![Command::Ack(ack(7, false)), message(7, 1)],
+            vec![],
+            vec![answered(200, Some(body))],
+            false,
+        ));
+        assert_eq!(outcome.sent, 0, "no ack is owed for it");
+        assert!(outcome.events.iter().any(|event| matches!(
+            event,
+            Event::Update(Update::MessageCreate {
+                guild: Some(1),
+                nonce: Some(1),
+                ..
+            })
+        )));
+    }
+
+    #[test]
+    fn a_failure_takes_its_channels_later_messages_along() {
+        let outcome = paused(session_with(
+            vec![message(7, 1), message(7, 2), message(8, 3)],
+            vec![],
+            vec![Attempt::Lost, answered(200, None)],
+            false,
+        ));
+        assert_eq!(outcome.posted, [1, 3]);
+        assert!(outcome.events.contains(&Event::SendUnsure {
+            channel: 7,
+            nonce: 1
+        }));
+        assert_eq!(failures(&outcome.events), [(2, None)]);
+    }
+
+    #[test]
+    fn refusals_and_rate_limits() {
+        let slow = r#"{"message":"You are being rate limited.","retry_after":30,"global":false}"#;
+        let slowmode = r#"{"message":"Slowmode is enabled.","code":20016,"retry_after":3}"#;
+        let outcome = paused(session_with(
+            vec![message(7, 1), message(8, 2)],
+            vec![],
+            vec![
+                answered(429, Some(slow)),
+                answered(200, None),
+                answered(429, Some(slowmode)),
+            ],
+            false,
+        ));
+        assert_eq!(outcome.posted, [1, 1, 2]);
+        let wait = Duration::from_secs(30);
+        assert!(outcome.events.contains(&Event::SendHeld {
+            channel: 7,
+            nonce: 1,
+            wait
+        }));
+        assert_eq!(
+            failures(&outcome.events),
+            [(2, Some("Slowmode is enabled.".into()))]
+        );
+    }
+
+    #[test]
+    fn a_401_on_a_message_ends_the_session_only_for_the_token_in_force() {
+        let refused = || answered(401, Some("{}"));
+        let outcome = paused(session_with(
+            vec![message(7, 1)],
+            vec![],
+            vec![refused()],
+            false,
+        ));
+        assert!(matches!(outcome.served, Served::Revoked));
+        // The token was replaced while it flew: the message goes again.
+        let outcome = paused(session_with(
+            vec![message(7, 1)],
+            vec![],
+            vec![refused(), answered(200, None)],
+            true,
+        ));
+        assert!(matches!(outcome.served, Served::Closed));
+        assert_eq!(outcome.posted, [1, 1]);
+    }
+
+    #[test]
+    fn logging_out_drops_the_messages_still_waiting() {
+        let outcome = paused(session_with(
+            vec![message(7, 1), message(7, 2), Command::LogOut],
+            vec![],
+            vec![answered(200, None)],
+            false,
+        ));
+        assert!(matches!(outcome.served, Served::LoggedOut));
+        assert_eq!(outcome.posted, [1]);
     }
 
     #[test]
     fn a_401_on_the_token_in_force_ends_the_session() {
-        let (served, sent, _) = paused(session_with(
+        let Phase { served, sent, .. } = paused(session_with(
             vec![Command::Ack(ack(5, true))],
             vec![Delivery::Unauthorized],
+            vec![],
             false,
         ));
         assert!(matches!(served, Served::Revoked));
@@ -1295,13 +1574,19 @@ mod tests {
 
     #[test]
     fn a_401_on_a_token_since_rotated_tries_again() {
-        let (served, sent, events) = paused(session_with(
+        let Phase {
+            served,
+            sent,
+            events,
+            ..
+        } = paused(session_with(
             vec![
                 Command::Ack(ack(5, true)),
                 Command::Ack(ack(6, false)),
                 Command::LogOut,
             ],
             vec![Delivery::Unauthorized, Delivery::Saved, Delivery::Saved],
+            vec![],
             true,
         ));
         assert!(matches!(served, Served::LoggedOut));
@@ -1319,9 +1604,10 @@ mod tests {
 
     #[test]
     fn failed_acks_come_back_until_saved() {
-        let (_, sent, events) = paused(session_with(
+        let Phase { sent, events, .. } = paused(session_with(
             vec![Command::Ack(ack(5, true)), Command::LogOut],
             vec![Delivery::Retry(None), Delivery::Saved],
+            vec![],
             false,
         ));
         assert_eq!(sent, 2);
@@ -1344,9 +1630,10 @@ mod tests {
                 sent.set(sent.get() + 1);
                 async move { (Delivery::Saved, used) }
             };
+            let post = |_: Outgoing, used: Token| async move { (Attempt::Lost, used) };
             let (sender, mut receiver) = unbounded_channel();
             tokio::select! {
-                _ = serve(&mut receiver, &api, &token, &emit, &acks, &busy, send) => {
+                _ = serve(&mut receiver, &api, &token, &emit, &acks, &busy, send, post) => {
                     panic!("still signed in");
                 }
                 () = async {

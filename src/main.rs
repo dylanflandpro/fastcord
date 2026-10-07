@@ -14,6 +14,7 @@ mod markdown;
 mod media;
 mod model;
 mod notify;
+mod outbox;
 mod remote_auth;
 mod theme;
 mod ui;
