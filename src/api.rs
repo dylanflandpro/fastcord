@@ -8,7 +8,7 @@
 
 use crate::acks::{Delivery, MAX_RETRY_WAIT};
 use crate::credentials::Token;
-use crate::model::{Ack, DISCORD_EPOCH_MS, Emoji, Id, ReactionRequest, User};
+use crate::model::{Ack, DISCORD_EPOCH_MS, Emoji, Id, ReactionRequest, ReplyTo, User};
 use crate::remote_auth;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -135,7 +135,43 @@ struct NewMessage<'a> {
     /// message so the copy shown while it was on its way can be replaced.
     nonce: String,
     tts: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_reference: Option<MessageReference>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_mentions: Option<AllowedMentions>,
     flags: u64,
+}
+
+/// The message a reply answers, fields in the web client's order; a DM
+/// has no guild.
+#[derive(serde::Serialize)]
+struct MessageReference {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guild_id: Option<String>,
+    channel_id: String,
+    message_id: String,
+}
+
+/// Sent only to keep a reply from pinging its author: everything else
+/// still notifies, as the web client asks.
+#[derive(serde::Serialize)]
+struct AllowedMentions {
+    parse: [&'static str; 3],
+    replied_user: bool,
+}
+
+const QUIET_REPLY: AllowedMentions = AllowedMentions {
+    parse: ["users", "roles", "everyone"],
+    replied_user: false,
+};
+
+/// An edit as the web client's queue sends it: the text, and for a reply
+/// that did not ping, the mentions that keep it quiet.
+#[derive(serde::Serialize)]
+struct EditedMessage<'a> {
+    content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_mentions: Option<AllowedMentions>,
 }
 
 /// A channel, and its guild (`None` for a DM): where a request is made
@@ -156,13 +192,27 @@ impl Place {
     }
 }
 
-fn new_message(content: &str, nonce: Id) -> NewMessage<'_> {
+fn new_message(content: &str, nonce: Id, place: Place, reply: Option<ReplyTo>) -> NewMessage<'_> {
     NewMessage {
         mobile_network_type: "unknown",
         content,
         nonce: nonce.to_string(),
         tts: false,
+        message_reference: reply.map(|reply| MessageReference {
+            guild_id: place.guild.map(|g| g.to_string()),
+            channel_id: place.channel.to_string(),
+            message_id: reply.message.to_string(),
+        }),
+        // Pinging is the default: only a quiet reply says so.
+        allowed_mentions: reply.filter(|r| !r.ping).map(|_| QUIET_REPLY),
         flags: 0,
+    }
+}
+
+fn edited_message(content: &str, quiet: bool) -> EditedMessage<'_> {
+    EditedMessage {
+        content,
+        allowed_mentions: quiet.then_some(QUIET_REPLY),
     }
 }
 
@@ -697,26 +747,27 @@ impl Api {
         place: Place,
         nonce: Id,
         content: &str,
+        reply: Option<ReplyTo>,
     ) -> Attempt {
         let url = format!("{BASE}/channels/{}/messages", place.channel);
-        let request = self.client.post(url).json(&new_message(content, nonce));
+        let body = new_message(content, nonce, place, reply);
+        let request = self.client.post(url).json(&body);
         self.attempt(token, place, request).await
     }
 
     /// Changes my message's text, the only part the web client's edit
-    /// sends; once, like [`Self::send_message`].
+    /// sends, keeping a reply that did not ping `quiet`; once, like
+    /// [`Self::send_message`].
     pub async fn edit_message(
         &self,
         token: &Token,
         place: Place,
         id: Id,
         content: &str,
+        quiet: bool,
     ) -> Attempt {
         let url = format!("{BASE}/channels/{}/messages/{id}", place.channel);
-        let request = self
-            .client
-            .patch(url)
-            .json(&serde_json::json!({ "content": content }));
+        let request = self.client.patch(url).json(&edited_message(content, quiet));
         self.attempt(token, place, request).await
     }
 
@@ -986,10 +1037,40 @@ mod tests {
 
     #[test]
     fn a_message_is_posted_as_the_web_client_posts_it() {
-        let body = serde_json::to_string(&new_message("salut :)", 1425000000000000000)).unwrap();
+        let place = Place {
+            channel: 7,
+            guild: Some(1),
+        };
+        let body =
+            |reply| serde_json::to_string(&new_message("salut :)", 1425, place, reply)).unwrap();
         assert_eq!(
-            body,
-            r#"{"mobile_network_type":"unknown","content":"salut :)","nonce":"1425000000000000000","tts":false,"flags":0}"#
+            body(None),
+            r#"{"mobile_network_type":"unknown","content":"salut :)","nonce":"1425","tts":false,"flags":0}"#
+        );
+        // A reply that pings sends no allowed_mentions at all.
+        let reply = |ping| Some(ReplyTo { message: 40, ping });
+        assert_eq!(
+            body(reply(true)),
+            r#"{"mobile_network_type":"unknown","content":"salut :)","nonce":"1425","tts":false,"message_reference":{"guild_id":"1","channel_id":"7","message_id":"40"},"flags":0}"#
+        );
+        assert!(body(reply(false)).ends_with(
+            r#""message_id":"40"},"allowed_mentions":{"parse":["users","roles","everyone"],"replied_user":false},"flags":0}"#
+        ));
+        let dm = Place {
+            channel: 7,
+            guild: None,
+        };
+        let in_dm = serde_json::to_string(&new_message("a", 1, dm, reply(true))).unwrap();
+        assert!(in_dm.contains(r#""message_reference":{"channel_id":"7","message_id":"40"}"#));
+    }
+
+    #[test]
+    fn an_edit_of_a_quiet_reply_stays_quiet() {
+        let body = |quiet| serde_json::to_string(&edited_message("non", quiet)).unwrap();
+        assert_eq!(body(false), r#"{"content":"non"}"#);
+        assert_eq!(
+            body(true),
+            r#"{"content":"non","allowed_mentions":{"parse":["users","roles","everyone"],"replied_user":false}}"#
         );
     }
 

@@ -297,6 +297,34 @@ pub struct Message {
     pub delivery: Delivery,
     /// Changed by its author since: the official client marks it "(edited)".
     pub edited: bool,
+    /// The message this one answers, for a reply.
+    pub reply: Option<Box<Reply>>,
+}
+
+/// What a reply shows of the message it answers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reply {
+    pub id: Id,
+    pub original: Original,
+    /// The reply pinged the original's author (it mentions them).
+    pub ping: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Original {
+    /// Its author and text.
+    Shown(User, String),
+    /// Discord sent it as null: it was deleted.
+    Deleted,
+    /// Discord did not send it: it could not be loaded.
+    Unknown,
+}
+
+/// What a message answers: the message, and whether its author is pinged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReplyTo {
+    pub message: Id,
+    pub ping: bool,
 }
 
 /// An emoji as reactions carry it: a Unicode one by its text, or a
@@ -496,13 +524,15 @@ pub struct Embed {
 /// Messages from one author close enough in time to share a header.
 const GROUP_WINDOW: jiff::SignedDuration = jiff::SignedDuration::from_mins(7);
 
-/// Whether `message` starts a new group after `previous`: another author, or
-/// more than seven minutes later, as the official client groups them.
+/// Whether `message` starts a new group after `previous`: another author,
+/// more than seven minutes later, or a reply (which shows what it answers
+/// under a header of its own), as the official client groups them.
 pub fn starts_group(previous: Option<&Message>, message: &Message) -> bool {
     let Some(previous) = previous else {
         return true;
     };
-    previous.author.id != message.author.id
+    message.reply.is_some()
+        || previous.author.id != message.author.id
         || created_at(message.id).duration_since(created_at(previous.id)) > GROUP_WINDOW
 }
 
@@ -618,12 +648,26 @@ impl Model {
     }
 
     /// Shows a message I just wrote at the bottom of `channel`, dimmed until
-    /// Discord confirms it. `false` while the channel's history is not
-    /// loaded: there is nowhere to show it yet.
-    pub fn add_pending(&mut self, channel: Id, nonce: Id, content: String) -> bool {
+    /// Discord confirms it, with what it answers. `false` while the
+    /// channel's history is not loaded: there is nowhere to show it yet.
+    pub fn add_pending(
+        &mut self,
+        channel: Id,
+        nonce: Id,
+        content: String,
+        reply: Option<ReplyTo>,
+    ) -> bool {
         let author = self.users.get(&self.me).cloned().unwrap_or(User {
             id: self.me,
             ..User::default()
+        });
+        let reply = reply.map(|reply| {
+            let original = match self.message(channel, reply.message) {
+                Some(m) => Original::Shown(m.author.clone(), m.content.clone()),
+                None => Original::Unknown,
+            };
+            let (id, ping) = (reply.message, reply.ping);
+            Box::new(Reply { id, original, ping })
         });
         let Some(loaded) = self.messages.get_mut(&channel) else {
             return false;
@@ -637,6 +681,7 @@ impl Model {
             reactions: Vec::new(),
             delivery: Delivery::Sending,
             edited: false,
+            reply,
         });
         loaded.sort_by_key(|m| m.id);
         true
@@ -842,6 +887,16 @@ impl Model {
                 embeds,
                 edited,
             } => {
+                // Replies show the text they answer as it is now.
+                if let Some(content) = &content {
+                    let loaded = self.messages.get_mut(&channel).into_iter().flatten();
+                    let replies = loaded.filter_map(|m| m.reply.as_mut());
+                    for reply in replies.filter(|r| r.id == id) {
+                        if let Original::Shown(_, text) = &mut reply.original {
+                            text.clone_from(content);
+                        }
+                    }
+                }
                 if let Some(message) = self
                     .messages
                     .get_mut(&channel)
@@ -862,6 +917,10 @@ impl Model {
             Update::MessageDelete { channel, ids } => {
                 if let Some(loaded) = self.messages.get_mut(&channel) {
                     loaded.retain(|m| !ids.contains(&m.id));
+                    let replies = loaded.iter_mut().filter_map(|m| m.reply.as_mut());
+                    for reply in replies.filter(|r| ids.contains(&r.id)) {
+                        reply.original = Original::Deleted;
+                    }
                 }
             }
             Update::DmRemove(id) => {
@@ -1747,6 +1806,7 @@ mod tests {
             reactions: vec![],
             delivery: Delivery::Sent,
             edited: false,
+            reply: None,
         }
     }
 
@@ -2024,7 +2084,7 @@ mod tests {
         let mut model = conversation();
         let badge = |m: &Model| m.dm_badge(&m.dms[0], jiff::Timestamp::now());
         let before = badge(&model);
-        assert!(model.add_pending(8, 100, "ok".into()));
+        assert!(model.add_pending(8, 100, "ok".into(), None));
         assert_eq!(badge(&model), before, "a pending message is not news");
         let sending = [(5, Delivery::Sent), (100, Delivery::Sending)];
         assert_eq!(deliveries(&model), sending);
@@ -2053,7 +2113,7 @@ mod tests {
     fn only_my_own_message_replaces_a_pending_one() {
         use crate::events::Update;
         let mut model = conversation();
-        model.add_pending(8, 100, "ok".into());
+        model.add_pending(8, 100, "ok".into(), None);
         model.apply(Update::MessageCreate {
             channel: 8,
             guild: None,
@@ -2067,7 +2127,7 @@ mod tests {
     #[test]
     fn a_failed_message_can_be_retried_or_deleted() {
         let mut model = conversation();
-        model.add_pending(8, 100, "ok".into());
+        model.add_pending(8, 100, "ok".into(), None);
         assert!(!model.discard(8, 100), "still on its way");
         assert_eq!(model.resend(8, 100), None, "still on its way");
         let reason = Some("Slowmode is enabled.".to_owned());
@@ -2087,7 +2147,7 @@ mod tests {
     #[test]
     fn a_lost_answer_or_a_wait_keeps_it_unconfirmed() {
         let mut model = conversation();
-        model.add_pending(8, 100, "ok".into());
+        model.add_pending(8, 100, "ok".into(), None);
         let at: jiff::Timestamp = "2026-10-07T12:00:00Z".parse().unwrap();
         model.send_settled(8, 100, Delivery::Held(at));
         assert!(model.messages(8)[1].delivery.in_flight());
@@ -2111,7 +2171,7 @@ mod tests {
             [(5, Delivery::Sent), (101, Delivery::Sent)]
         );
         // A failure then changes nothing; one before settles it.
-        model.add_pending(8, 102, "deux".into());
+        model.add_pending(8, 102, "deux".into(), None);
         model.send_failed(8, 102, None);
         model.send_settled(8, 102, Delivery::Unsure);
         assert_eq!(deliveries(&model)[2], (102, Delivery::Failed(None)));
@@ -2121,7 +2181,7 @@ mod tests {
     fn nothing_is_shown_before_the_history_is() {
         let mut model = conversation();
         model.messages.clear();
-        assert!(!model.add_pending(8, 100, "ok".into()));
+        assert!(!model.add_pending(8, 100, "ok".into(), None));
         assert!(model.messages.is_empty());
     }
 
@@ -2130,12 +2190,58 @@ mod tests {
         let mut model = conversation();
         model.messages.get_mut(&8).unwrap().push(said(6, ME, "moi"));
         model.messages.get_mut(&8).unwrap().push(said(7, 2, "toi"));
-        model.add_pending(8, 100, "en route".into());
+        model.add_pending(8, 100, "en route".into(), None);
         assert!(model.is_mine(8, 6));
         assert!(!model.is_mine(8, 7) && !model.is_mine(8, 100));
         assert_eq!(model.last_mine(8), Some(6));
         model.messages.get_mut(&8).unwrap().retain(|m| m.id != 6);
         assert_eq!(model.last_mine(8), None);
+    }
+
+    #[test]
+    fn replies_follow_what_they_answer() {
+        use crate::events::Update;
+        let mut model = conversation();
+        let reply = Some(ReplyTo {
+            message: 5,
+            ping: false,
+        });
+        model.add_pending(8, 100, "oui".into(), reply);
+        let shown = |model: &Model| model.messages(8).last().unwrap().reply.clone().unwrap();
+        assert!(
+            matches!(shown(&model).original, Original::Shown(ref a, ref t) if a.id == 2 && t == "salut")
+        );
+        assert!(!shown(&model).ping);
+        let replied = &model.messages(8)[1];
+        assert!(
+            starts_group(Some(&model.messages(8)[0]), replied),
+            "a reply has its own header"
+        );
+        model.apply(Update::MessageEdit {
+            channel: 8,
+            id: 5,
+            content: Some("salut à tous".into()),
+            attachments: None,
+            embeds: None,
+            edited: true,
+        });
+        assert!(matches!(shown(&model).original, Original::Shown(_, ref t) if t == "salut à tous"));
+        model.apply(Update::MessageDelete {
+            channel: 8,
+            ids: vec![5],
+        });
+        assert_eq!(shown(&model).original, Original::Deleted);
+        // Answering a message not loaded here.
+        model.add_pending(
+            8,
+            101,
+            "et ça ?".into(),
+            Some(ReplyTo {
+                message: 77,
+                ping: true,
+            }),
+        );
+        assert_eq!(shown(&model).original, Original::Unknown);
     }
 
     #[test]

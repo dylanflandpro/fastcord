@@ -79,6 +79,7 @@ mod tests {
             place,
             nonce,
             content: String::new(),
+            reply: None,
         })
     }
 

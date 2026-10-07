@@ -124,6 +124,7 @@ fastframe_icons::icons! {
         prefix: "fastcord-icon-",
         directory: "../assets/icons/",
         Alert => lucide "circle-alert",
+        CircleX => lucide "circle-x",
         Download => "download",
         File => "file",
         Hash => "hash",

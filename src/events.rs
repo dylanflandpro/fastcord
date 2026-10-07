@@ -9,8 +9,9 @@
 use crate::api::{ApiUser, optional_snowflake, snowflake};
 use crate::model::{
     Attachment, Channel, ChannelKind, ChannelSettings, DmChannel, Embed, EmbedField, EmbedImage,
-    Emoji, Guild, GuildSettings, Id, Message, Model, Mute, Notify, Overwrite, OverwriteKind,
-    Permissions, Ping, Reaction, ReactionKind, ReadState, Role, Unreads, User,
+    Emoji, Guild, GuildSettings, Id, Message, Model, Mute, Notify, Original, Overwrite,
+    OverwriteKind, Permissions, Ping, Reaction, ReactionKind, ReadState, Reply, Role, Unreads,
+    User,
 };
 use serde_json::value::RawValue;
 use std::collections::HashMap;
@@ -194,6 +195,35 @@ struct WireMessage {
     #[serde(default, deserialize_with = "nonce")]
     nonce: Option<Id>,
     edited_timestamp: Option<String>,
+    #[serde(default, deserialize_with = "lenient_one")]
+    message_reference: Option<Reference>,
+    /// A reply's original: absent when Discord could not load it, null
+    /// once it was deleted.
+    #[serde(default, deserialize_with = "present")]
+    referenced_message: Option<Option<Box<WireMessage>>>,
+}
+
+#[derive(serde::Deserialize)]
+struct Reference {
+    #[serde(default, deserialize_with = "optional_snowflake")]
+    message_id: Option<Id>,
+}
+
+/// The message type of a reply.
+const REPLY: u8 = 19;
+
+/// A field that may be absent (`None`), null (`Some(None)`) or there. One
+/// in a shape this version does not know counts as absent.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let raw: Option<Box<RawValue>> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(match raw {
+        None => Some(None),
+        Some(raw) => serde_json::from_str(raw.get()).ok().map(Some),
+    })
 }
 
 /// A message's nonce: a snowflake string from Discord's clients, but bots
@@ -409,7 +439,22 @@ fn shown(kind: u8) -> bool {
 }
 
 impl From<WireMessage> for Message {
-    fn from(wire: WireMessage) -> Self {
+    fn from(mut wire: WireMessage) -> Self {
+        let referenced = wire.referenced_message.take();
+        let reference = wire.message_reference.as_ref().and_then(|r| r.message_id);
+        let reply = reference.filter(|_| wire.kind == REPLY).map(|id| {
+            let (original, ping) = match referenced {
+                Some(Some(original)) => {
+                    let author = original.author.id;
+                    let ping = wire.mentions.iter().any(|user| user.id == author);
+                    let original = Message::from(*original);
+                    (Original::Shown(original.author, original.content), ping)
+                }
+                Some(None) => (Original::Deleted, false),
+                None => (Original::Unknown, false),
+            };
+            Box::new(Reply { id, original, ping })
+        });
         Message {
             id: wire.id,
             author: wire.author.into(),
@@ -419,6 +464,7 @@ impl From<WireMessage> for Message {
             reactions: wire.reactions.into_iter().map(Into::into).collect(),
             delivery: crate::model::Delivery::Sent,
             edited: wire.edited_timestamp.is_some(),
+            reply,
         }
     }
 }
@@ -2797,6 +2843,45 @@ mod tests {
             edited(&answer).unwrap(),
             Update::MessageEdit { channel: 7, id: 41, edited: true, content: Some(c), .. } if c == "oui"
         ));
+    }
+
+    #[test]
+    fn replies_read_what_they_answer() {
+        let mut decoder = Decoder::default();
+        let sam = r#""author":{"id":"5","username":"sam","global_name":"Sam"}"#;
+        let reply = |rest: &str| {
+            format!(
+                r#"{{"id":"41","channel_id":"7","type":19,"content":"oui",{sam},"message_reference":{{"message_id":"40","channel_id":"7"}}{rest}}}"#
+            )
+        };
+        let read = |decoder: &mut Decoder, data: &str| {
+            let created = decoder.event("MESSAGE_CREATE", data).unwrap();
+            let [.., Update::MessageCreate { message, .. }] = &created[..] else {
+                panic!("expected a message");
+            };
+            message.reply.clone()
+        };
+        let original = format!(
+            r#","referenced_message":{{"id":"40","channel_id":"7","type":0,"content":"ça va ?",{sam}}}"#
+        );
+        let shown = read(&mut decoder, &reply(&original)).unwrap();
+        assert_eq!(shown.id, 40);
+        assert!(
+            matches!(&shown.original, Original::Shown(author, text) if author.id == 5 && text == "ça va ?")
+        );
+        assert!(!shown.ping, "Sam is not among the mentions");
+        let pinged = format!(r#"{original},"mentions":[{{"id":"5","username":"sam"}}]"#);
+        assert!(read(&mut decoder, &reply(&pinged)).unwrap().ping);
+        // Null: deleted. Absent: Discord could not load it.
+        let deleted = read(&mut decoder, &reply(r#","referenced_message":null"#)).unwrap();
+        assert_eq!(deleted.original, Original::Deleted);
+        assert_eq!(
+            read(&mut decoder, &reply("")).unwrap().original,
+            Original::Unknown
+        );
+        // A crosspost or a forward carries a reference too, but is no reply.
+        let crosspost = reply(&original).replace(r#""type":19"#, r#""type":0"#);
+        assert_eq!(read(&mut decoder, &crosspost), None);
     }
 
     #[test]
