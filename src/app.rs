@@ -1,21 +1,56 @@
-//! The window: the model, what is selected, and the palette it is drawn in.
+//! The window: the model, what is open, and the palette it is drawn in.
 
 use crate::model::{Id, Model};
 use crate::theme::{self, Catalog, Palette};
 use std::path::PathBuf;
 
 /// Which list the middle column shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum View {
     DirectMessages,
     Guild(Id),
 }
 
+/// What is open: the list in the middle column and the conversation. Kept
+/// apart from the model so the interface can change it while drawing from
+/// the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub view: View,
+    pub channel: Option<Id>,
+}
+
+impl Selection {
+    /// Where the window opens: the first guild, or the DMs without one.
+    pub fn initial(model: Option<&Model>) -> Self {
+        let mut selection = Self {
+            view: View::DirectMessages,
+            channel: None,
+        };
+        if let Some(model) = model {
+            match model.guilds.first() {
+                Some(guild) => selection.open_guild(model, guild.id),
+                None => selection.open_direct_messages(model),
+            }
+        }
+        selection
+    }
+
+    pub fn open_guild(&mut self, model: &Model, id: Id) {
+        self.view = View::Guild(id);
+        self.channel = model.guild(id).and_then(|g| g.first_text_channel());
+    }
+
+    pub fn open_direct_messages(&mut self, model: &Model) {
+        self.view = View::DirectMessages;
+        self.channel = model.dms_by_recency().first().map(|d| d.id);
+    }
+}
+
 pub struct App {
     /// `None` until the account is connected.
     pub model: Option<Model>,
-    pub view: View,
-    pub channel: Option<Id>,
+    pub selection: Selection,
     pub palette: Palette,
     themes: Catalog,
     themes_dir: Option<PathBuf>,
@@ -36,7 +71,7 @@ impl App {
         let palette = Palette::dark();
         theme::apply(ctx, &palette);
 
-        let mut themes = Catalog::preview(Vec::new(), false);
+        let mut themes = Catalog::default();
         let repaint = ctx.clone();
         let waker = fastframe_theme::Waker::new(move || repaint.request_repaint());
         if let Some(dir) = &themes_dir {
@@ -44,10 +79,9 @@ impl App {
             themes.start(dir.clone(), None, &waker);
         }
 
-        let mut app = Self {
+        Self {
+            selection: Selection::initial(model.as_ref()),
             model,
-            view: View::DirectMessages,
-            channel: None,
             palette,
             themes,
             themes_dir,
@@ -55,33 +89,7 @@ impl App {
             transition: fastframe_theme::Transition::default(),
             wanted: palette,
             first_palette: true,
-        };
-        if let Some(guild) = app
-            .model
-            .as_ref()
-            .and_then(|m| m.guilds.first())
-            .map(|g| g.id)
-        {
-            app.open_guild(guild);
         }
-        app
-    }
-
-    pub fn open_guild(&mut self, id: Id) {
-        self.view = View::Guild(id);
-        self.channel = self
-            .model
-            .as_ref()
-            .and_then(|m| m.guild(id))
-            .and_then(|g| g.first_text_channel());
-    }
-
-    pub fn open_direct_messages(&mut self) {
-        self.view = View::DirectMessages;
-        self.channel = self
-            .model
-            .as_ref()
-            .and_then(|m| m.dms_by_recency().first().map(|d| d.id));
     }
 
     /// Picks up a new desktop palette and reveals it.
@@ -92,10 +100,12 @@ impl App {
             self.themes.start(dir.clone(), None, &self.waker);
         }
         if self.themes.poll() {
-            self.wanted = self
-                .themes
-                .system_theme()
-                .map_or_else(Palette::dark, |theme| theme.palette);
+            // A scan without a desktop palette (none at all, or one caught
+            // half-written mid-switch) keeps the current one rather than
+            // flashing the built-in palette.
+            if let Some(theme) = self.themes.system_theme() {
+                self.wanted = theme.palette;
+            }
             if std::mem::replace(&mut self.first_palette, false) {
                 self.set_palette(ctx, self.wanted);
             }
@@ -122,5 +132,37 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         crate::ui::show(self, ui);
         self.transition.paint(ui.ctx());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opens_on_the_first_guild_and_its_first_text_channel() {
+        let model = crate::demo::model();
+        let selection = Selection::initial(Some(&model));
+        assert_eq!(selection.view, View::Guild(100));
+        assert_eq!(selection.channel, Some(101));
+    }
+
+    #[test]
+    fn switching_lists_opens_a_conversation() {
+        let model = crate::demo::model();
+        let mut selection = Selection::initial(Some(&model));
+        selection.open_guild(&model, 200);
+        assert_eq!(selection.channel, Some(201));
+        // The DM with the most recent message.
+        selection.open_direct_messages(&model);
+        assert_eq!(selection.view, View::DirectMessages);
+        assert_eq!(selection.channel, Some(900));
+    }
+
+    #[test]
+    fn without_an_account_nothing_is_open() {
+        let selection = Selection::initial(None);
+        assert_eq!(selection.view, View::DirectMessages);
+        assert_eq!(selection.channel, None);
     }
 }

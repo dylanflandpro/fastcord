@@ -72,28 +72,34 @@ pub enum Entry<'a> {
 
 impl Guild {
     /// The channel list as Discord draws it: channels outside any category
-    /// first, then each category followed by its channels, all by position
-    /// (ties broken by id, as Discord does).
+    /// first, then each category followed by its channels. Within a group,
+    /// text channels come before voice ones (each kind numbers its positions
+    /// from zero), then by position, ties broken by id, as Discord does.
     pub fn sidebar(&self) -> Vec<Entry<'_>> {
-        let by_position = |a: &&Channel, b: &&Channel| (a.position, a.id).cmp(&(b.position, b.id));
-        let children = |parent: Option<Id>| {
-            let mut channels: Vec<&Channel> = self
-                .channels
-                .iter()
-                .filter(|c| c.kind != ChannelKind::Category && c.parent == parent)
-                .collect();
-            channels.sort_by(by_position);
-            channels
-        };
         let mut categories: Vec<&Channel> = self
             .channels
             .iter()
             .filter(|c| c.kind == ChannelKind::Category)
             .collect();
-        categories.sort_by(by_position);
+        categories.sort_by_key(|c| (c.position, c.id));
+        // A parent the guild does not list (hidden, or not loaded yet) leaves
+        // the channel loose rather than lost.
+        let parent = |c: &Channel| {
+            c.parent
+                .filter(|p| categories.iter().any(|cat| cat.id == *p))
+        };
+        let children = |category: Option<Id>| {
+            let mut channels: Vec<&Channel> = self
+                .channels
+                .iter()
+                .filter(|c| c.kind != ChannelKind::Category && parent(c) == category)
+                .collect();
+            channels.sort_by_key(|c| (c.kind == ChannelKind::Voice, c.position, c.id));
+            channels
+        };
 
         let mut entries: Vec<Entry<'_>> = children(None).into_iter().map(Entry::Channel).collect();
-        for category in categories {
+        for &category in &categories {
             entries.push(Entry::Category(category));
             entries.extend(children(Some(category.id)).into_iter().map(Entry::Channel));
         }
@@ -235,6 +241,35 @@ mod tests {
             ],
         };
         assert_eq!(ids(&guild.sidebar()), ["3", "9"]);
+    }
+
+    #[test]
+    fn sidebar_puts_text_before_voice_whatever_the_positions() {
+        let guild = Guild {
+            id: 1,
+            name: "g".into(),
+            channels: vec![
+                channel(10, ChannelKind::Category, None, 0),
+                channel(11, ChannelKind::Voice, Some(10), 0),
+                channel(12, ChannelKind::Text, Some(10), 1),
+                channel(13, ChannelKind::Announcement, Some(10), 0),
+            ],
+        };
+        assert_eq!(ids(&guild.sidebar()), ["[10]", "13", "12", "11"]);
+    }
+
+    #[test]
+    fn sidebar_keeps_channels_whose_category_is_unknown() {
+        let guild = Guild {
+            id: 1,
+            name: "g".into(),
+            channels: vec![
+                channel(2, ChannelKind::Text, None, 1),
+                channel(3, ChannelKind::Text, Some(99), 0),
+            ],
+        };
+        assert_eq!(ids(&guild.sidebar()), ["3", "2"]);
+        assert_eq!(guild.first_text_channel(), Some(3));
     }
 
     #[test]
