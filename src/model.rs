@@ -923,6 +923,8 @@ impl Model {
                     }
                 }
             }
+            // Timed, so the window keeps it: see `typing::Others`.
+            Update::TypingStart { .. } => {}
             Update::DmRemove(id) => {
                 self.dms.retain(|d| d.id != id);
                 self.forget_history(id);

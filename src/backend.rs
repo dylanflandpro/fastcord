@@ -48,6 +48,9 @@ pub enum Command {
     /// Post a message I wrote. Messages leave one at a time, in the order
     /// they were written, as the official client's queue sends them.
     Write(Write),
+    /// I am typing there. Outside the queue, and never tried again, as the
+    /// web client sends it: a late one would be wrong.
+    Typing(Place),
 }
 
 /// A change I make on Discord. Writes leave one at a time, in the order
@@ -647,6 +650,7 @@ where
     };
     let mut outbox = Outbox::default();
     let mut writing = FuturesUnordered::new();
+    let mut typing = FuturesUnordered::new();
     let served = loop {
         if let Some(write) = outbox.next() {
             writing.push(send_one(&post, token, emit, write));
@@ -677,6 +681,12 @@ where
                     }
                     outbox.push(write);
                 }
+                Some(Command::Typing(place)) => {
+                    let used = Token::new(token.borrow().expose().to_owned());
+                    typing.push(async move {
+                        api.typing(&used, place).await;
+                    });
+                }
                 Some(Command::Retry) => {}
             },
             Some((write, verdict, used)) = writing.next(), if !writing.is_empty() => {
@@ -684,6 +694,7 @@ where
                     break Served::Revoked;
                 }
             }
+            Some(()) = typing.next(), if !typing.is_empty() => {}
             // Only the token in force: one rotated meanwhile is fine.
             Some((revoked, used)) = loading.next(), if !loading.is_empty() => {
                 if revoked && used.expose() == token.borrow().expose() {

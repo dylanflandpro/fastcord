@@ -43,6 +43,9 @@ A native Discord client: Rust, egui 0.36 (glow), fastframe. Text only for now.
   edit (quiet `allowed_mentions`, also when the original is not loaded: never a ping by
   guess), a retry and a draft put back keep. `markdown::reply_snippet` is the
   line above it.
+- `typing.rs`: typing indicators both ways, timed as the web client's `TypingStore`
+  (shown 10 s, sent at most every 8 s after 1.5 s, none past five typists). Typing goes
+  outside the write queue (`Command::Typing`) and is never retried.
 - `outbox.rs`: messages, edits and deletions (`backend::Write`) leave one at a time, in
   order; a failed message fails the channel's later messages unsent. Edits and
   deletions are not optimistic, as in the web client: the editor shows "Saving…" until

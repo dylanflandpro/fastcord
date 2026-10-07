@@ -771,6 +771,13 @@ impl Api {
         self.attempt(token, place, request).await
     }
 
+    /// Shows me typing in the channel for ten seconds; once, nothing waits
+    /// on it.
+    pub async fn typing(&self, token: &Token, place: Place) -> Attempt {
+        let url = format!("{BASE}/channels/{}/typing", place.channel);
+        self.attempt(token, place, self.client.post(url)).await
+    }
+
     /// Deletes my message, once.
     pub async fn delete_message(&self, token: &Token, place: Place, id: Id) -> Attempt {
         let url = format!("{BASE}/channels/{}/messages/{id}", place.channel);
